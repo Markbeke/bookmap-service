@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 # -----------------------------
 # Build
 # -----------------------------
-BUILD_TAG = "FIX6"
+BUILD_TAG = "FIX7"
 
 # -----------------------------
 # Config (env)
@@ -460,7 +460,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (FIX6)</title>
+  <title>QuantDesk Bookmap (FIX7)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
     #topbar { flex:0 0 auto;
@@ -840,8 +840,9 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
   }
 
   function yOf(p, pMin, pMax, h) {
-    const t = (p - pMin) / (pMax - pMin);
-    return h - t*h;
+    const span = Math.max(1e-9, (pMax - pMin));
+    const t = (p - pMin) / span;
+    return h - clamp(t,0,1)*h;
   }
 
   function rowOfPrice(p) {
@@ -912,6 +913,7 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
   }
 
   function draw() {
+    try {
     const w = cv.width;
     const h = cv.height;
 
@@ -932,6 +934,10 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
       viewMid = primaryPx;
     }
 
+    // Guard against zero/NaN span (prevents blank canvas due to ImageData errors)
+    const minSpan = Math.max(tickSize*10, 1);
+    if (!(isFinite(viewSpan) && viewSpan > 0)) viewSpan = 400;
+    if (viewSpan < minSpan) viewSpan = minSpan;
     const pMin = viewMid - viewSpan/2;
     const pMax = viewMid + viewSpan/2;
 
@@ -1149,6 +1155,21 @@ const [rr, gg, bb, aa] = heatRGBA(a);
       24, h - 20
     );
 
+    }
+    catch (e) {
+      const w = cv.width, h = cv.height;
+      ctx.clearRect(0,0,w,h);
+      ctx.fillStyle = "#0b0f14";
+      ctx.fillRect(0,0,w,h);
+      ctx.fillStyle = "rgba(248,113,113,0.95)";
+      ctx.font = "16px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+      const msg = (e && (e.stack || e.message)) ? String(e.stack || e.message) : String(e);
+      const lines = msg.split("\n").slice(0,6);
+      ctx.fillText("JS ERROR (FIX7)", 16, 28);
+      for (let i=0;i<lines.length;i++) ctx.fillText(lines[i].slice(0,120), 16, 52 + i*18);
+    }
+
+    // schedule next frame
     requestAnimationFrame(draw);
   }
 
