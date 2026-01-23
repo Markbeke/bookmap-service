@@ -906,28 +906,75 @@ HTML = r"""
 
       // Exposure: compute robust vmax on recent sample; then apply "heatDim"
       // heatDim low => brighter (reduce vmax), high => dimmer (increase vmax)
-      let vmax = 1;
+      // Exposure / auto-exposure (robust percentiles; avoids "all red" haze)
+      let vmax = 255;
+      let floor = 0;
+      let sampleN = 0;
+
       if (autoExp) {
-        const sampleCols = Math.min(colsVisible, 80);
-        const step = Math.max(1, Math.floor(colsVisible / sampleCols));
-        for (let ci = startCol; ci <= head; ci += step) {
-          const col = heat.ring[((ci % heat.cols)+heat.cols)%heat.cols];
+        const sample = [];
+        const cols = heat.cols, rows = heat.rows;
+        const x0 = Math.max(0, Math.floor((viewT0 - heat.t0) / heat.dt));
+        const x1 = Math.min(cols - 1, Math.floor(((viewT0 + viewSpan * 1000) - heat.t0) / heat.dt));
+
+        // sample every Nth row/col for speed
+        const stepX = Math.max(1, Math.floor((x1 - x0 + 1) / 180));
+        const stepY = Math.max(1, Math.floor(rows / 140));
+
+        for (let x = x0; x <= x1; x += stepX) {
+          const col = heat.ring[x];
           if (!col) continue;
-          for (let rr = rTop; rr <= rBot; rr += 6) {
-            const v = col[rr] || 0;
-            if (v > vmax) vmax = v;
+          for (let y = 0; y < rows; y += stepY) {
+            const v = col[y] || 0;
+            if (v > 0) sample.push(v);
           }
         }
-        vmax = Math.max(vmax, 16);
+
+        sampleN = sample.length;
+        if (sampleN > 0) {
+          sample.sort((a, b) => a - b);
+
+          // Heat Thr slider = percentile floor (0..1). A slightly higher floor when dimmer is desired.
+          const thrPct = clamp(100 * heatThr + 10 * heatDim, 0, 98.5);
+          floor = percentile(sample, thrPct);
+
+          // Robust vmax = high percentile (prevents a single spike from flattening contrast)
+          vmax = percentile(sample, 99.7);
+
+          // ensure ordering
+          vmax = Math.max(floor + 1, vmax);
+        }
       } else {
-        vmax = 64; // fixed fallback
+        floor = 0;
+        vmax = 255;
       }
 
-      // dimmer acts like a multiplier on vmax (not a flat alpha kill)
-      // heatDim in [0,1] => scale vmax by [0.55 .. 2.2]
-      const dimScale = 0.55 + 1.65 * heatDim;
-      vmax = vmax * dimScale;
+      // Precompute a per-x "price path" from trades so we can locally attenuate heat near the traded path
+      // (gives a Bookmap-like "liquidity gets eaten" effect).
+      const colsVisible = w;
+      const pxAt = new Float32Array(colsVisible);
+      pxAt.fill(NaN);
+      for (const tr of trades) {
+        const tms = tr.t || tr.ts || tr.T || 0;
+        const p = tr.p;
+        if (!tms || !p) continue;
+        const frac = (tms - viewT0) / (viewSpan * 1000);
+        const x = Math.floor(frac * colsVisible);
+        if (x >= 0 && x < colsVisible) pxAt[x] = p;
+      }
+      // forward/back fill gaps for a continuous path
+      let last = NaN;
+      for (let x = 0; x < colsVisible; x++) {
+        if (!Number.isNaN(pxAt[x])) last = pxAt[x];
+        else if (!Number.isNaN(last)) pxAt[x] = last;
+      }
+      let next = NaN;
+      for (let x = colsVisible - 1; x >= 0; x--) {
+        if (!Number.isNaN(pxAt[x])) next = pxAt[x];
+        else if (!Number.isNaN(next)) pxAt[x] = next;
+      }
 
+      heatDebug = `vmax=${fmt(vmax)} floor=${fmt(floor)} drawn=${drawn} skip=${skip} sample=${sampleN}`;
       // fill pixels
       for (let x = 0; x < colsVisible; x++) {
         const colIdx = startCol + x;
@@ -936,18 +983,38 @@ HTML = r"""
 
         for (let y = 0; y < rowsVisible; y++) {
           const row = rTop + y;
-          const v = col[row] || 0;
-          if (v === 0) continue;
+          let v = col[row] || 0;
+          if (v <= 0) continue;
 
-          const a = clamp(v / vmax, 0, 1);
-          if (a < heatThr) continue;
+          // Local "consumption" attenuation near the traded path
+          const px = pxAt[x] || NaN;
+          if (!Number.isNaN(px)) {
+            const rpx = rowOfPrice(px);
+            const d = Math.abs(row - rpx);
+            const consumeR = 4;            // rows
+            if (d <= consumeR) {
+              const k = 0.65 * (1 - (d / consumeR));
+              v = v * (1 - k);
+            }
+          }
+
+          // Threshold (floor) and robust log compression for Bookmap-like separation
+          const vv = v - floor;
+          if (vv <= 0) continue;
+
+          const denom = Math.max(1, vmax - floor);
+          const dimK = 10 + 80 * (1 - heatDim); // higher = more linear; lower = more compression
+          let a = Math.log1p(dimK * vv) / Math.log1p(dimK * denom);
+
+          // additional contrast control (Heat Ctr): shift mid-tones without changing saturation
+          a = clamp(Math.pow(a, 0.65 + 1.35 * (1 - heatCtr)), 0, 1);
 
           const [rr, gg, bb, aa] = heatRGBA(a);
           const i = (y*colsVisible + x) * 4;
           data[i+0] = rr;
           data[i+1] = gg;
           data[i+2] = bb;
-          data[i+3] = Math.floor(255 * aa);
+          data[i+3] = Math.floor(255 * aa * (1 - 0.45 * heatDim));
         }
       }
 
