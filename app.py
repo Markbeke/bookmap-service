@@ -50,7 +50,7 @@ BIN_USD = float(os.getenv("QD_BIN_USD", "5"))            # price bin size for sn
 TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))    # levels retained per side
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX9_DOMINANCE_ENGINE_FIX1"
+BUILD = "FIX10_WIDE_LADDER_ENGINE_FIX1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -127,6 +127,42 @@ def _recompute_tob() -> None:
     now = _now_ms()
     STATE["depth_age_ms"] = (now - LAST_DEPTH_MS) if LAST_DEPTH_MS else None
     STATE["trade_age_ms"] = (now - LAST_TRADE_MS) if LAST_TRADE_MS else None
+
+
+def _update_ladder_bounds() -> None:
+    """Expand session-wide ladder bounds so distant liquidity remains visible when zooming out.
+
+    Note: This cannot reveal liquidity that is not present in the depth feed (e.g., if the exchange only streams top-N levels).
+    It preserves/expands the visible price domain to include extremes we have observed so far.
+    """
+    global LADDER_MIN_PX, LADDER_MAX_PX
+    if not BIDS and not ASKS:
+        return
+    try:
+        lo = min(BIDS.keys()) if BIDS else None
+        hi = max(ASKS.keys()) if ASKS else None
+        if lo is None and ASKS:
+            lo = min(ASKS.keys())
+        if hi is None and BIDS:
+            hi = max(BIDS.keys())
+        if lo is None or hi is None:
+            return
+        # Ensure non-zero span
+        if hi <= lo:
+            hi = lo + 1.0
+        # Expand with a small margin to reduce edge clipping
+        span = float(hi - lo)
+        margin = max(5.0, span * 0.05)
+        lo2 = float(lo) - margin
+        hi2 = float(hi) + margin
+        if LADDER_MIN_PX is None or lo2 < LADDER_MIN_PX:
+            LADDER_MIN_PX = lo2
+        if LADDER_MAX_PX is None or hi2 > LADDER_MAX_PX:
+            LADDER_MAX_PX = hi2
+    except Exception:
+        # Never let ladder logic crash the data plane
+        return
+
 
 
 def _prune_topn() -> None:
@@ -272,6 +308,7 @@ async def mexc_consumer_loop() -> None:
                         _prune_topn()
                         async with STATE_LOCK:
                             _recompute_tob()
+                            _update_ladder_bounds()
 
                     elif "push.deal" in ch:
                         deals = msg.get("data") or []
@@ -289,6 +326,7 @@ async def mexc_consumer_loop() -> None:
                             _track_print(time.time())
                             async with STATE_LOCK:
                                 _recompute_tob()
+                                _update_ladder_bounds()
 
         except Exception as e:
             async with STATE_LOCK:
@@ -361,6 +399,7 @@ async def index() -> str:
       <button id="followBtn">Autofollow: ON</button>
       <button id="resetBtn">Reset view</button>
       <button id="testBtn">Test pattern: OFF</button>
+      <button id="wideBtn">Wide ladder: ON</button>
       <button id="gainBtn">Gain: 1.00</button>
       <button id="gammaBtn">Gamma: 0.65</button>
       <button id="floorBtn">Floor: 0.02</button>
@@ -400,6 +439,7 @@ async def index() -> str:
   const followBtn = document.getElementById('followBtn');
   const resetBtn = document.getElementById('resetBtn');
   const testBtn = document.getElementById('testBtn');
+  const wideBtn = document.getElementById('wideBtn');
   const gainBtn = document.getElementById('gainBtn');
   const gammaBtn = document.getElementById('gammaBtn');
   const floorBtn = document.getElementById('floorBtn');
@@ -414,6 +454,7 @@ async def index() -> str:
 
   let autofollow = true;
   let testPattern = false;
+  let wideMode = true; // use session-expanding ladder bounds + wide heat bins
 
   // View state
   let centerPx = null;
@@ -584,6 +625,19 @@ async def index() -> str:
   }
 
   function viewBounds(snap) {
+    // Two modes:
+    //  (1) Normal: centered on `centerPx` with configurable half_range.
+    //  (2) Wide ladder: use session-expanding ladder_min/max (preserves distant liquidity we have observed).
+    if (wideMode && snap && isFinite(snap.ladder_min_px) && isFinite(snap.ladder_max_px) && (snap.ladder_max_px > snap.ladder_min_px)) {
+      const baseLo = snap.ladder_min_px;
+      const baseHi = snap.ladder_max_px;
+      const baseMid = (baseLo + baseHi) / 2.0;
+      const baseHalf = (baseHi - baseLo) / 2.0;
+      const effHalf = (baseHalf / zoom);
+      const lo = (baseMid + panPx) - effHalf;
+      const hi = (baseMid + panPx) + effHalf;
+      return { lo, hi, halfRange: baseHalf, effHalf };
+    }
     const halfRange = (snap && snap.half_range) ? snap.half_range : __RANGE_USD__;
     const effHalf = (halfRange / zoom);
     const c = (centerPx === null || !isFinite(centerPx)) ? 0.0 : centerPx;
@@ -619,8 +673,15 @@ async def index() -> str:
 
 
     // Decide bins/max
+    // Choose which ladder to render
     let bins = (snap && snap.heat_bins) ? snap.heat_bins : [];
     let maxv = (snap && snap.heat_max) ? snap.heat_max : 0;
+    let binUsd = (snap && snap.bin_usd) ? snap.bin_usd : __BIN_USD__;
+    if (wideMode && snap && snap.wide_heat_bins && snap.wide_heat_bins.length) {
+      bins = snap.wide_heat_bins;
+      maxv = (snap.wide_heat_max) ? snap.wide_heat_max : maxv;
+      if (snap.wide_bin_usd) binUsd = snap.wide_bin_usd;
+    }
 
     const { lo, hi } = viewBounds(snap);
 
@@ -963,6 +1024,14 @@ async def index() -> str:
     testPattern = !testPattern;
     testBtn.textContent = `Test pattern: ${testPattern ? 'ON' : 'OFF'}`;
   });
+  wideBtn.addEventListener('click', () => {
+    wideMode = !wideMode;
+    wideBtn.textContent = `Wide ladder: ${wideMode ? 'ON' : 'OFF'}`;
+    // Reset view for predictable zoom when switching modes
+    panPx = 0;
+    zoom = 1.0;
+  });
+
   function updateExposureLabels() {
     gainBtn.textContent = `Gain: ${heatGain.toFixed(2)}`;
     gammaBtn.textContent = `Gamma: ${heatGamma.toFixed(2)}`;
@@ -1131,6 +1200,26 @@ async def snapshot() -> JSONResponse:
             if center_px is not None:
                 heat_bins, heat_max = _build_heat_bins(float(center_px), float(RANGE_USD), float(BIN_USD))
 
+            
+            # --- Wide ladder (session-expanding bounds) ---
+            ladder_min = LADDER_MIN_PX
+            ladder_max = LADDER_MAX_PX
+            wide_heat_bins: List[List[float]] = []
+            wide_heat_max = 0.0
+            wide_bin_usd = None
+            if ladder_min is not None and ladder_max is not None and ladder_max > ladder_min:
+                span = float(ladder_max - ladder_min)
+                # Cap vertical bin count for performance; adapt bin size to span.
+                target_bins = 320.0
+                wide_bin = max(float(BIN_USD), span / target_bins)
+                # Avoid pathological huge payloads
+                if span / wide_bin > 500.0:
+                    wide_bin = span / 500.0
+                wide_bin_usd = wide_bin
+                wide_center = (float(ladder_min) + float(ladder_max)) / 2.0
+                wide_range = span / 2.0
+                wide_heat_bins, wide_heat_max = _build_heat_bins(wide_center, wide_range, wide_bin)
+
             payload = {
                 "ok": True,
                 "build": BUILD,
@@ -1151,6 +1240,11 @@ async def snapshot() -> JSONResponse:
                 "bin_usd": float(BIN_USD),
                 "heat_bins": heat_bins,
                 "heat_max": float(heat_max),
+                "ladder_min_px": (float(ladder_min) if ladder_min is not None else None),
+                "ladder_max_px": (float(ladder_max) if ladder_max is not None else None),
+                "wide_bin_usd": (float(wide_bin_usd) if wide_bin_usd is not None else None),
+                "wide_heat_bins": wide_heat_bins,
+                "wide_heat_max": float(wide_heat_max),
                 "error": STATE.get("last_error"),
             }
             return JSONResponse(payload)
