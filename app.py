@@ -50,7 +50,7 @@ BIN_USD = float(os.getenv("QD_BIN_USD", "5"))            # price bin size for sn
 TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))    # levels retained per side
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX7_BAND_QUALITY_FIX1"
+BUILD = "FIX8_BAND_COALESCE_FIX1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -367,6 +367,9 @@ async def index() -> str:
       <button id="topNBtn">TopN: 70</button>
       <button id="smoothBtn">Smooth: ON</button>
       <button id="consumeBtn">Consume: ON</button>
+      <button id="bandBtn">Bands: ON</button>
+      <button id="gapBtn">Gap: 1</button>
+      <button id="minBtn">Min: 2</button>
     </div>
     <div id="err"></div>
   </div>
@@ -401,6 +404,9 @@ async def index() -> str:
   const topNBtn = document.getElementById('topNBtn');
   const smoothBtn = document.getElementById('smoothBtn');
   const consumeBtn = document.getElementById('consumeBtn');
+  const bandBtn = document.getElementById('bandBtn');
+  const gapBtn = document.getElementById('gapBtn');
+  const minBtn = document.getElementById('minBtn');
 
   let autofollow = true;
   let testPattern = false;
@@ -434,6 +440,10 @@ async def index() -> str:
   let consumeStrength = 0.18; // 0..1 extra decay per hit
   let consumeCols = 6;        // affect newest N columns
   let consumeMinNotional = 1500.0; // USD threshold to count as consumption
+  let bandify = true;          // coalesce adjacent rows into continuous bands
+  let bandGapBins = 1;         // allow small gaps when merging (in bins)
+  let bandMinBins = 2;         // minimum band thickness in bins
+  let bandEdgeSoft = 0.12;     // soften edges via alpha taper
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -519,6 +529,38 @@ async def index() -> str:
     if (idxs.length <= topN) return idxs;
     idxs.sort((i,j)=>a[j]-a[i]);
     return idxs.slice(0, topN);
+  }
+
+  function computeBandRuns(arr, keepIdxs, gapBins, minBins) {
+    // Returns list of [startIdx, endIdxInclusive, maxVal] for merged bands
+    const keep = new Uint8Array(arr.length);
+    for (let k=0; k<keepIdxs.length; k++) keep[keepIdxs[k]] = 1;
+
+    const runs = [];
+    let i = 0;
+    while (i < arr.length) {
+      if (!keep[i] || !(arr[i] > 0)) { i++; continue; }
+      let s = i, e = i, mx = arr[i];
+      let gap = 0;
+      i++;
+      while (i < arr.length) {
+        const ok = keep[i] && (arr[i] > 0);
+        if (ok) {
+          e = i;
+          if (arr[i] > mx) mx = arr[i];
+          gap = 0;
+        } else {
+          gap++;
+          if (gap > gapBins) break;
+        }
+        i++;
+      }
+      e = Math.max(s, e);
+      if ((e - s + 1) >= Math.max(1, minBins)) {
+        runs.push([s, e, mx]);
+      }
+    }
+    return runs;
   }
 
   function setStatus(ok, txt) {
@@ -624,7 +666,7 @@ async def index() -> str:
     // apply gain (higher gain => brighter => lower scaleMax)
     scaleMax = scaleMax / Math.max(1e-6, heatGain);
 
-    // Draw new column (Phase 5 quality: smooth + TopN)
+    // Draw new column (Phase 5/8 quality: smooth + TopN + band coalescing)
     if (bins && bins.length > 0) {
       // Quantize into uniform price bins so smoothing + TopN are stable.
       const nBins = Math.max(1, Math.floor((hi - lo) / Math.max(1e-9, binUsd)) + 1);
@@ -641,26 +683,64 @@ async def index() -> str:
 
       if (smoothBands) smoothArrayInPlace(arr);
 
-      // auto-exposure is based on scaleMax; convert to normalized t after TopN selection
       const keepIdxs = topNIndicesByValue(arr, Math.max(1, Math.floor(topNLevels)));
-      // draw kept rows only
+
       hctx.globalAlpha = 0.95;
-      for (let k=0; k<keepIdxs.length; k++) {
-        const idx = keepIdxs[k];
-        const p = lo + idx * binUsd;
-        const v = arr[idx];
 
-        let t = Math.max(0, Math.min(1, v / scaleMax));
-        t = Math.max(0, (t - heatFloor) / Math.max(1e-6, (1 - heatFloor)));
-        t = Math.pow(t, heatGamma);
+      if (bandify) {
+        const runs = computeBandRuns(arr, keepIdxs, Math.max(0, Math.floor(bandGapBins)), Math.max(1, Math.floor(bandMinBins)));
+        for (let r=0; r<runs.length; r++) {
+          const s = runs[r][0], e = runs[r][1], mx = runs[r][2];
 
-        const y = yOfPrice(p, lo, hi, H);
-        const y2 = yOfPrice(p + binUsd, lo, hi, H);
-        const hStripe = Math.max(1, Math.abs(y2 - y));
+          let t = Math.max(0, Math.min(1, mx / scaleMax));
+          t = Math.max(0, (t - heatFloor) / Math.max(1e-6, (1 - heatFloor)));
+          t = Math.pow(t, heatGamma);
 
-        hctx.fillStyle = heatColor(t);
-        hctx.fillRect(W - COL_PX, y - hStripe*0.5, COL_PX, hStripe);
+          const p1 = lo + s * binUsd;
+          const p2 = lo + (e + 1) * binUsd;
+
+          const y1 = yOfPrice(p1, lo, hi, H);
+          const y2 = yOfPrice(p2, lo, hi, H);
+          const yTop = Math.min(y1, y2);
+          const yBot = Math.max(y1, y2);
+          const hStripe = Math.max(1, (yBot - yTop));
+
+          // Edge softening via alpha taper (simple: draw core + faint rims)
+          const rimAlpha = Math.max(0, Math.min(0.35, bandEdgeSoft));
+          const rimPx = Math.max(1, Math.floor(hStripe * 0.18));
+
+          hctx.fillStyle = heatColor(t);
+          // core
+          hctx.globalAlpha = 0.95;
+          hctx.fillRect(W - COL_PX, yTop + rimPx, COL_PX, Math.max(1, hStripe - 2*rimPx));
+          // rims
+          if (rimPx >= 1) {
+            hctx.globalAlpha = 0.95 * rimAlpha;
+            hctx.fillRect(W - COL_PX, yTop, COL_PX, rimPx);
+            hctx.fillRect(W - COL_PX, yBot - rimPx, COL_PX, rimPx);
+          }
+        }
+      } else {
+        // draw kept rows only (legacy)
+        for (let k=0; k<keepIdxs.length; k++) {
+          const idx = keepIdxs[k];
+          const p = lo + idx * binUsd;
+          const v = arr[idx];
+
+          let t = Math.max(0, Math.min(1, v / scaleMax));
+          t = Math.max(0, (t - heatFloor) / Math.max(1e-6, (1 - heatFloor)));
+          t = Math.pow(t, heatGamma);
+
+          const y = yOfPrice(p, lo, hi, H);
+          const y2 = yOfPrice(p + binUsd, lo, hi, H);
+          const hStripe = Math.max(1, Math.abs(y2 - y));
+
+          hctx.fillStyle = heatColor(t);
+          hctx.globalAlpha = 0.95;
+          hctx.fillRect(W - COL_PX, y - hStripe*0.5, COL_PX, hStripe);
+        }
       }
+
       hctx.globalAlpha = 1.0;
     }
   }
@@ -808,6 +888,9 @@ async def index() -> str:
     topNBtn.textContent = `TopN: ${topNLevels}`;
     smoothBtn.textContent = `Smooth: ${smoothBands ? 'ON' : 'OFF'}`;
     consumeBtn.textContent = `Consume: ${consumeOnPrints ? 'ON' : 'OFF'}`;
+    bandBtn.textContent = `Bands: ${bandify ? 'ON' : 'OFF'}`;
+    gapBtn.textContent = `Gap: ${bandGapBins}`;
+    minBtn.textContent = `Min: ${bandMinBins}`;
   }
   updateExposureLabels();
 
@@ -848,6 +931,27 @@ async def index() -> str:
 
   consumeBtn.addEventListener('click', () => {
     consumeOnPrints = !consumeOnPrints;
+    updateExposureLabels();
+  });
+
+  bandBtn.addEventListener('click', () => {
+    bandify = !bandify;
+    updateExposureLabels();
+  });
+
+  gapBtn.addEventListener('click', () => {
+    const steps = [0,1,2,3];
+    let idx = steps.indexOf(bandGapBins);
+    if (idx < 0) idx = 1;
+    bandGapBins = steps[(idx + 1) % steps.length];
+    updateExposureLabels();
+  });
+
+  minBtn.addEventListener('click', () => {
+    const steps = [1,2,3,4,6];
+    let idx = steps.indexOf(bandMinBins);
+    if (idx < 0) idx = 1;
+    bandMinBins = steps[(idx + 1) % steps.length];
     updateExposureLabels();
   });
 
