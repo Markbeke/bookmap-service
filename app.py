@@ -50,7 +50,7 @@ BIN_USD = float(os.getenv("QD_BIN_USD", "5"))            # price bin size for sn
 TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))    # levels retained per side
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX5_HEAT_ACCUMULATOR_FIX1"
+BUILD = "FIX6_AUTO_EXPOSURE_PALETTE_FIX1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -361,6 +361,9 @@ async def index() -> str:
       <button id="followBtn">Autofollow: ON</button>
       <button id="resetBtn">Reset view</button>
       <button id="testBtn">Test pattern: OFF</button>
+      <button id="gainBtn">Gain: 1.00</button>
+      <button id="gammaBtn">Gamma: 0.65</button>
+      <button id="floorBtn">Floor: 0.02</button>
     </div>
     <div id="err"></div>
   </div>
@@ -389,6 +392,9 @@ async def index() -> str:
   const followBtn = document.getElementById('followBtn');
   const resetBtn = document.getElementById('resetBtn');
   const testBtn = document.getElementById('testBtn');
+  const gainBtn = document.getElementById('gainBtn');
+  const gammaBtn = document.getElementById('gammaBtn');
+  const floorBtn = document.getElementById('floorBtn');
 
   let autofollow = true;
   let testPattern = false;
@@ -407,6 +413,14 @@ async def index() -> str:
 
   let emaMax = 0.0;            // running max for scaling
   let lastDrawSnap = null;
+  // Auto-exposure (Phase 4): robust percentile scaling on recent heat_max samples
+  const MAXV_WIN = 240; // ~1 minute at 4Hz; adjusted by tick rate
+  const maxvHist = new Array(MAXV_WIN);
+  let maxvIdx = 0;
+  let maxvCount = 0;
+  let heatGain = 1.00;      // multiplies exposure
+  let heatGamma = 0.65;     // <1 brightens bands, >1 darkens
+  let heatFloor = 0.02;     // threshold below which pixels stay near-black
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -445,10 +459,25 @@ async def index() -> str:
 
   // Simple blue->red heat mapping (Phase 4 will replace with percentile/log/gamma)
   function heatColor(t) {
+    // Bookmap-like: deep blue -> cyan -> yellow -> red (on black)
     t = Math.max(0, Math.min(1, t));
-    const r = Math.floor(255 * Math.pow(t, 0.85));
-    const g = Math.floor(60 * Math.pow(t, 1.2));
-    const b = Math.floor(255 * Math.pow(1 - t, 0.25));
+    let r=0, g=0, b=0;
+    if (t < 0.33) {
+      const u = t / 0.33;
+      r = Math.floor(10 * u);
+      g = Math.floor(200 * u);
+      b = Math.floor(120 + (255-120) * u);
+    } else if (t < 0.66) {
+      const u = (t - 0.33) / 0.33;
+      r = Math.floor(0 + 255 * u);
+      g = Math.floor(200 + (255-200) * u);
+      b = Math.floor(255 - 255 * u);
+    } else {
+      const u = (t - 0.66) / 0.34;
+      r = 255;
+      g = Math.floor(255 - (255-40) * u);
+      b = 0;
+    }
     return `rgb(${r},${g},${b})`;
   }
 
@@ -507,14 +536,33 @@ async def index() -> str:
         bins.push([p, t]);
       }
       maxv = 1.0;
+    }    // --- Auto-exposure (robust): track recent heat_max values and use percentile scaling ---
+    if (maxv && isFinite(maxv) && maxv > 0) {
+      maxvHist[maxvIdx] = maxv;
+      maxvIdx = (maxvIdx + 1) % MAXV_WIN;
+      maxvCount = Math.min(MAXV_WIN, maxvCount + 1);
+      // keep a light EMA too (helps when percentile window is sparse)
+      emaMax = (1 - MAX_EMA_ALPHA) * emaMax + (MAX_EMA_ALPHA) * maxv;
+      if (emaMax < maxv) emaMax = maxv;
     }
 
-    // Update exposure EMA
-    if (maxv && isFinite(maxv) && maxv > 0) {
-      emaMax = (1 - MAX_EMA_ALPHA) * emaMax + (MAX_EMA_ALPHA) * maxv;
-      if (emaMax < maxv) emaMax = maxv; // quick react up
+    function percentile(arr, n, q) {
+      if (n <= 0) return 0;
+      const tmp = [];
+      for (let i=0; i<n; i++) {
+        const v = arr[i];
+        if (v !== undefined && v !== null && isFinite(v) && v > 0) tmp.push(v);
+      }
+      if (tmp.length === 0) return 0;
+      tmp.sort((a,b)=>a-b);
+      const idx = Math.max(0, Math.min(tmp.length-1, Math.floor(q * (tmp.length-1))));
+      return tmp[idx];
     }
-    const scaleMax = Math.max(1e-9, Math.max(maxv || 0, emaMax || 0));
+
+    const p98 = percentile(maxvHist, maxvCount, 0.98);
+    let scaleMax = Math.max(1e-9, Math.max(p98 || 0, emaMax || 0));
+    // apply gain (higher gain => brighter => lower scaleMax)
+    scaleMax = scaleMax / Math.max(1e-6, heatGain);
 
     // Draw new column
     if (bins && bins.length > 0) {
@@ -522,7 +570,11 @@ async def index() -> str:
         const p = bins[i][0];
         const v = bins[i][1];
         if (!(p >= lo && p <= hi)) continue;
-        const t = Math.max(0, Math.min(1, v / scaleMax));
+        let t = Math.max(0, Math.min(1, v / scaleMax));
+        // floor (suppress noise) then gamma shaping
+        t = Math.max(0, (t - heatFloor) / Math.max(1e-6, (1 - heatFloor)));
+        t = Math.pow(t, heatGamma);
+
 
         const y = yOfPrice(p, lo, hi, H);
         const y2 = yOfPrice(p + binUsd, lo, hi, H);
@@ -652,6 +704,34 @@ async def index() -> str:
   testBtn.addEventListener('click', () => {
     testPattern = !testPattern;
     testBtn.textContent = `Test pattern: ${testPattern ? 'ON' : 'OFF'}`;
+  });
+  function updateExposureLabels() {
+    gainBtn.textContent = `Gain: ${heatGain.toFixed(2)}`;
+    gammaBtn.textContent = `Gamma: ${heatGamma.toFixed(2)}`;
+    floorBtn.textContent = `Floor: ${heatFloor.toFixed(2)}`;
+  }
+  updateExposureLabels();
+
+  gainBtn.addEventListener('click', () => {
+    const steps = [0.50,0.75,1.00,1.25,1.50,2.00];
+    let idx = steps.indexOf(Number(heatGain.toFixed(2)));
+    if (idx < 0) idx = 2;
+    heatGain = steps[(idx + 1) % steps.length];
+    updateExposureLabels();
+  });
+  gammaBtn.addEventListener('click', () => {
+    const steps = [0.45,0.55,0.65,0.80,1.00];
+    let idx = steps.indexOf(Number(heatGamma.toFixed(2)));
+    if (idx < 0) idx = 2;
+    heatGamma = steps[(idx + 1) % steps.length];
+    updateExposureLabels();
+  });
+  floorBtn.addEventListener('click', () => {
+    const steps = [0.00,0.01,0.02,0.04,0.06];
+    let idx = steps.indexOf(Number(heatFloor.toFixed(2)));
+    if (idx < 0) idx = 2;
+    heatFloor = steps[(idx + 1) % steps.length];
+    updateExposureLabels();
   });
 
   CANVAS.addEventListener('pointerdown', (e) => {
