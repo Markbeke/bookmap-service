@@ -560,6 +560,30 @@ HTML = r"""
   </div>
 
 <script>
+
+    // --- FIX17 hardening (iPad/Brave): define helpers + never-silent render failures ---
+    const floorU8 = (x) => {
+      x = Math.floor(x);
+      if (x < 0) return 0;
+      if (x > 255) return 255;
+      return x;
+    };
+    // tick size is used for y-quantization; fall back to 0.1 if not provided.
+    let tickSize = 0.1;
+
+    function setJsErr(step, err){
+      const el = document.getElementById('js_err');
+      if(!el) return;
+      const msg = (err && (err.stack || err.message || String(err))) || String(err);
+      el.textContent = `JS ERROR (FIX17) step=${step}\n${msg}`;
+      el.style.display = 'block';
+    }
+    function clearJsErr(){
+      const el = document.getElementById('js_err');
+      if(!el) return;
+      el.textContent = '';
+      el.style.display = 'none';
+    }
 (() => {
   const cv = document.getElementById("cv");
   const ctx = cv.getContext("2d");
@@ -866,7 +890,8 @@ HTML = r"""
   }
 
   function draw() {
-    const w = cv.width;
+    try {
+const w = cv.width;
     const h = cv.height;
 
     ctx.clearRect(0,0,w,h);
