@@ -1,6 +1,9 @@
-# QuantDesk Bookmap Service (Replit/GitHub) — FIX2
+# QuantDesk Bookmap Service (Replit/GitHub) — FIX3
 # Goals:
-# 1) Smooth, stable Bookmap-like scroll/zoom (no "pressed to left" drift)
+# 1) Correct pan/zoom anchoring (no inverted drag; zoom stays aligned)
+# 2) Bookmap-like heat exposure: suppress weak liquidity haze; preserve dense bands
+# 3) Add liquidity 'consumption' burn so price movement cools bands it trades through
+# 4) Stable time window mapping + primary price truth
 # 2) Correct heat palette: weak=light blue, strong=red, none=black
 # 3) Heat dimmer acts like a "vmax/exposure" control (keeps dense bands visible, doesn't nuke everything)
 # 4) Reduce over-crowding: client uses server trade list as authoritative (no duplicate appends)
@@ -561,6 +564,7 @@ HTML = r"""
   let trades = [];
   let lastPx = null;
   let midPx = null;
+  let prevLastPx = null;
 
   // time window
   let timeSpanSec = 90;
@@ -693,9 +697,15 @@ HTML = r"""
       const colIdx = msg.heat_patch.col_idx;
       const u8 = b64ToU8(msg.heat_patch.b64);
       if (u8.length === heat.rows) {
-        heat.ring[colIdx % heat.cols] = u8;
+        // Apply "burn" using latest trade movement on the same column: price eats liquidity.
+        if (prevLastPx !== null && lastPx !== null && lastPx !== undefined) {
+          burnBetweenPx(u8, prevLastPx, lastPx);
+        }
       }
     }
+
+    // track previous trade for next burn
+    prevLastPx = (lastPx !== null && lastPx !== undefined) ? lastPx : prevLastPx;
 
     // IMPORTANT: trades snapshot is authoritative; do NOT append (prevents drift/crowding)
     if (Array.isArray(msg.trades)) {
@@ -733,7 +743,7 @@ HTML = r"""
       autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
       const dy = e.clientY - dragStartY;
       const pxPerPrice = (cv.clientHeight) / viewSpan;
-      const dPrice = dy / Math.max(1, pxPerPrice);
+      const dPrice = (-dy) / Math.max(1, pxPerPrice);
       viewMid = (dragStartMid ?? viewMid) + dPrice;
     }
 
@@ -743,7 +753,19 @@ HTML = r"""
       const dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
       const dist = Math.sqrt(dx*dx + dy*dy);
       const scale = pinchStartDist / Math.max(10, dist);
-      viewSpan = clamp(pinchStartSpan * scale, MIN_PSPAN, MAX_PSPAN);
+
+// anchor around midpoint Y of the two pointers
+const midY = (pts[0].y + pts[1].y) / 2;
+const rect = cv.getBoundingClientRect();
+const y = (midY - rect.top);
+const yFrac = clamp(y / Math.max(1, rect.height), 0, 1);
+
+// price under midpoint before zoom
+const pUnder = viewMid + viewSpan * (0.5 - yFrac);
+
+const newSpan = clamp(pinchStartSpan * scale, MIN_PSPAN, MAX_PSPAN);
+viewSpan = newSpan;
+viewMid = pUnder - viewSpan * (0.5 - yFrac);
     }
   });
 
@@ -760,8 +782,20 @@ HTML = r"""
     if (viewMid === null || viewSpan === null) return;
     e.preventDefault();
     autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
+
+    const rect = cv.getBoundingClientRect();
+    const y = (e.clientY - rect.top);
+    const yFrac = clamp(y / Math.max(1, rect.height), 0, 1);
+
+    // price under cursor before zoom
+    const pUnder = viewMid + viewSpan * (0.5 - yFrac);
+
     const factor = (e.deltaY > 0) ? 1.10 : 0.90;
-    viewSpan = clamp(viewSpan * factor, MIN_PSPAN, MAX_PSPAN);
+    const newSpan = clamp(viewSpan * factor, MIN_PSPAN, MAX_PSPAN);
+
+    // keep pUnder anchored under cursor
+    viewSpan = newSpan;
+    viewMid = pUnder - viewSpan * (0.5 - yFrac);
   }, {passive:false});
 
   // -------------- Rendering pipeline (reused buffers) --------------
@@ -788,7 +822,29 @@ HTML = r"""
 
   function rowOfPrice(p) {
     return Math.floor((p - heat.anchorMinPrice) / heat.binUsd);
+  
+  // Liquidity "consumption" / burn: when trade price crosses levels, we reduce the latest heat column
+  // so bands behind price cool down (Bookmap-like: price eats liquidity).
+  const BURN_CAP_U8 = 36;         // upper cap for burned pixels (keeps them blue-ish, not red)
+  const BURN_BAND_ROWS = 1;       // widen burn corridor by +/- rows
+
+  function burnBetweenPx(colU8, pxA, pxB) {
+    if (!colU8 || !heat.ready) return;
+    if (pxA === null || pxB === null || pxA === undefined || pxB === undefined) return;
+    const rA = rowOfPrice(pxA);
+    const rB = rowOfPrice(pxB);
+    if (!isFinite(rA) || !isFinite(rB)) return;
+    let lo = Math.min(rA, rB) - BURN_BAND_ROWS;
+    let hi = Math.max(rA, rB) + BURN_BAND_ROWS;
+    lo = clamp(lo, 0, heat.rows-1);
+    hi = clamp(hi, 0, heat.rows-1);
+    for (let r = lo; r <= hi; r++) {
+      const v = colU8[r] || 0;
+      if (v > 0) colU8[r] = Math.min(v, BURN_CAP_U8);
+    }
   }
+
+}
 
   // Bookmap-like palette: light blue -> cyan -> yellow -> orange -> red (strongest)
   function heatRGBA(a) {
@@ -911,7 +967,7 @@ if (autoExp) {
 
   // Dim controls the target percentile: low dim => brighter (lower pct), high dim => darker (higher pct).
   // Range chosen to mimic Bookmap exposure behavior.
-  const pct = clamp(0.950 + 0.049 * heatDim, 0.90, 0.999); // 0.95 .. ~0.999
+  const pct = clamp(0.930 + 0.069 * heatDim, 0.85, 0.9995); // 0.95 .. ~0.999
   vmax = histPercentileValue(hist, pct);
   vmax = Math.max(vmax, 24);
 } else {
@@ -920,7 +976,7 @@ if (autoExp) {
 
 // Additional "contrast compression" knee: removes low-intensity clutter as heatDim increases.
 // knee in [0..0.35]
-const knee = 0.35 * heatDim;
+const knee = 0.50 * heatDim;
 
 // fill pixels
       // fill pixels
@@ -933,6 +989,9 @@ const knee = 0.35 * heatDim;
           const row = rTop + y;
           const v = col[row] || 0;
           if (v === 0) continue;
+
+          const floorU8 = Math.floor(vmax * (0.10 + 0.45 * heatDim));
+          if (v < floorU8) continue;
 
 let a = clamp(v / vmax, 0, 1);
 
