@@ -1,3 +1,11 @@
+# QuantDesk Bookmap Service (Replit/GitHub) — FIX1
+# Goals:
+# 1) Smooth, stable Bookmap-like scroll/zoom (no "pressed to left" drift)
+# 2) Correct heat palette: weak=light blue, strong=red, none=black
+# 3) Heat dimmer acts like a "vmax/exposure" control (keeps dense bands visible, doesn't nuke everything)
+# 4) Reduce over-crowding: client uses server trade list as authoritative (no duplicate appends)
+# 5) Performance: reuse offscreen canvas + ImageData buffers; no per-frame canvas allocations
+
 import os
 import json
 import time
@@ -14,42 +22,32 @@ import websockets
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 
-# ============================================================
-# QuantDesk Bookmap Service (Absolute Grid + Smooth UI Controls)
-#
-# Key upgrades vs prior build:
-# 1) Client: NO per-frame offscreen canvas allocation (removes jitter)
-# 2) Client: Time PAN (horizontal drag) + bounded time offset (stops "pushing left")
-# 3) Client: Bookmap-style controls (heat dimming/contrast/threshold + bubble controls)
-# 4) Client: Robust auto-exposure (percentile + EWMA) to avoid "all yellow" wash
-# 5) Labels: clearer "TRADE(last)" vs "MID(BBO)" + bid/ask on status line
-# ============================================================
 
 # -----------------------------
 # Config (env)
 # -----------------------------
 WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
-SYMBOL_WS = os.environ.get("QD_SYMBOL_WS", "BTC_USDT")  # MEXC WS uses BTC_USDT
+SYMBOL_WS = os.environ.get("QD_SYMBOL_WS", "BTC_USDT")
 PORT = int(os.environ.get("PORT", "5000"))
 
 MAX_TRADES = int(os.environ.get("QD_MAX_TRADES", "6000"))
 
-# Depth snapshot for UI (book ladder & trades)
-TOP_LEVELS = int(os.environ.get("QD_TOP_LEVELS", "250"))          # send depth levels each side
-SNAPSHOT_HZ = float(os.environ.get("QD_SNAPSHOT_HZ", "6"))         # UI snapshots/sec
+TOP_LEVELS = int(os.environ.get("QD_TOP_LEVELS", "250"))
+SNAPSHOT_HZ = float(os.environ.get("QD_SNAPSHOT_HZ", "6"))
 
-# Heatmap timeline storage
-HEAT_WINDOW_SEC = int(os.environ.get("QD_HEAT_WINDOW_SEC", "3600"))  # 60m
-HEAT_COL_MS = int(os.environ.get("QD_HEAT_COL_MS", "1000"))          # 1s columns
+HEAT_WINDOW_SEC = int(os.environ.get("QD_HEAT_WINDOW_SEC", "3600"))
+HEAT_COL_MS = int(os.environ.get("QD_HEAT_COL_MS", "1000"))
 
-# Absolute price grid
-PRICE_BIN_USD = float(os.environ.get("QD_PRICE_BIN_USD", "1.0"))     # $ per row (absolute)
-RANGE_USD = float(os.environ.get("QD_RANGE_USD", "4000"))            # total range stored (e.g., 4000 => +/-2000)
+PRICE_BIN_USD = float(os.environ.get("QD_PRICE_BIN_USD", "1.0"))
+RANGE_USD = float(os.environ.get("QD_RANGE_USD", "4000"))
 DEFAULT_PRICE_SPAN = float(os.environ.get("QD_DEFAULT_PRICE_SPAN", "600.0"))
 
-# Heat quantization
-HEAT_LOG_SCALE = float(os.environ.get("QD_HEAT_LOG_SCALE", "32.0"))  # higher => brighter
-HEAT_CELL_MAX = int(os.environ.get("QD_HEAT_CELL_MAX", "255"))       # uint8
+HEAT_LOG_SCALE = float(os.environ.get("QD_HEAT_LOG_SCALE", "32.0"))
+HEAT_CELL_MAX = int(os.environ.get("QD_HEAT_CELL_MAX", "255"))
+
+# server-side optional decay (keeps very old resting levels from saturating to 255)
+HEAT_DECAY_PER_COL = float(os.environ.get("QD_HEAT_DECAY_PER_COL", "0.985"))  # 1.0 disables
+HEAT_BOOK_SAMPLE_LIMIT = int(os.environ.get("QD_HEAT_BOOK_SAMPLE_LIMIT", "0"))  # 0 => full book
 
 # -----------------------------
 # Helpers
@@ -79,6 +77,7 @@ def safe_int(x: Any, default: int = 0) -> int:
     except Exception:
         return default
 
+
 # -----------------------------
 # State
 # -----------------------------
@@ -88,8 +87,7 @@ class OrderBook:
     asks: Dict[float, float] = field(default_factory=dict)
 
     def apply_side_updates(self, side: str, levels: List[List[Any]]) -> None:
-        # MEXC push.depth levels are commonly [price, qty, count]
-        # qty==0 => remove
+        # MEXC push.depth levels: [price, qty, count]; qty==0 => remove
         book = self.bids if side == "bids" else self.asks
         for lvl in levels:
             if not lvl or len(lvl) < 2:
@@ -113,6 +111,16 @@ class OrderBook:
         asks_sorted = sorted(self.asks.items(), key=lambda x: x[0], reverse=False)[:n]
         return {"bids": bids_sorted, "asks": asks_sorted}
 
+    def iter_sampled(self) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        """Optionally sample book (for CPU control). If limit==0, return full."""
+        lim = int(HEAT_BOOK_SAMPLE_LIMIT)
+        if lim <= 0:
+            return list(self.bids.items()), list(self.asks.items())
+        # sample by taking top lim by qty (roughly highlights dominant resting liquidity)
+        bids = sorted(self.bids.items(), key=lambda x: x[1], reverse=True)[:lim]
+        asks = sorted(self.asks.items(), key=lambda x: x[1], reverse=True)[:lim]
+        return bids, asks
+
 @dataclass
 class Trades:
     dq: deque = field(default_factory=lambda: deque(maxlen=MAX_TRADES))
@@ -120,12 +128,13 @@ class Trades:
     def append(self, t: Dict[str, Any]) -> None:
         self.dq.append(t)
 
+
 class HeatmapRing:
     """
     Absolute price grid heat storage:
-      - rows = fixed price bins (min_price + i*bin_usd)
-      - cols = fixed time columns (every HEAT_COL_MS), stored in a ring
-    We send *patches* (new columns) to clients; clients keep their own ring.
+      - rows = fixed price bins (anchor_min_price + i*bin_usd)
+      - cols = fixed time columns (every col_ms), stored in a ring
+    Server sends patches (one new column per head advance).
     """
     def __init__(self, bin_usd: float, range_usd: float, window_sec: int, col_ms: int) -> None:
         self.bin_usd = float(bin_usd)
@@ -177,6 +186,10 @@ class HeatmapRing:
         return None
 
     def maybe_open_new_column(self, t_ms: int) -> Optional[int]:
+        """
+        Opens new columns whenever col_ms boundary passes.
+        Returns new head col_idx if opened, else None.
+        """
         if self._last_col_open_ms is None:
             self._last_col_open_ms = t_ms
             self._head_col_idx += 1
@@ -190,8 +203,23 @@ class HeatmapRing:
                 self._head_col_idx += 1
                 self._grid[self._head_col_idx % self.cols] = bytearray(self.rows)
             return self._head_col_idx
-
         return None
+
+    def _apply_decay_to_current(self) -> None:
+        # Decay previous column into current one (so bands persist but don't hard-saturate)
+        if HEAT_DECAY_PER_COL >= 0.9999:
+            return
+        if self._head_col_idx <= 0:
+            return
+        prev = self._grid[(self._head_col_idx - 1) % self.cols]
+        cur = self._grid[self._head_col_idx % self.cols]
+        if prev is None or cur is None:
+            return
+        k = float(HEAT_DECAY_PER_COL)
+        # cur = prev * k (uint8)
+        for i in range(self.rows):
+            v = int(prev[i] * k)
+            cur[i] = v if v <= 255 else 255
 
     def write_level(self, p: float, q: float) -> None:
         if self._head_col_idx < 0:
@@ -210,19 +238,18 @@ class HeatmapRing:
             return
         if v > HEAT_CELL_MAX:
             v = HEAT_CELL_MAX
-
         nv = col[row] + v
-        if nv > HEAT_CELL_MAX:
-            nv = HEAT_CELL_MAX
-        col[row] = nv
+        col[row] = HEAT_CELL_MAX if nv > HEAT_CELL_MAX else nv
 
     def export_patch_b64(self, col_idx: int) -> Optional[str]:
-        if col_idx < 0:
-            return None
-        col = self._grid[col_idx % self.cols]
+        col = self._grid[col_idx % self.cols] if col_idx >= 0 else None
         if col is None:
             return None
         return base64.b64encode(bytes(col)).decode("ascii")
+
+    def get_col(self, col_idx: int) -> Optional[bytearray]:
+        return self._grid[col_idx % self.cols] if col_idx >= 0 else None
+
 
 class MexcFeed:
     def __init__(self) -> None:
@@ -239,7 +266,6 @@ class MexcFeed:
         self.mid_px: Optional[float] = None
 
         self._stop = False
-
         self._clients: List[WebSocket] = []
         self._clients_lock = asyncio.Lock()
 
@@ -249,7 +275,6 @@ class MexcFeed:
             window_sec=HEAT_WINDOW_SEC,
             col_ms=HEAT_COL_MS,
         )
-
         self._last_patch_sent_head: int = -1
 
     async def add_client(self, ws: WebSocket) -> None:
@@ -271,9 +296,8 @@ class MexcFeed:
 
     async def broadcast_snapshot(self) -> None:
         self._update_bba_mid()
-
         book = self.book.top_n(TOP_LEVELS)
-        trades = list(self.trades.dq)[-2000:]
+        trades = list(self.trades.dq)[-1500:]  # authoritative snapshot
 
         if self.mid_px is not None:
             self.heat.ensure_anchor(self.mid_px)
@@ -318,12 +342,7 @@ class MexcFeed:
             },
             "heat_patch": heat_patch,
             "ui_defaults": {
-                "heat_window_sec": HEAT_WINDOW_SEC,
-                "heat_col_ms": HEAT_COL_MS,
-                "heat_bins": self.heat.rows,
                 "default_price_span": DEFAULT_PRICE_SPAN,
-                "price_bin_usd": PRICE_BIN_USD,
-                "range_usd": RANGE_USD,
             },
         }
 
@@ -361,10 +380,15 @@ class MexcFeed:
 
                 new_head = self.heat.maybe_open_new_column(t)
                 if new_head is not None:
-                    for p, q in self.book.bids.items():
+                    # decay previous -> current (prevents hard saturation)
+                    self.heat._apply_decay_to_current()
+
+                    # sample current resting book and write into current column
+                    bids, asks = self.book.iter_sampled()
+                    for p, q in bids:
                         if q > 0:
                             self.heat.write_level(p, q)
-                    for p, q in self.book.asks.items():
+                    for p, q in asks:
                         if q > 0:
                             self.heat.write_level(p, q)
             except Exception:
@@ -392,14 +416,12 @@ class MexcFeed:
 
                         if ch in ("push.depth", "rs.push.depth"):
                             data = msg.get("data", {}) or {}
-                            bids = data.get("bids", []) or []
-                            asks = data.get("asks", []) or []
-                            self.book.apply_side_updates("bids", bids)
-                            self.book.apply_side_updates("asks", asks)
+                            self.book.apply_side_updates("bids", data.get("bids", []) or [])
+                            self.book.apply_side_updates("asks", data.get("asks", []) or [])
                             self.last_depth_ms = now_ms()
                             self._update_bba_mid()
 
-                        if ch in ("push.deal", "rs.push.deal"):
+                        elif ch in ("push.deal", "rs.push.deal"):
                             data = msg.get("data", [])
                             if isinstance(data, list):
                                 for t in data:
@@ -417,6 +439,10 @@ class MexcFeed:
                 self.ws_ok = False
                 await asyncio.sleep(1.5)
 
+
+# -----------------------------
+# Web App
+# -----------------------------
 app = FastAPI()
 feed = MexcFeed()
 
@@ -426,7 +452,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (Absolute Grid Heat)</title>
+  <title>QuantDesk Bookmap (FIX1)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
     #topbar {
@@ -451,10 +477,9 @@ HTML = r"""
       color:#cbd5e1;
       font-size:12px;
     }
-    .ctl { display:flex; align-items:center; gap:6px; }
-    .ctl label { font-size:12px; color:#94a3b8; }
-    input[type="range"] { width:120px; }
-    #wrap { height: calc(100% - 78px); display:flex; }
+    .ctl { display:flex; align-items:center; gap:8px; }
+    input[type="range"] { width: 160px; }
+    #wrap { height: calc(100% - 96px); display:flex; }
     canvas { width: 100%; height: 100%; display:block; touch-action:none; }
   </style>
 </head>
@@ -463,22 +488,35 @@ HTML = r"""
     <span id="statusDot"></span>
     <span class="mono" id="sym"></span>
     <span class="mono" id="health"></span>
-
     <button id="btnAF">AutoFollow: ON</button>
     <button id="btnTm">-T</button>
     <button id="btnTp">+T</button>
     <button id="btnPm">-P</button>
     <button id="btnPp">+P</button>
-    <button id="btnAE">AutoExp: ON</button>
+  </div>
 
-    <span class="ctl"><label>Heat Dim</label><input id="slDim" type="range" min="0" max="100" value="70"></span>
-    <span class="ctl"><label>Heat Thr</label><input id="slThr" type="range" min="0" max="255" value="8"></span>
-    <span class="ctl"><label>Heat Ctr</label><input id="slGam" type="range" min="30" max="300" value="90"></span>
-    <span class="ctl"><label>Heat Bri</label><input id="slBri" type="range" min="50" max="300" value="120"></span>
+  <div id="topbar" style="border-bottom:1px solid #111827;">
+    <button id="btnAutoExp">AutoExp: ON</button>
 
-    <span class="ctl"><label>Bub Op</label><input id="slBOp" type="range" min="0" max="100" value="60"></span>
-    <span class="ctl"><label>Bub Sz</label><input id="slBSz" type="range" min="0" max="250" value="100"></span>
-    <span class="ctl"><label>Bub Min</label><input id="slBMin" type="range" min="0" max="100" value="0"></span>
+    <div class="ctl"><span class="mono">Heat Dim</span>
+      <input id="slDim" type="range" min="0" max="100" value="20"/>
+    </div>
+    <div class="ctl"><span class="mono">Heat Thr</span>
+      <input id="slThr" type="range" min="0" max="100" value="6"/>
+    </div>
+    <div class="ctl"><span class="mono">Heat Ctr</span>
+      <input id="slCtr" type="range" min="0" max="100" value="50"/>
+    </div>
+
+    <div class="ctl"><span class="mono">Bub Op</span>
+      <input id="slBubOp" type="range" min="0" max="100" value="65"/>
+    </div>
+    <div class="ctl"><span class="mono">Bub Sz</span>
+      <input id="slBubSz" type="range" min="10" max="200" value="100"/>
+    </div>
+    <div class="ctl"><span class="mono">Bub Min</span>
+      <input id="slBubMin" type="range" min="0" max="100" value="2"/>
+    </div>
   </div>
 
   <div id="wrap">
@@ -499,74 +537,44 @@ HTML = r"""
   const btnTp = document.getElementById("btnTp");
   const btnPm = document.getElementById("btnPm");
   const btnPp = document.getElementById("btnPp");
-  const btnAE = document.getElementById("btnAE");
 
+  const btnAutoExp = document.getElementById("btnAutoExp");
   const slDim = document.getElementById("slDim");
   const slThr = document.getElementById("slThr");
-  const slGam = document.getElementById("slGam");
-  const slBri = document.getElementById("slBri");
-  const slBOp = document.getElementById("slBOp");
-  const slBSz = document.getElementById("slBSz");
-  const slBMin = document.getElementById("slBMin");
+  const slCtr = document.getElementById("slCtr");
+  const slBubOp = document.getElementById("slBubOp");
+  const slBubSz = document.getElementById("slBubSz");
+  const slBubMin = document.getElementById("slBubMin");
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
     cv.width = Math.floor(cv.clientWidth * dpr);
     cv.height = Math.floor(cv.clientHeight * dpr);
-    ctx.setTransform(dpr,0,0,dpr,0,0);
+    // draw in device pixels; no transform drift
+    ctx.setTransform(1,0,0,1,0,0);
   }
   window.addEventListener("resize", resize);
   resize();
 
+  // -------------- Data state --------------
   let last = null;
   let trades = [];
   let lastPx = null;
   let midPx = null;
-  let bestBid = null;
-  let bestAsk = null;
 
+  // time window
   let timeSpanSec = 90;
   const MIN_TSPAN = 30;
   const MAX_TSPAN = 60 * 60;
 
-  let timeOffsetMs = 0;
-
+  // price view
   let autoFollow = true;
   let viewMid = null;
   let viewSpan = null;
   const MIN_PSPAN = 40;
   const MAX_PSPAN = 20000;
 
-  let autoExposure = true;
-  let expVmaxEwma = 64;
-
-  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
-
-  function heatDimAlpha() { return clamp(parseInt(slDim.value,10)/100, 0, 1); }
-  function heatThreshold() { return clamp(parseInt(slThr.value,10), 0, 255); }
-  function heatGamma() { return clamp(parseInt(slGam.value,10)/100, 0.3, 3.0); }
-  function heatBrightness() { return clamp(parseInt(slBri.value,10)/100, 0.5, 3.0); }
-
-  function bubOpacity() { return clamp(parseInt(slBOp.value,10)/100, 0, 1); }
-  function bubScale() { return clamp(parseInt(slBSz.value,10)/100, 0, 2.5); }
-  function bubMinPct() { return clamp(parseInt(slBMin.value,10)/100, 0, 1); }
-
-  btnAF.onclick = () => {
-    autoFollow = !autoFollow;
-    if (autoFollow) timeOffsetMs = 0;
-    btnAF.textContent = `AutoFollow: ${autoFollow ? "ON" : "OFF"}`;
-  };
-  btnAE.onclick = () => {
-    autoExposure = !autoExposure;
-    btnAE.textContent = `AutoExp: ${autoExposure ? "ON" : "OFF"}`;
-  };
-
-  btnTm.onclick = () => { timeSpanSec = clamp(Math.floor(timeSpanSec / 1.5), MIN_TSPAN, MAX_TSPAN); };
-  btnTp.onclick = () => { timeSpanSec = clamp(Math.floor(timeSpanSec * 1.5), MIN_TSPAN, MAX_TSPAN); };
-
-  btnPm.onclick = () => { viewSpan = clamp((viewSpan ?? 600) * 0.75, MIN_PSPAN, MAX_PSPAN); };
-  btnPp.onclick = () => { viewSpan = clamp((viewSpan ?? 600) * 1.33, MIN_PSPAN, MAX_PSPAN); };
-
+  // heat ring
   let heat = {
     ready: false,
     windowSec: null,
@@ -580,32 +588,49 @@ HTML = r"""
     ring: [],
   };
 
-  function initHeat(meta) {
-    heat.windowSec = meta.window_sec;
-    heat.colMs = meta.col_ms;
-    heat.cols = meta.cols;
-    heat.binUsd = meta.bin_usd;
-    heat.rangeUsd = meta.range_usd;
-    heat.rows = meta.rows;
-    heat.anchorMinPrice = meta.anchor_min_price;
-    heat.head = meta.head;
-    heat.ring = new Array(heat.cols).fill(null);
-    heat.ready = !!(heat.anchorMinPrice !== null && heat.rows && heat.cols && heat.colMs);
+  // UI controls
+  let autoExp = true;
+  let heatDim = 0.20;    // acts on vmax (lower -> brighter)
+  let heatThr = 0.06;    // per-pixel alpha threshold
+  let heatCtr = 0.50;    // gamma/contrast
+  let bubOp = 0.65;
+  let bubSz = 1.00;
+  let bubMin = 0.02;
+
+  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+
+  function setFromSliders() {
+    heatDim = clamp(parseInt(slDim.value,10)/100, 0.0, 1.0);
+    heatThr = clamp(parseInt(slThr.value,10)/100, 0.0, 1.0);
+    heatCtr = clamp(parseInt(slCtr.value,10)/100, 0.0, 1.0);
+    bubOp = clamp(parseInt(slBubOp.value,10)/100, 0.0, 1.0);
+    bubSz = clamp(parseInt(slBubSz.value,10)/100, 0.1, 2.0);
+    bubMin = clamp(parseInt(slBubMin.value,10)/100, 0.0, 1.0);
   }
+  slDim.oninput = setFromSliders;
+  slThr.oninput = setFromSliders;
+  slCtr.oninput = setFromSliders;
+  slBubOp.oninput = setFromSliders;
+  slBubSz.oninput = setFromSliders;
+  slBubMin.oninput = setFromSliders;
+  setFromSliders();
 
-  let off = document.createElement("canvas");
-  let octx = off.getContext("2d");
-  let offW = 0, offH = 0;
-  let offImg = null;
+  btnAutoExp.onclick = () => {
+    autoExp = !autoExp;
+    btnAutoExp.textContent = `AutoExp: ${autoExp ? "ON" : "OFF"}`;
+  };
 
-  function ensureOffscreen(w, h) {
-    if (w === offW && h === offH && offImg) return;
-    offW = w; offH = h;
-    off.width = w;
-    off.height = h;
-    offImg = octx.createImageData(w, h);
-  }
+  btnAF.onclick = () => {
+    autoFollow = !autoFollow;
+    btnAF.textContent = `AutoFollow: ${autoFollow ? "ON" : "OFF"}`;
+  };
 
+  btnTm.onclick = () => { timeSpanSec = clamp(Math.floor(timeSpanSec / 1.5), MIN_TSPAN, MAX_TSPAN); };
+  btnTp.onclick = () => { timeSpanSec = clamp(Math.floor(timeSpanSec * 1.5), MIN_TSPAN, MAX_TSPAN); };
+  btnPm.onclick = () => { viewSpan = clamp(viewSpan * 0.75, MIN_PSPAN, MAX_PSPAN); };
+  btnPp.onclick = () => { viewSpan = clamp(viewSpan * 1.33, MIN_PSPAN, MAX_PSPAN); };
+
+  // -------------- WebSocket --------------
   function wsUrl() {
     const proto = (location.protocol === "https:") ? "wss" : "ws";
     return `${proto}://${location.host}/ws`;
@@ -620,22 +645,33 @@ HTML = r"""
     return out;
   }
 
+  function initHeat(meta) {
+    heat.windowSec = meta.window_sec;
+    heat.colMs = meta.col_ms;
+    heat.cols = meta.cols;
+    heat.binUsd = meta.bin_usd;
+    heat.rangeUsd = meta.range_usd;
+    heat.rows = meta.rows;
+    heat.anchorMinPrice = meta.anchor_min_price;
+    heat.head = meta.head;
+    heat.ring = new Array(heat.cols).fill(null);
+    heat.ready = !!(heat.anchorMinPrice !== null && heat.rows && heat.cols);
+  }
+
   WS.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     last = msg;
 
     dot.style.background = msg.ws_ok ? "#22c55e" : "#ef4444";
+
     lastPx = (msg.last_px ?? lastPx);
     midPx = (msg.mid_px ?? midPx);
-    bestBid = (msg.best_bid ?? bestBid);
-    bestAsk = (msg.best_ask ?? bestAsk);
 
-    const lp = (lastPx !== null && lastPx !== undefined) ? Number(lastPx).toFixed(1) : "None";
-    const mp = (midPx !== null && midPx !== undefined) ? Number(midPx).toFixed(1) : "None";
-    const bb = (bestBid !== null && bestBid !== undefined) ? Number(bestBid).toFixed(1) : "None";
-    const ba = (bestAsk !== null && bestAsk !== undefined) ? Number(bestAsk).toFixed(1) : "None";
+    // show "actual" price sources: trade, mid, bid/ask
+    const bid = (msg.best_bid ?? null);
+    const ask = (msg.best_ask ?? null);
+    symEl.textContent = `${msg.symbol} | TRADE=${(lastPx ?? "None")} | MID=${(midPx ?? "None")} | bid=${(bid ?? "None")} ask=${(ask ?? "None")}`;
 
-    symEl.textContent = `${msg.symbol} | TRADE=${lp} | MID=${mp} | bid=${bb} ask=${ba}`;
     healthEl.textContent =
       `book: bids=${msg.health.bids_n} asks=${msg.health.asks_n} age: depth=${msg.health.depth_age_ms ?? "None"}ms trade=${msg.health.trade_age_ms ?? "None"}ms`;
 
@@ -648,6 +684,7 @@ HTML = r"""
       initHeat(msg.heat_meta);
     } else if (heat.ready && msg.heat_meta) {
       heat.head = msg.heat_meta.head;
+      heat.anchorMinPrice = msg.heat_meta.anchor_min_price ?? heat.anchorMinPrice;
     }
 
     if (heat.ready && msg.heat_patch && msg.heat_patch.b64) {
@@ -658,48 +695,28 @@ HTML = r"""
       }
     }
 
-    const now = Date.now();
-    const maxWindowMs = Math.min((heat.windowSec ?? 3600) * 1000, 60*60*1000);
+    // IMPORTANT: trades snapshot is authoritative; do NOT append (prevents drift/crowding)
     if (Array.isArray(msg.trades)) {
-      for (const t of msg.trades) trades.push(t);
+      trades = msg.trades;
     }
-    trades = trades.filter(t => (now - t.t) <= maxWindowMs);
   };
 
   WS.onclose = () => { dot.style.background = "#ef4444"; };
 
+  // -------------- Interaction (pointer) --------------
   let pointers = new Map();
   let pinchStartDist = null;
   let pinchStartSpan = null;
-
-  let dragStartX = null;
   let dragStartY = null;
   let dragStartMid = null;
-  let dragStartOffset = null;
-  let dragMode = null;
-
-  function maxTimeOffsetMs() {
-    if (!heat.ready) return 0;
-    const windowMs = timeSpanSec * 1000;
-    const totalMs = (heat.windowSec ?? 3600) * 1000;
-    return Math.max(0, totalMs - windowMs);
-  }
 
   cv.addEventListener("pointerdown", (e) => {
     cv.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
-
-    if (pointers.size === 1) {
-      dragStartX = e.clientX;
-      dragStartY = e.clientY;
-      dragStartMid = viewMid;
-      dragStartOffset = timeOffsetMs;
-      dragMode = null;
-    }
+    if (pointers.size === 1) { dragStartY = e.clientY; dragStartMid = viewMid; }
     if (pointers.size === 2) {
       const pts = Array.from(pointers.values());
-      const dx = pts[0].x - pts[1].x;
-      const dy = pts[0].y - pts[1].y;
+      const dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
       pinchStartDist = Math.sqrt(dx*dx + dy*dy);
       pinchStartSpan = viewSpan;
     }
@@ -710,36 +727,18 @@ HTML = r"""
     pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
     if (viewMid === null || viewSpan === null) return;
 
-    if (pointers.size === 1 && dragStartX !== null && dragStartY !== null) {
-      autoFollow = false;
-      btnAF.textContent = "AutoFollow: OFF";
-
-      const dx = e.clientX - dragStartX;
+    if (pointers.size === 1 && dragStartY !== null) {
+      autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
       const dy = e.clientY - dragStartY;
-
-      if (dragMode === null) {
-        const adx = Math.abs(dx), ady = Math.abs(dy);
-        if (adx + ady > 8) dragMode = (adx > ady) ? "time" : "price";
-      }
-
-      if (dragMode === "price") {
-        const pxPerPrice = cv.clientHeight / viewSpan;
-        const dPrice = dy / Math.max(1, pxPerPrice);
-        viewMid = (dragStartMid ?? viewMid) + dPrice;
-      } else if (dragMode === "time") {
-        const windowMs = timeSpanSec * 1000;
-        const msPerPx = windowMs / Math.max(1, cv.clientWidth);
-        const dms = dx * msPerPx;
-        timeOffsetMs = clamp((dragStartOffset ?? 0) + dms, 0, maxTimeOffsetMs());
-      }
+      const pxPerPrice = (cv.clientHeight) / viewSpan;
+      const dPrice = dy / Math.max(1, pxPerPrice);
+      viewMid = (dragStartMid ?? viewMid) + dPrice;
     }
 
     if (pointers.size === 2 && pinchStartDist && pinchStartSpan) {
-      autoFollow = false;
-      btnAF.textContent = "AutoFollow: OFF";
+      autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
       const pts = Array.from(pointers.values());
-      const dx = pts[0].x - pts[1].x;
-      const dy = pts[0].y - pts[1].y;
+      const dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
       const dist = Math.sqrt(dx*dx + dy*dy);
       const scale = pinchStartDist / Math.max(10, dist);
       viewSpan = clamp(pinchStartSpan * scale, MIN_PSPAN, MAX_PSPAN);
@@ -748,17 +747,8 @@ HTML = r"""
 
   function endPointer(e) {
     pointers.delete(e.pointerId);
-    if (pointers.size < 2) {
-      pinchStartDist = null;
-      pinchStartSpan = null;
-    }
-    if (pointers.size === 0) {
-      dragStartX = null;
-      dragStartY = null;
-      dragStartMid = null;
-      dragStartOffset = null;
-      dragMode = null;
-    }
+    if (pointers.size < 2) { pinchStartDist = null; pinchStartSpan = null; }
+    if (pointers.size === 0) { dragStartY = null; dragStartMid = null; }
   }
   cv.addEventListener("pointerup", endPointer);
   cv.addEventListener("pointercancel", endPointer);
@@ -767,79 +757,81 @@ HTML = r"""
   cv.addEventListener("wheel", (e) => {
     if (viewMid === null || viewSpan === null) return;
     e.preventDefault();
-    autoFollow = false;
-    btnAF.textContent = "AutoFollow: OFF";
+    autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
     const factor = (e.deltaY > 0) ? 1.10 : 0.90;
     viewSpan = clamp(viewSpan * factor, MIN_PSPAN, MAX_PSPAN);
   }, {passive:false});
+
+  // -------------- Rendering pipeline (reused buffers) --------------
+  const off = document.createElement("canvas");
+  const octx = off.getContext("2d");
+  let img = null; // ImageData
+  let imgW = 0, imgH = 0;
+
+  function ensureImg(w, h) {
+    if (!img || imgW !== w || imgH !== h) {
+      imgW = w; imgH = h;
+      off.width = w; off.height = h;
+      img = octx.createImageData(w, h);
+    }
+    // clear alpha quickly
+    img.data.fill(0);
+    return img;
+  }
 
   function yOf(p, pMin, pMax, h) {
     const t = (p - pMin) / (pMax - pMin);
     return h - t*h;
   }
+
   function rowOfPrice(p) {
     return Math.floor((p - heat.anchorMinPrice) / heat.binUsd);
   }
 
+  // Bookmap-like palette: light blue -> cyan -> yellow -> orange -> red (strongest)
   function heatRGBA(a) {
-    const g = Math.pow(a, 0.75);
-    let r=0, gg=0, b=0, alpha=0;
+    // apply contrast (gamma) around center
+    // heatCtr=0..1 => gamma range [0.6..2.2] (higher => more contrast)
+    const gamma = 0.6 + (2.2 - 0.6) * heatCtr;
+    const g = Math.pow(clamp(a,0,1), gamma);
 
-    if (g < 0.5) {
-      const t = g / 0.5;
-      r = 10 + 20*t;
-      gg = 40 + 160*t;
-      b = 80 + 140*t;
-      alpha = 0.05 + 0.55*g;
+    // piecewise gradient
+    let r=0, gg=0, b=0, alpha=0;
+    if (g < 0.25) {
+      // very weak: light blue
+      const t = g / 0.25;
+      r = 30 + 20*t;      // 30 -> 50
+      gg = 120 + 80*t;    // 120 -> 200
+      b = 220 + 20*(1-t); // 220 -> 200
+      alpha = 0.10 + 0.30*t;
+    } else if (g < 0.50) {
+      // cyan -> yellow
+      const t = (g - 0.25) / 0.25;
+      r = 50 + 180*t;     // 50 -> 230
+      gg = 200 + 40*t;    // 200 -> 240
+      b = 200*(1-t);      // 200 -> 0
+      alpha = 0.25 + 0.35*t;
+    } else if (g < 0.75) {
+      // yellow -> orange
+      const t = (g - 0.50) / 0.25;
+      r = 230 + 20*t;     // 230 -> 250
+      gg = 240 - 80*t;    // 240 -> 160
+      b = 0;
+      alpha = 0.45 + 0.35*t;
     } else {
-      const t = (g - 0.5) / 0.5;
-      r = 80 + 170*t;
-      gg = 180 + 60*(1-t);
-      b = 80*(1-t);
-      alpha = 0.10 + 0.75*g;
+      // orange -> red (strongest)
+      const t = (g - 0.75) / 0.25;
+      r = 250;
+      gg = 160*(1-t);     // 160 -> 0
+      b = 0;
+      alpha = 0.70 + 0.30*t;
     }
     return [r|0, gg|0, b|0, clamp(alpha, 0, 1)];
   }
 
-  function percentileFromHistogram(hist, total, pct) {
-    if (total <= 0) return 1;
-    const target = total * pct;
-    let c = 0;
-    for (let v=0; v<256; v++) {
-      c += hist[v];
-      if (c >= target) return v;
-    }
-    return 255;
-  }
-
-  function computeExposure(colsVisible, rowsVisible, r0, r1, startCol, head) {
-    const hist = new Uint32Array(256);
-    let n = 0;
-
-    const maxSampleCols = Math.min(colsVisible, 90);
-    const stepC = Math.max(1, Math.floor(colsVisible / maxSampleCols));
-    const stepR = Math.max(1, Math.floor(rowsVisible / 120));
-
-    for (let ci = startCol; ci <= head; ci += stepC) {
-      const col = heat.ring[((ci % heat.cols) + heat.cols) % heat.cols];
-      if (!col) continue;
-      for (let rr = r0; rr <= r1; rr += stepR) {
-        const v = col[rr] || 0;
-        if (v === 0) continue;
-        hist[v] += 1;
-        n += 1;
-      }
-    }
-    let p98 = percentileFromHistogram(hist, n, 0.98);
-    p98 = Math.max(16, p98);
-    if (!autoExposure) return Math.max(16, expVmaxEwma);
-    expVmaxEwma = 0.90 * expVmaxEwma + 0.10 * p98;
-    return Math.max(16, expVmaxEwma);
-  }
-
   function draw() {
-    const w = cv.clientWidth;
-    const h = cv.clientHeight;
+    const w = cv.width;
+    const h = cv.height;
 
     ctx.clearRect(0,0,w,h);
     ctx.fillStyle = "#0b0f14";
@@ -847,66 +839,74 @@ HTML = r"""
 
     if (!last || viewMid === null || viewSpan === null) {
       ctx.fillStyle = "#94a3b8";
-      ctx.font = "14px -apple-system, system-ui, Arial";
-      ctx.fillText("Waiting for data...", 12, 24);
+      ctx.font = "28px -apple-system, system-ui, Arial";
+      ctx.fillText("Waiting for data...", 24, 48);
       requestAnimationFrame(draw);
       return;
     }
 
     if (autoFollow && (midPx || lastPx)) {
       viewMid = (midPx ?? lastPx);
-      timeOffsetMs = 0;
     }
 
     const pMin = viewMid - viewSpan/2;
     const pMax = viewMid + viewSpan/2;
 
+    // ---- HEATMAP ----
     if (heat.ready && heat.head >= 0 && heat.anchorMinPrice !== null) {
       const colsVisible = clamp(Math.floor((timeSpanSec*1000) / heat.colMs), 10, heat.cols);
-
-      const offCols = Math.floor(timeOffsetMs / heat.colMs);
-      const head = heat.head - offCols;
+      const head = heat.head;
       const startCol = head - colsVisible + 1;
 
-      const safeHead = Math.max(0, head);
-      const safeStart = Math.max(0, startCol);
+      let rTop = rowOfPrice(pMax);
+      let rBot = rowOfPrice(pMin);
+      rTop = clamp(rTop, 0, heat.rows-1);
+      rBot = clamp(rBot, 0, heat.rows-1);
+      if (rBot < rTop) { const tmp=rTop; rTop=rBot; rBot=tmp; }
+      const rowsVisible = clamp((rBot - rTop + 1), 50, heat.rows);
 
-      let r0 = rowOfPrice(pMax);
-      let r1 = rowOfPrice(pMin);
-      r0 = clamp(r0, 0, heat.rows-1);
-      r1 = clamp(r1, 0, heat.rows-1);
-      if (r1 < r0) { const tmp=r0; r0=r1; r1=tmp; }
-      const rowsVisible = clamp((r1 - r0 + 1), 50, heat.rows);
+      const img = ensureImg(colsVisible, rowsVisible);
+      const data = img.data;
 
-      ensureOffscreen(colsVisible, rowsVisible);
-      const data = offImg.data;
-      data.fill(0);
+      // Exposure: compute robust vmax on recent sample; then apply "heatDim"
+      // heatDim low => brighter (reduce vmax), high => dimmer (increase vmax)
+      let vmax = 1;
+      if (autoExp) {
+        const sampleCols = Math.min(colsVisible, 80);
+        const step = Math.max(1, Math.floor(colsVisible / sampleCols));
+        for (let ci = startCol; ci <= head; ci += step) {
+          const col = heat.ring[((ci % heat.cols)+heat.cols)%heat.cols];
+          if (!col) continue;
+          for (let rr = rTop; rr <= rBot; rr += 6) {
+            const v = col[rr] || 0;
+            if (v > vmax) vmax = v;
+          }
+        }
+        vmax = Math.max(vmax, 16);
+      } else {
+        vmax = 64; // fixed fallback
+      }
 
-      const vmax = computeExposure(colsVisible, rowsVisible, r0, r1, safeStart, safeHead);
-      const thr = heatThreshold();
-      const gam = heatGamma();
-      const bri = heatBrightness();
-      const dimA = heatDimAlpha();
+      // dimmer acts like a multiplier on vmax (not a flat alpha kill)
+      // heatDim in [0,1] => scale vmax by [0.55 .. 2.2]
+      const dimScale = 0.55 + 1.65 * heatDim;
+      vmax = vmax * dimScale;
 
+      // fill pixels
       for (let x = 0; x < colsVisible; x++) {
-        const colIdx = safeStart + x;
+        const colIdx = startCol + x;
         const col = heat.ring[((colIdx % heat.cols) + heat.cols) % heat.cols];
         if (!col) continue;
 
         for (let y = 0; y < rowsVisible; y++) {
-          const row = r0 + y;
+          const row = rTop + y;
           const v = col[row] || 0;
-          if (v <= thr) continue;
+          if (v === 0) continue;
 
-          let a = clamp((v - thr) / Math.max(1, (vmax - thr)), 0, 1);
-          a = Math.pow(a, gam) * bri;
-          a = clamp(a, 0, 1);
+          const a = clamp(v / vmax, 0, 1);
+          if (a < heatThr) continue;
 
-          if (a < 0.01) continue;
-
-          const [rr, gg, bb, aa0] = heatRGBA(a);
-          const aa = clamp(aa0 * dimA, 0, 1);
-
+          const [rr, gg, bb, aa] = heatRGBA(a);
           const i = (y*colsVisible + x) * 4;
           data[i+0] = rr;
           data[i+1] = gg;
@@ -915,28 +915,24 @@ HTML = r"""
         }
       }
 
-      octx.putImageData(offImg, 0, 0);
+      octx.putImageData(img, 0, 0);
       ctx.imageSmoothingEnabled = true;
       ctx.drawImage(off, 0, 0, w, h);
     }
 
+    // grid
     ctx.strokeStyle = "rgba(148,163,184,0.08)";
     ctx.lineWidth = 1;
-    const gridN = 8;
-    for (let k=1;k<gridN;k++) {
-      const yy = (h/gridN)*k;
-      ctx.beginPath();
-      ctx.moveTo(0, yy);
-      ctx.lineTo(w, yy);
-      ctx.stroke();
+    for (let k=1;k<8;k++) {
+      const yy = (h/8)*k;
+      ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(w, yy); ctx.stroke();
     }
 
+    // ---- Trade bubbles ----
     const now = Date.now();
     const windowMs = timeSpanSec * 1000;
-    const tNow = now - timeOffsetMs;
-
     const xOf = (tms) => {
-      const dtm = (tNow - tms);
+      const dtm = now - tms;
       const frac = 1 - (dtm / windowMs);
       return clamp(frac, 0, 1) * w;
     };
@@ -945,63 +941,54 @@ HTML = r"""
     for (const t of trades) vMax = Math.max(vMax, t.v || 0);
     vMax = Math.max(vMax, 1e-9);
 
-    const bOp = bubOpacity();
-    const bSz = bubScale();
-    const bMin = bubMinPct();
-
     for (const t of trades) {
       const p = t.p;
       if (!(p >= pMin && p <= pMax)) continue;
-
-      const v = (t.v || 0);
-      if (v / vMax < bMin) continue;
+      const vv = (t.v || 0);
+      const vFrac = Math.sqrt(vv / vMax);
+      if (vFrac < bubMin) continue;
 
       const x = xOf(t.t);
       const y = yOf(p, pMin, pMax, h);
 
-      const r = (1.5 + 16 * Math.sqrt(v / vMax)) * bSz;
+      const r = (1.5 + 16 * vFrac) * bubSz;
       const isBuy = (t.T === 1);
       ctx.beginPath();
-      ctx.fillStyle = isBuy ? `rgba(59,130,246,${0.65*bOp})` : `rgba(245,158,11,${0.65*bOp})`;
+      ctx.fillStyle = isBuy ? `rgba(59,130,246,${bubOp})` : `rgba(245,158,11,${bubOp})`;
       ctx.arc(x, y, r, 0, Math.PI*2);
       ctx.fill();
     }
 
+    // price lines
     if (lastPx) {
       const y = yOf(lastPx, pMin, pMax, h);
       ctx.strokeStyle = "rgba(226,232,240,0.9)";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(0,y);
-      ctx.lineTo(w,y);
-      ctx.stroke();
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
 
       ctx.fillStyle = "rgba(226,232,240,0.9)";
-      ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      ctx.fillText(`TRADE ${Number(lastPx).toFixed(1)}`, 10, clamp(y-6, 14, h-8));
+      ctx.font = "24px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+      ctx.fillText(`TRADE ${lastPx.toFixed(1)}`, 24, clamp(y-10, 28, h-16));
     }
-
     if (midPx) {
       const y = yOf(midPx, pMin, pMax, h);
-      ctx.strokeStyle = "rgba(147,197,253,0.35)";
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4,4]);
-      ctx.beginPath();
-      ctx.moveTo(0,y);
-      ctx.lineTo(w,y);
-      ctx.stroke();
+      ctx.strokeStyle = "rgba(147,197,253,0.45)";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([10,10]);
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
       ctx.setLineDash([]);
 
-      ctx.fillStyle = "rgba(147,197,253,0.85)";
-      ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      ctx.fillText(`MID   ${Number(midPx).toFixed(1)}`, 10, clamp(y-6, 14, h-8));
+      ctx.fillStyle = "rgba(147,197,253,0.9)";
+      ctx.font = "24px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+      ctx.fillText(`MID   ${midPx.toFixed(1)}`, 24, clamp(y-10, 28, h-16));
     }
 
-    ctx.fillStyle = "rgba(148,163,184,0.92)";
-    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+    // footer
+    ctx.fillStyle = "rgba(148,163,184,0.95)";
+    ctx.font = "22px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
     ctx.fillText(
-      `T=${timeSpanSec.toFixed(0)}s | P=${viewSpan.toFixed(1)} | pan=${(timeOffsetMs/1000).toFixed(1)}s | thr=${heatThreshold()} | vmaxâ${expVmaxEwma.toFixed(0)} | trade_age=${(last?.health?.trade_age_ms ?? "None")}ms`,
-      10, h - 10
+      `Tspan=${timeSpanSec.toFixed(0)}s | Pspan=${viewSpan.toFixed(1)} | AutoExp=${autoExp?"ON":"OFF"} | Dim=${heatDim.toFixed(2)} Thr=${heatThr.toFixed(2)} Ctr=${heatCtr.toFixed(2)}`,
+      24, h - 20
     );
 
     requestAnimationFrame(draw);
