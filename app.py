@@ -50,7 +50,8 @@ BIN_USD = float(os.getenv("QD_BIN_USD", "5"))            # price bin size for sn
 TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))    # levels retained per side
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX4_RENDER_BRIDGE_FIX3_WS_DERIVE"
+BUILD = "FIX4_RENDER_BRIDGE_FIX4_SNAPSHOT_GUARD"
+
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
 # ---------------------------
@@ -454,10 +455,13 @@ async def index() -> str:
     if (centerPx === null) centerPx = pxCenter;
 
     if (centerPx === null || !isFinite(centerPx)) {
+      if (testPattern) { centerPx = 0.0; panPx = 0.0; }
+      else {
       ctx.fillStyle = 'rgba(255,255,255,0.75)';
       ctx.font = `${Math.floor(14 * (window.devicePixelRatio||1))}px sans-serif`;
       ctx.fillText('Waiting for first price/book…', 16, 28);
       return;
+      }
     }
 
     const halfRange = snapshot.half_range || __RANGE_USD__;
@@ -578,7 +582,7 @@ async def index() -> str:
       elPrints.textContent = `${snap.prints_60s || 0}`;
 
       draw(snap);
-      elErr.textContent = '';
+      if (snap.ok === false && snap.error) { elErr.textContent = String(snap.error); } else { elErr.textContent = ''; }
     } catch (e) {
       elErr.textContent = String(e && e.stack ? e.stack : e);
     }
@@ -654,52 +658,82 @@ async def snapshot() -> JSONResponse:
     UI snapshot for FIX4:
       - center_px: mid if available else last price else best side
       - heat_bins: snapshot ladder bins from current depth only
+    IMPORTANT:
+      - This handler must NEVER throw. If anything fails, return ok=false with safe defaults.
     """
-    async with STATE_LOCK:
-        ws_ok_raw = bool(STATE.get("ws_ok"))  # raw flag (may flicker)
-        ws_ok = bool(ws_msg_age_ms < 2500.0)  # authoritative derived health
+    try:
+        async with STATE_LOCK:
+            ws_ok = bool(STATE.get("ws_ok"))
+            ws_last_rx_ms = STATE.get("ws_last_rx_ms")
+            now_ms = _now_ms()
+            ws_msg_age_ms = (now_ms - ws_last_rx_ms) if ws_last_rx_ms else None
 
-        best_bid = STATE.get("best_bid")
-        best_ask = STATE.get("best_ask")
-        mid = STATE.get("mid")
-        last_px = STATE.get("last_trade_px")
+            best_bid = STATE.get("best_bid")
+            best_ask = STATE.get("best_ask")
+            mid = STATE.get("mid")
+            last_px = STATE.get("last_trade_px")
 
-        center_px = mid
-        if center_px is None:
-            center_px = last_px
-        if center_px is None and best_bid is not None and best_ask is not None:
-            center_px = (float(best_bid) + float(best_ask)) / 2.0
-        if center_px is None and best_bid is not None:
-            center_px = float(best_bid)
-        if center_px is None and best_ask is not None:
-            center_px = float(best_ask)
+            center_px = mid
+            if center_px is None:
+                center_px = last_px
+            if center_px is None and best_bid is not None and best_ask is not None:
+                center_px = (float(best_bid) + float(best_ask)) / 2.0
+            if center_px is None and best_bid is not None:
+                center_px = float(best_bid)
+            if center_px is None and best_ask is not None:
+                center_px = float(best_ask)
 
-        heat_bins: List[List[float]] = []
-        heat_max = 0.0
-        if center_px is not None:
-            heat_bins, heat_max = _build_heat_bins(float(center_px), float(RANGE_USD), float(BIN_USD))
+            heat_bins: List[List[float]] = []
+            heat_max = 0.0
+            if center_px is not None:
+                heat_bins, heat_max = _build_heat_bins(float(center_px), float(RANGE_USD), float(BIN_USD))
 
+            payload = {
+                "ok": True,
+                "build": BUILD,
+                "symbol": SYMBOL,
+                "ws_ok": ws_ok,
+                "ws_msg_age_ms": (float(ws_msg_age_ms) if ws_msg_age_ms is not None else None),
+                "depth_age_ms": STATE.get("depth_age_ms"),
+                "trade_age_ms": STATE.get("trade_age_ms"),
+                "prints_60s": STATE.get("prints_60s", 0),
+                "last_px": last_px,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "mid": mid,
+                "book_bids_n": int(STATE.get("bids_n") or 0),
+                "book_asks_n": int(STATE.get("asks_n") or 0),
+                "center_px": center_px,
+                "half_range": float(RANGE_USD),
+                "bin_usd": float(BIN_USD),
+                "heat_bins": heat_bins,
+                "heat_max": float(heat_max),
+                "error": STATE.get("last_error"),
+            }
+            return JSONResponse(payload)
+    except Exception as e:
+        # Never fail the API surface — return a safe payload so the UI can keep running.
         payload = {
+            "ok": False,
             "build": BUILD,
             "symbol": SYMBOL,
-            "ws_ok": bool(ws_ok),
-            "ws_ok_raw": bool(ws_ok_raw),
-            "ws_msg_age_ms": float(ws_msg_age_ms),
-            "depth_age_ms": STATE.get("depth_age_ms"),
-            "trade_age_ms": STATE.get("trade_age_ms"),
-            "prints_60s": STATE.get("prints_60s", 0),
-            "last_px": last_px,
-            "best_bid": best_bid,
-            "best_ask": best_ask,
-            "mid": mid,
-            "book_bids_n": int(STATE.get("bids_n") or 0),
-            "book_asks_n": int(STATE.get("asks_n") or 0),
-            "center_px": center_px,
+            "ws_ok": False,
+            "ws_msg_age_ms": None,
+            "depth_age_ms": None,
+            "trade_age_ms": None,
+            "prints_60s": 0,
+            "last_px": None,
+            "best_bid": None,
+            "best_ask": None,
+            "mid": None,
+            "book_bids_n": 0,
+            "book_asks_n": 0,
+            "center_px": 0.0,  # allow test pattern rendering even with no data
             "half_range": float(RANGE_USD),
             "bin_usd": float(BIN_USD),
-            "heat_bins": heat_bins,
-            "heat_max": float(heat_max),
-            "error": STATE.get("last_error"),
+            "heat_bins": [],
+            "heat_max": 0.0,
+            "error": f"snapshot_exception: {type(e).__name__}: {e}",
         }
         return JSONResponse(payload)
 
