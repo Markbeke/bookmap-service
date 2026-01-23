@@ -50,7 +50,7 @@ BIN_USD = float(os.getenv("QD_BIN_USD", "5"))            # price bin size for sn
 TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))    # levels retained per side
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX8_BAND_COALESCE_FIX1"
+BUILD = "FIX9_DOMINANCE_ENGINE_FIX1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -370,6 +370,8 @@ async def index() -> str:
       <button id="bandBtn">Bands: ON</button>
       <button id="gapBtn">Gap: 1</button>
       <button id="minBtn">Min: 2</button>
+      <button id="domBtn">Dom: ON</button>
+      <button id="domAgeBtn">DomAge: 0.35</button>
     </div>
     <div id="err"></div>
   </div>
@@ -407,6 +409,8 @@ async def index() -> str:
   const bandBtn = document.getElementById('bandBtn');
   const gapBtn = document.getElementById('gapBtn');
   const minBtn = document.getElementById('minBtn');
+  const domBtn = document.getElementById('domBtn');
+  const domAgeBtn = document.getElementById('domAgeBtn');
 
   let autofollow = true;
   let testPattern = false;
@@ -444,6 +448,17 @@ async def index() -> str:
   let bandGapBins = 1;         // allow small gaps when merging (in bins)
   let bandMinBins = 2;         // minimum band thickness in bins
   let bandEdgeSoft = 0.12;     // soften edges via alpha taper
+
+  // --- Dominance engine (Phase 6): rank bands by persistence + strength so key liquidity stands out ---
+  let domOn = true;
+  let domAgeW = 0.35;          // how much persistence influences brightness (0..1-ish)
+  const domBands = [];         // tracked bands across columns
+  const DOM_MAX_BANDS = 256;
+  const DOM_FORGET_MS = 60_000;
+
+  function bandsOverlap(a0,a1,b0,b1) {
+    return !(a1 < b0 || b1 < a0);
+  }
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -689,12 +704,79 @@ async def index() -> str:
 
       if (bandify) {
         const runs = computeBandRuns(arr, keepIdxs, Math.max(0, Math.floor(bandGapBins)), Math.max(1, Math.floor(bandMinBins)));
+
+        // Dominance tracking: remember strong bands across time so they stay visually prominent.
+        const domRel = new Array(runs.length).fill(0.0);
+        if (domOn) {
+          const now = Date.now();
+          // prune old
+          for (let i = domBands.length - 1; i >= 0; i--) {
+            if ((now - domBands[i].lastSeen) > DOM_FORGET_MS) domBands.splice(i, 1);
+            else domBands[i].seen = false;
+          }
+
+          // match current runs to tracked bands
+          for (let r=0; r<runs.length; r++) {
+            const s = runs[r][0], e = runs[r][1], mx = runs[r][2];
+            let best = -1;
+            let bestOv = -1;
+            const c = 0.5 * (s + e);
+            for (let i=0; i<domBands.length; i++) {
+              const b = domBands[i];
+              if (!bandsOverlap(s, e, b.s, b.e)) continue;
+              const bc = 0.5 * (b.s + b.e);
+              const dist = Math.abs(c - bc);
+              if (dist > 6) continue;
+              const ov = Math.min(e, b.e) - Math.max(s, b.s);
+              if (ov > bestOv) { bestOv = ov; best = i; }
+            }
+            if (best >= 0) {
+              const b = domBands[best];
+              b.s = s; b.e = e; // follow current band bounds
+              b.str = 0.85*b.str + 0.15*mx;
+              b.age = Math.min(5000, (b.age || 1) + 1);
+              b.lastSeen = now;
+              b.seen = true;
+              runs[r].push(best); // store band index for later
+            } else {
+              domBands.push({s:s, e:e, str:mx, age:1, lastSeen:now, seen:true});
+              runs[r].push(domBands.length - 1);
+            }
+          }
+
+          // cap band count (keep strongest)
+          if (domBands.length > DOM_MAX_BANDS) {
+            domBands.sort((a,b)=> (b.str||0) - (a.str||0));
+            domBands.length = DOM_MAX_BANDS;
+          }
+
+          // compute normalization across seen bands
+          let domMax = 1e-6;
+          for (let i=0; i<domBands.length; i++) {
+            const b = domBands[i];
+            if (!b.seen) continue;
+            const ageN = Math.min(200, b.age || 1) / 200.0;
+            const score = Math.log1p(Math.max(0, b.str || 0)) * (1.0 + domAgeW * ageN);
+            if (score > domMax) domMax = score;
+          }
+
+          for (let r=0; r<runs.length; r++) {
+            const bi = runs[r][3];
+            const b = domBands[bi] || null;
+            if (!b) continue;
+            const ageN = Math.min(200, b.age || 1) / 200.0;
+            const score = Math.log1p(Math.max(0, b.str || 0)) * (1.0 + domAgeW * ageN);
+            domRel[r] = Math.max(0, Math.min(1, score / domMax));
+          }
+        }
+
         for (let r=0; r<runs.length; r++) {
           const s = runs[r][0], e = runs[r][1], mx = runs[r][2];
 
           let t = Math.max(0, Math.min(1, mx / scaleMax));
           t = Math.max(0, (t - heatFloor) / Math.max(1e-6, (1 - heatFloor)));
           t = Math.pow(t, heatGamma);
+          if (domOn) { t = Math.max(0, Math.min(1, t * (0.70 + 0.60 * domRel[r]))); }
 
           const p1 = lo + s * binUsd;
           const p2 = lo + (e + 1) * binUsd;
@@ -891,6 +973,8 @@ async def index() -> str:
     bandBtn.textContent = `Bands: ${bandify ? 'ON' : 'OFF'}`;
     gapBtn.textContent = `Gap: ${bandGapBins}`;
     minBtn.textContent = `Min: ${bandMinBins}`;
+    domBtn.textContent = `Dom: ${domOn ? 'ON' : 'OFF'}`;
+    domAgeBtn.textContent = `DomAge: ${domAgeW.toFixed(2)}`;
   }
   updateExposureLabels();
 
@@ -953,6 +1037,19 @@ async def index() -> str:
     if (idx < 0) idx = 1;
     bandMinBins = steps[(idx + 1) % steps.length];
     updateExposureLabels();
+  });
+
+
+  domBtn.addEventListener('click', () => {
+    domOn = !domOn;
+    domBtn.textContent = `Dom: ${domOn ? 'ON' : 'OFF'}`;
+  });
+  domAgeBtn.addEventListener('click', () => {
+    const steps = [0.0, 0.15, 0.25, 0.35, 0.5, 0.7];
+    let idx = steps.indexOf(domAgeW);
+    if (idx < 0) idx = 3;
+    domAgeW = steps[(idx + 1) % steps.length];
+    domAgeBtn.textContent = `DomAge: ${domAgeW.toFixed(2)}`;
   });
 
   CANVAS.addEventListener('pointerdown', (e) => {
