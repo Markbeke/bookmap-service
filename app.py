@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 # -----------------------------
 # Build
 # -----------------------------
-BUILD_TAG = "FIX10"
+BUILD_TAG = "FIX11"
 
 # -----------------------------
 # Config (env)
@@ -1052,6 +1052,7 @@ if (autoExp) {
 // Additional "contrast compression" knee: removes low-intensity clutter as heatDim increases.
 // knee in [0..0.35]
 const knee = 0.50 * heatDim;
+const floorU8 = Math.floor(vmax * (0.02 + 0.12 * heatDim)); // u8 floor for haze suppression
 let drawn = 0;
 let skipped = 0;
 
@@ -1067,7 +1068,7 @@ let skipped = 0;
           const v = col[row] || 0;
           if (v === 0) continue;
 
-          const floorU8 = Math.floor(vmax * (0.02 + 0.12 * heatDim));
+          // floorU8 computed outside inner loop (Safari/WebKit-safe)
           if (v < floorU8) { skipped++; continue; }
 
 let a = clamp(v / vmax, 0, 1);
@@ -1216,7 +1217,7 @@ const [rr, gg, bb, aa] = heatRGBA(a);
         msg = String(e);
       }
       const lines = msg.split("\n").slice(0,8);
-      ctx.fillText("JS ERROR (FIX10) step="+(__step||"?"), 16, 28);
+      ctx.fillText("JS ERROR (FIX11) step="+(__step||"?"), 16, 28);
       for (let i=0;i<lines.length;i++) ctx.fillText(lines[i].slice(0,120), 16, 52 + i*18);
     }
 
