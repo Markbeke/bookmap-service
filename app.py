@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 # -----------------------------
 # Build
 # -----------------------------
-BUILD_TAG = "FIX8"
+BUILD_TAG = "FIX9"
 
 # -----------------------------
 # Config (env)
@@ -941,12 +941,12 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
       viewMid = primaryPx;
     }
 
-    // Guard against zero/NaN span (prevents blank canvas due to ImageData errors)
+        // Guard against zero/NaN span (Safari-safe: DO NOT assign to viewSpan during draw)
     const minSpan = Math.max(tickSize*10, 1);
-    if (!(isFinite(viewSpan) && viewSpan > 0)) viewSpan = 400;
-    if (viewSpan < minSpan) viewSpan = minSpan;
-    const pMin = viewMid - viewSpan/2;
-    const pMax = viewMid + viewSpan/2;
+    let span = (Number.isFinite(viewSpan) && viewSpan > 0) ? viewSpan : 400;
+    if (span < minSpan) span = minSpan;
+    const pMin = viewMid - span/2;
+    const pMax = viewMid + span/2;
 
     __step = "heat_begin";
     // ---- HEATMAP ----
@@ -1171,9 +1171,17 @@ const [rr, gg, bb, aa] = heatRGBA(a);
       ctx.fillRect(0,0,w,h);
       ctx.fillStyle = "rgba(248,113,113,0.95)";
       ctx.font = "16px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      const msg = (e && (e.stack || e.message)) ? String(e.stack || e.message) : String(e);
-      const lines = msg.split("\n").slice(0,6);
-      ctx.fillText("JS ERROR (FIX8) step="+(__step||"?"), 16, 28);
+      let msg = "";
+      try {
+        const name = (e && e.name) ? String(e.name) : "Error";
+        const emsg = (e && e.message) ? String(e.message) : String(e);
+        const stack = (e && e.stack) ? String(e.stack) : "";
+        msg = name + ": " + emsg + (stack ? ("\n" + stack) : "");
+      } catch (_err) {
+        msg = String(e);
+      }
+      const lines = msg.split("\n").slice(0,8);
+      ctx.fillText("JS ERROR (FIX9) step="+(__step||"?"), 16, 28);
       for (let i=0;i<lines.length;i++) ctx.fillText(lines[i].slice(0,120), 16, 52 + i*18);
     }
 
