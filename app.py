@@ -311,10 +311,7 @@ async def _startup() -> None:
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    # JS must stay inside this HTML string.
-    # UI errors should never crash server; render errors are caught client-side.
-    interval_ms = max(250, int(1000 / max(0.2, SNAPSHOT_HZ)))
-    return f"""<!doctype html>
+    html = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -657,6 +654,9 @@ async def index() -> str:
 </body>
 </html>
 """
+    # Inject numeric constants safely (avoid f-string / brace collisions)
+    html = html.replace("__RANGE_USD__", str(RANGE_USD)).replace("__SNAPSHOT_HZ__", str(SNAPSHOT_HZ))
+    return html
 
 
 @app.get("/state")
