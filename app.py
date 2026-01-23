@@ -352,7 +352,7 @@ HTML = f"""<!doctype html>
   }};
 
   // trades for bubbles (Phase 1: minimal)
-  const trades = []; // {p, v, ts, side}
+  const trades = []; // {{p, v, ts, side}}
   const TRADES_MAX = 2000;
 
   // last state
