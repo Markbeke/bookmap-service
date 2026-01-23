@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 # -----------------------------
 # Build
 # -----------------------------
-BUILD_TAG = "FIX12"
+BUILD_TAG = "FIX13"
 
 # -----------------------------
 # Config (env)
@@ -460,7 +460,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (FIX8)</title>
+  <title>QuantDesk Bookmap (FIX13)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
     #topbar { flex:0 0 auto;
@@ -697,7 +697,27 @@ HTML = r"""
     const proto = (location.protocol === "https:") ? "wss" : "ws";
     return `${proto}://${location.host}/ws`;
   }
-  const WS = new WebSocket(wsUrl());
+  let WS = null;
+  let wsRetry = 0;
+  function wsBackoffMs() {
+    // 0.5s, 1s, 2s, 4s ... capped
+    const ms = Math.min(15000, 500 * Math.pow(2, wsRetry));
+    wsRetry = Math.min(wsRetry + 1, 10);
+    return ms;
+  }
+  function wsConnect() {
+    try {
+      WS = new WebSocket(wsUrl());
+      WS.binaryType = "arraybuffer";
+      WS.onopen = () => { wsRetry = 0; dot.style.background = "#22c55e"; };
+      WS.onmessage = onWsMessage;
+      WS.onerror = () => { try { WS.close(); } catch(e) {} };
+    } catch (e) {
+      dot.style.background = "#ef4444";
+      const wait = wsBackoffMs();
+      setTimeout(wsConnect, wait);
+    }
+  }
 
   function b64ToU8(b64) {
     const bin = atob(b64);
@@ -720,7 +740,7 @@ HTML = r"""
     heat.ready = !!(heat.anchorMinPrice !== null && heat.rows && heat.cols);
   }
 
-  WS.onmessage = (ev) => {
+  function onWsMessage(ev) {
     const msg = JSON.parse(ev.data);
     last = msg;
 
@@ -768,8 +788,6 @@ HTML = r"""
       } else {
         heatDbg.bad_patch = (heatDbg.bad_patch || 0) + 1;
       }
-    }
-    }
 
     // track previous trade for next burn
     prevLastPx = (lastPx !== null && lastPx !== undefined) ? lastPx : prevLastPx;
@@ -778,9 +796,9 @@ HTML = r"""
     if (Array.isArray(msg.trades)) {
       trades = msg.trades;
     }
-  };
+  }
 
-  WS.onclose = () => { dot.style.background = "#ef4444"; };
+  wsConnect();
 
   // -------------- Interaction (pointer) --------------
   let pointers = new Map();
