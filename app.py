@@ -27,6 +27,11 @@ from fastapi.responses import HTMLResponse
 
 
 # -----------------------------
+# Build
+# -----------------------------
+BUILD_TAG = "FIX4"
+
+# -----------------------------
 # Config (env)
 # -----------------------------
 WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
@@ -455,7 +460,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (FIX2)</title>
+  <title>QuantDesk Bookmap (FIX4)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
     #topbar {
@@ -592,6 +597,9 @@ HTML = r"""
     ring: [],
   };
 
+  // last heat debug (for on-chart diagnostics)
+  let heatDbg = {ready:false, head:-1, colsVis:0, rowsVis:0, vmax:0, floor:0, knee:0, drawn:0, skipped:0};
+
   // UI controls
   let autoExp = true;
   let heatDim = 0.20;    // acts on vmax (lower -> brighter)
@@ -676,7 +684,7 @@ HTML = r"""
     const ask = (msg.best_ask ?? null);
     const primaryPx = (midPx ?? lastPx);
     const primaryTag = (midPx !== null && midPx !== undefined) ? "MID" : "TRADE";
-    symEl.textContent = `${msg.symbol} | PRIMARY(${primaryTag})=${(primaryPx ?? "None")} | TRADE=${(lastPx ?? "None")} | MID=${(midPx ?? "None")} | bid=${(bid ?? "None")} ask=${(ask ?? "None")}`;
+    symEl.textContent = `${msg.symbol} | build=${(msg.health && msg.health.build) ? msg.health.build : 'FIX?'} | PRIMARY(${primaryTag})=${(primaryPx ?? 'None')} | TRADE=${(lastPx ?? 'None')} | MID=${(midPx ?? 'None')} | bid=${(bid ?? 'None')} ask=${(ask ?? 'None')}`;
 
     healthEl.textContent =
       `book: bids=${msg.health.bids_n} asks=${msg.health.asks_n} age: depth=${msg.health.depth_age_ms ?? "None"}ms trade=${msg.health.trade_age_ms ?? "None"}ms`;
@@ -912,6 +920,8 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
     const pMax = viewMid + viewSpan/2;
 
     // ---- HEATMAP ----
+    heatDbg.ready = false;
+    heatDbg.head = heat.head;
     if (heat.ready && heat.head >= 0 && heat.anchorMinPrice !== null) {
       const colsVisible = clamp(Math.floor((timeSpanSec*1000) / heat.colMs), 10, heat.cols);
       const head = heat.head;
@@ -977,6 +987,8 @@ if (autoExp) {
 // Additional "contrast compression" knee: removes low-intensity clutter as heatDim increases.
 // knee in [0..0.35]
 const knee = 0.50 * heatDim;
+let drawn = 0;
+let skipped = 0;
 
 // fill pixels
       // fill pixels
@@ -990,8 +1002,8 @@ const knee = 0.50 * heatDim;
           const v = col[row] || 0;
           if (v === 0) continue;
 
-          const floorU8 = Math.floor(vmax * (0.10 + 0.45 * heatDim));
-          if (v < floorU8) continue;
+          const floorU8 = Math.floor(vmax * (0.02 + 0.12 * heatDim));
+          if (v < floorU8) { skipped++; continue; }
 
 let a = clamp(v / vmax, 0, 1);
 
@@ -1001,7 +1013,7 @@ if (knee > 0) {
 }
 
 // HeatThr acts as a floor but re-maps so top bands remain visible.
-if (a < heatThr) continue;
+if (a < heatThr) { skipped++; continue; }
 a = clamp((a - heatThr) / Math.max(1e-6, (1 - heatThr)), 0, 1);
 
 const [rr, gg, bb, aa] = heatRGBA(a);
@@ -1010,8 +1022,20 @@ const [rr, gg, bb, aa] = heatRGBA(a);
           data[i+1] = gg;
           data[i+2] = bb;
           data[i+3] = Math.floor(255 * aa);
+          drawn++;
         }
       }
+
+      // update on-chart heat diagnostics
+      heatDbg.ready = true;
+      heatDbg.head = heat.head;
+      heatDbg.colsVis = colsVisible;
+      heatDbg.rowsVis = rowsVisible;
+      heatDbg.vmax = vmax;
+      heatDbg.floor = floorU8;
+      heatDbg.knee = knee;
+      heatDbg.drawn = drawn;
+      heatDbg.skipped = skipped;
 
       octx.putImageData(img, 0, 0);
       ctx.imageSmoothingEnabled = true;
@@ -1085,7 +1109,7 @@ const [rr, gg, bb, aa] = heatRGBA(a);
     ctx.fillStyle = "rgba(148,163,184,0.95)";
     ctx.font = "22px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
     ctx.fillText(
-      `Tspan=${timeSpanSec.toFixed(0)}s | Pspan=${viewSpan.toFixed(1)} | AutoExp=${autoExp?"ON":"OFF"} | Dim=${heatDim.toFixed(2)} Thr=${heatThr.toFixed(2)} Ctr=${heatCtr.toFixed(2)}`,
+      `Tspan=${timeSpanSec.toFixed(0)}s | Pspan=${viewSpan.toFixed(1)} | AutoExp=${autoExp?"ON":"OFF"} | Dim=${heatDim.toFixed(2)} Thr=${heatThr.toFixed(2)} Ctr=${heatCtr.toFixed(2)} | Heat:${heatDbg.ready?"ON":"OFF"} head=${heatDbg.head} vmax=${heatDbg.vmax} floor=${heatDbg.floor} knee=${heatDbg.knee.toFixed(2)} drawn=${heatDbg.drawn} skip=${heatDbg.skipped}`,
       24, h - 20
     );
 
@@ -1112,6 +1136,7 @@ async def health():
     feed._update_bba_mid()
     return {
         "service": "quantdesk-bookmap-ui",
+        "build": BUILD_TAG,
         "symbol": SYMBOL_WS,
         "ws_url": WS_URL,
         "ws_ok": feed.ws_ok,
