@@ -16,12 +16,18 @@ from fastapi.responses import HTMLResponse
 # Config (env)
 # -----------------------------
 WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
-SYMBOL_WS = os.environ.get("QD_SYMBOL_WS", "BTC_USDT")  # MEXC WS uses BTC_USDT
+SYMBOL_WS = os.environ.get("QD_SYMBOL_WS", "BTC_USDT")  # MEXC contract WS uses BTC_USDT
 PORT = int(os.environ.get("PORT", "8000"))
 
-MAX_TRADES = int(os.environ.get("QD_MAX_TRADES", "6000"))
-TOP_LEVELS = int(os.environ.get("QD_TOP_LEVELS", "200"))         # send depth levels each side
-SNAPSHOT_HZ = float(os.environ.get("QD_SNAPSHOT_HZ", "6"))        # UI snapshots/sec
+MAX_TRADES = int(os.environ.get("QD_MAX_TRADES", "20000"))
+TOP_LEVELS = int(os.environ.get("QD_TOP_LEVELS", "200"))           # send depth levels each side
+SNAPSHOT_HZ = float(os.environ.get("QD_SNAPSHOT_HZ", "6"))          # UI snapshots/sec
+
+# Heatmap defaults (UI-side uses these as max history)
+HEAT_WINDOW_SEC = int(os.environ.get("QD_HEAT_WINDOW_SEC", str(60 * 60)))  # 60m history stored
+HEAT_COL_MS = int(os.environ.get("QD_HEAT_COL_MS", "1000"))                # 1s columns
+HEAT_BINS = int(os.environ.get("QD_HEAT_BINS", "360"))                     # vertical resolution
+DEFAULT_PRICE_SPAN = float(os.environ.get("QD_PRICE_SPAN", "600"))          # USD visible span initial
 
 # -----------------------------
 # Helpers
@@ -74,6 +80,11 @@ class OrderBook:
         asks_sorted = sorted(self.asks.items(), key=lambda x: x[0], reverse=False)[:n]
         return {"bids": bids_sorted, "asks": asks_sorted}
 
+    def best_bid_ask(self) -> Tuple[Optional[float], Optional[float]]:
+        bb = max(self.bids.keys()) if self.bids else None
+        ba = min(self.asks.keys()) if self.asks else None
+        return bb, ba
+
 @dataclass
 class Trades:
     dq: deque = field(default_factory=lambda: deque(maxlen=MAX_TRADES))
@@ -104,13 +115,22 @@ class MexcFeed:
 
     async def broadcast_snapshot(self) -> None:
         book = self.book.top_n(TOP_LEVELS)
-        trades = list(self.trades.dq)[-1200:]  # keep payload sane
+        trades = list(self.trades.dq)[-2500:]  # keep payload sane
+
+        bb, ba = self.book.best_bid_ask()
+        mid = None
+        if bb is not None and ba is not None and bb > 0 and ba > 0:
+            mid = (bb + ba) / 2.0
 
         payload = {
             "ts": now_ms(),
+            "ws_url": WS_URL,
             "symbol": SYMBOL_WS,
             "ws_ok": self.ws_ok,
             "last_px": self.last_px,
+            "mid_px": mid,
+            "best_bid": bb,
+            "best_ask": ba,
             "book": {"bids": book["bids"], "asks": book["asks"]},
             "trades": trades,
             "health": {
@@ -120,6 +140,12 @@ class MexcFeed:
                 "asks_n": len(self.book.asks),
                 "trades_n": len(self.trades.dq),
             },
+            "ui_defaults": {
+                "heat_window_sec": HEAT_WINDOW_SEC,
+                "heat_col_ms": HEAT_COL_MS,
+                "heat_bins": HEAT_BINS,
+                "default_price_span": DEFAULT_PRICE_SPAN,
+            }
         }
 
         msg = json.dumps(payload)
@@ -153,7 +179,7 @@ class MexcFeed:
                 async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                     self.ws_ok = True
 
-                    # subscribe depth + deal
+                    # subscribe depth + deal (contract)
                     await ws.send(json.dumps({"method": "sub.depth", "param": {"symbol": SYMBOL_WS}}))
                     await ws.send(json.dumps({"method": "sub.deal", "param": {"symbol": SYMBOL_WS}}))
 
@@ -169,6 +195,7 @@ class MexcFeed:
                             data = msg.get("data", {}) or {}
                             bids = data.get("bids", []) or []
                             asks = data.get("asks", []) or []
+                            # IMPORTANT: partial updates; never wipe other side
                             self.book.apply_side_updates("bids", bids)
                             self.book.apply_side_updates("asks", asks)
                             self.last_depth_ms = now_ms()
@@ -206,7 +233,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>Bookmap UI MVP (Interactive)</title>
+  <title>QuantDesk Bookmap UI (Time Zoom + True Heat)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
     #topbar {
@@ -214,16 +241,16 @@ HTML = r"""
       font-family: -apple-system, system-ui, Arial;
       font-size:14px;
       display:flex;
-      gap:12px;
+      gap:10px;
       align-items:center;
       border-bottom:1px solid #111827;
       user-select:none;
       -webkit-user-select:none;
+      flex-wrap:wrap;
     }
     #statusDot { width:10px; height:10px; border-radius:50%; display:inline-block; background:#ef4444; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:12px; color:#93c5fd; }
-    #btn {
-      margin-left:auto;
+    .btn {
       padding:6px 10px;
       border:1px solid #1f2937;
       border-radius:10px;
@@ -231,7 +258,7 @@ HTML = r"""
       color:#cbd5e1;
       font-size:12px;
     }
-    #wrap { height: calc(100% - 44px); display:flex; }
+    #wrap { height: calc(100% - 56px); display:flex; }
     canvas { width: 100%; height: 100%; display:block; touch-action:none; } /* IMPORTANT for iPad gestures */
   </style>
 </head>
@@ -240,7 +267,16 @@ HTML = r"""
     <span id="statusDot"></span>
     <span id="sym"></span>
     <span class="mono" id="health"></span>
-    <button id="btn">AutoFollow: ON</button>
+
+    <button class="btn" id="btnFollow">AutoFollow: ON</button>
+
+    <button class="btn" id="btnTimeOut">-T</button>
+    <button class="btn" id="btnTimeIn">+T</button>
+
+    <button class="btn" id="btnPriceOut">-P</button>
+    <button class="btn" id="btnPriceIn">+P</button>
+
+    <span class="mono" id="viewInfo"></span>
   </div>
   <div id="wrap">
     <canvas id="cv"></canvas>
@@ -253,7 +289,13 @@ HTML = r"""
   const symEl = document.getElementById("sym");
   const dot = document.getElementById("statusDot");
   const healthEl = document.getElementById("health");
-  const btn = document.getElementById("btn");
+  const viewInfoEl = document.getElementById("viewInfo");
+
+  const btnFollow = document.getElementById("btnFollow");
+  const btnTimeOut = document.getElementById("btnTimeOut");
+  const btnTimeIn  = document.getElementById("btnTimeIn");
+  const btnPriceOut = document.getElementById("btnPriceOut");
+  const btnPriceIn  = document.getElementById("btnPriceIn");
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -270,34 +312,98 @@ HTML = r"""
   let last = null;
   let trades = [];
   let lastPx = null;
+  let midPx = null;
 
   // -----------------------------
   // View state (interactive)
   // -----------------------------
   let autoFollow = true;
-  let viewMid = null;    // center price
-  let viewSpan = 600;    // visible price range (USD)
+
+  // Price axis
+  let viewMid = null;                 // center price
+  let viewSpan = 600;                 // visible price range (USD)
   const MIN_SPAN = 40;
-  const MAX_SPAN = 8000;
+  const MAX_SPAN = 20000;
 
-  btn.onclick = () => {
-    autoFollow = !autoFollow;
-    btn.textContent = `AutoFollow: ${autoFollow ? "ON" : "OFF"}`;
-  };
+  // Time axis
+  let timeEndMs = null;               // right edge time (ms)
+  let timeSpanMs = 12 * 60 * 1000;    // visible window (ms)
+  const MIN_TIME_SPAN_MS = 15 * 1000;
+  const MAX_TIME_SPAN_MS = 8 * 60 * 60 * 1000;
 
   // -----------------------------
-  // Heatmap state (persistence)
-  // We accumulate depth into bins and decay over time.
+  // Heatmap state (TRUE time×price)
+  // Stored as ring buffer of columns.
   // -----------------------------
-  const BINS = 360;                 // vertical resolution
-  let heatBid = new Float32Array(BINS);
-  let heatAsk = new Float32Array(BINS);
-  let lastHeatTs = performance.now();
+  let BINS = 360;
+  let HEAT_COL_MS = 1000;
+  let HEAT_WINDOW_MS = 60 * 60 * 1000;
 
-  function resetHeat() {
-    heatBid = new Float32Array(BINS);
-    heatAsk = new Float32Array(BINS);
+  let heatCols = 3600;                  // derived
+  let heat = null;                      // Float32Array length = BINS * heatCols (row-major: [bin * heatCols + col])
+  let colTimes = null;                  // Int32Array length = heatCols (timestamps)
+  let colWrite = 0;
+  let lastColPushMs = null;
+
+  // Exposure control
+  let vmaxEwma = 1e-6;
+
+  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+
+  function initHeatFromDefaults(defs) {
+    if (!defs) return;
+    BINS = defs.heat_bins ?? BINS;
+    HEAT_COL_MS = defs.heat_col_ms ?? HEAT_COL_MS;
+    const winSec = defs.heat_window_sec ?? (HEAT_WINDOW_MS / 1000);
+    HEAT_WINDOW_MS = Math.max(60*1000, winSec * 1000);
+
+    heatCols = Math.max(120, Math.floor(HEAT_WINDOW_MS / HEAT_COL_MS));
+    heat = new Float32Array(BINS * heatCols);
+    colTimes = new Int32Array(heatCols);
+    colWrite = 0;
+    lastColPushMs = null;
+    vmaxEwma = 1e-6;
   }
+
+  function clearHeat() {
+    if (!heat) return;
+    heat.fill(0);
+    colTimes.fill(0);
+    colWrite = 0;
+    lastColPushMs = null;
+    vmaxEwma = 1e-6;
+  }
+
+  // -----------------------------
+  // UI buttons
+  // -----------------------------
+  function setFollow(on) {
+    autoFollow = !!on;
+    btnFollow.textContent = `AutoFollow: ${autoFollow ? "ON" : "OFF"}`;
+    if (autoFollow) {
+      // snap time to now
+      timeEndMs = Date.now();
+    }
+  }
+
+  btnFollow.onclick = () => setFollow(!autoFollow);
+
+  btnTimeOut.onclick = () => {
+    setFollow(false);
+    timeSpanMs = clamp(timeSpanMs * 1.25, MIN_TIME_SPAN_MS, MAX_TIME_SPAN_MS);
+  };
+  btnTimeIn.onclick = () => {
+    setFollow(false);
+    timeSpanMs = clamp(timeSpanMs / 1.25, MIN_TIME_SPAN_MS, MAX_TIME_SPAN_MS);
+  };
+  btnPriceOut.onclick = () => {
+    setFollow(false);
+    viewSpan = clamp(viewSpan * 1.25, MIN_SPAN, MAX_SPAN);
+  };
+  btnPriceIn.onclick = () => {
+    setFollow(false);
+    viewSpan = clamp(viewSpan / 1.25, MIN_SPAN, MAX_SPAN);
+  };
 
   // -----------------------------
   // WebSocket
@@ -313,27 +419,48 @@ HTML = r"""
     last = msg;
 
     dot.style.background = msg.ws_ok ? "#22c55e" : "#ef4444";
+
     lastPx = msg.last_px ?? lastPx;
+    midPx  = msg.mid_px ?? midPx;
 
-    symEl.textContent = `${msg.symbol} | last_px=${(lastPx ?? "None")}`;
-    healthEl.textContent =
-      `bids=${msg.health.bids_n} asks=${msg.health.asks_n} trades=${msg.health.trades_n} ` +
-      `depth_age_ms=${msg.health.depth_age_ms ?? "None"} trade_age_ms=${msg.health.trade_age_ms ?? "None"}`;
-
-    // Maintain rolling trade window
-    const now = Date.now();
-    const windowMs = 12 * 60 * 1000; // increase to 12m for nicer flow
-    if (Array.isArray(msg.trades)) {
-      // NOTE: server sends last ~1200; we just append; filter by time
-      for (const t of msg.trades) trades.push(t);
+    // initialize heat defaults once
+    if (heat === null && msg.ui_defaults) {
+      initHeatFromDefaults(msg.ui_defaults);
+      if (msg.ui_defaults.default_price_span) viewSpan = msg.ui_defaults.default_price_span;
     }
-    trades = trades.filter(t => (now - t.t) <= windowMs);
 
     // Initialize view from lastPx once
-    if (viewMid === null && lastPx) {
-      viewMid = lastPx;
-      viewSpan = 600;
-      resetHeat();
+    if (viewMid === null && (lastPx || midPx)) {
+      viewMid = (lastPx ?? midPx);
+      viewSpan = viewSpan || 600;
+      timeEndMs = Date.now();
+      timeSpanMs = 12 * 60 * 1000;
+      clearHeat();
+    }
+
+    // show price audit
+    const lp = (lastPx != null) ? lastPx.toFixed(3) : "None";
+    const mp = (midPx  != null) ? midPx.toFixed(3)  : "None";
+    symEl.textContent = `${msg.symbol} | last_trade=${lp} | mid=${mp}`;
+
+    healthEl.textContent =
+      `book: bids=${msg.health.bids_n} asks=${msg.health.asks_n} ` +
+      `age: depth=${msg.health.depth_age_ms ?? "None"}ms trade=${msg.health.trade_age_ms ?? "None"}ms ` +
+      `WS=${(msg.ws_url || "").replace("wss://","")}`;
+
+    // Maintain rolling trade window for memory (we will render per current time view)
+    // We append trades from the server snapshot then de-dup roughly by timestamp+price+v+T.
+    if (Array.isArray(msg.trades)) {
+      for (const t of msg.trades) trades.push(t);
+    }
+    // Keep a generous trade memory, tied to HEAT_WINDOW_MS (plus slack)
+    const now = Date.now();
+    const keepMs = Math.max(HEAT_WINDOW_MS, timeSpanMs) + 5 * 60 * 1000;
+    trades = trades.filter(t => (now - t.t) <= keepMs);
+
+    // If follow is on, keep timeEnd pinned to now
+    if (autoFollow) {
+      timeEndMs = now;
     }
   };
 
@@ -341,63 +468,97 @@ HTML = r"""
 
   // -----------------------------
   // Interaction (iPad + desktop)
-  // - Drag: pan price
-  // - Pinch: zoom price
+  // Gesture logic:
+  // - 1 finger drag vertical => price pan
+  // - 1 finger drag horizontal => time pan
+  // - 2 finger pinch: dominant axis decides zoom target:
+  //     mostly vertical => price zoom
+  //     mostly horizontal => time zoom
   // -----------------------------
   let pointers = new Map(); // pointerId -> {x,y}
   let pinchStartDist = null;
-  let pinchStartSpan = null;
+  let pinchStartSpanPrice = null;
+  let pinchStartSpanTime = null;
+  let pinchAxisMode = null; // "price" | "time"
+
+  let dragStartX = null;
   let dragStartY = null;
   let dragStartMid = null;
-
-  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+  let dragStartTimeEnd = null;
+  let dragMode = null; // "price" | "time"
 
   cv.addEventListener("pointerdown", (e) => {
     cv.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
 
     if (pointers.size === 1) {
+      dragStartX = e.clientX;
       dragStartY = e.clientY;
       dragStartMid = viewMid;
+      dragStartTimeEnd = timeEndMs;
+      dragMode = null; // decide on first meaningful move
     }
     if (pointers.size === 2) {
       const pts = Array.from(pointers.values());
       const dx = pts[0].x - pts[1].x;
       const dy = pts[0].y - pts[1].y;
       pinchStartDist = Math.sqrt(dx*dx + dy*dy);
-      pinchStartSpan = viewSpan;
+      pinchStartSpanPrice = viewSpan;
+      pinchStartSpanTime = timeSpanMs;
+      pinchAxisMode = null; // decide based on dominant axis
     }
   });
 
   cv.addEventListener("pointermove", (e) => {
     if (!pointers.has(e.pointerId)) return;
     pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+    if (viewMid === null || timeEndMs === null) return;
 
-    if (viewMid === null) return;
+    // One finger drag
+    if (pointers.size === 1 && dragStartY !== null && dragStartX !== null) {
+      setFollow(false);
 
-    // One finger drag: pan
-    if (pointers.size === 1 && dragStartY !== null) {
-      autoFollow = false;
-      btn.textContent = "AutoFollow: OFF";
-
+      const dx = e.clientX - dragStartX;
       const dy = e.clientY - dragStartY;
-      // dy pixels -> price delta
-      const pxPerPrice = cv.clientHeight / viewSpan;
-      const dPrice = dy / Math.max(1, pxPerPrice);
-      viewMid = (dragStartMid ?? viewMid) + dPrice;
+
+      if (dragMode === null) {
+        // decide mode: horizontal => time, vertical => price
+        dragMode = (Math.abs(dx) > Math.abs(dy)) ? "time" : "price";
+      }
+
+      if (dragMode === "price") {
+        const pxPerPrice = cv.clientHeight / Math.max(1e-6, viewSpan);
+        const dPrice = dy / Math.max(1, pxPerPrice);
+        viewMid = (dragStartMid ?? viewMid) + dPrice;
+      } else {
+        // time pan: dx pixels => ms shift
+        const msPerPx = timeSpanMs / Math.max(1, cv.clientWidth);
+        const dMs = dx * msPerPx;
+        timeEndMs = (dragStartTimeEnd ?? timeEndMs) - dMs; // drag right shows past
+        timeEndMs = clamp(timeEndMs, Date.now() - HEAT_WINDOW_MS, Date.now());
+      }
     }
 
-    // Two finger pinch: zoom
-    if (pointers.size === 2 && pinchStartDist && pinchStartSpan) {
-      autoFollow = false;
-      btn.textContent = "AutoFollow: OFF";
+    // Two finger pinch
+    if (pointers.size === 2 && pinchStartDist && pinchStartSpanPrice && pinchStartSpanTime) {
+      setFollow(false);
 
       const pts = Array.from(pointers.values());
       const dx = pts[0].x - pts[1].x;
       const dy = pts[0].y - pts[1].y;
       const dist = Math.sqrt(dx*dx + dy*dy);
+
+      if (pinchAxisMode === null) {
+        pinchAxisMode = (Math.abs(dx) > Math.abs(dy)) ? "time" : "price";
+      }
+
       const scale = pinchStartDist / Math.max(10, dist);
-      viewSpan = clamp(pinchStartSpan * scale, MIN_SPAN, MAX_SPAN);
+
+      if (pinchAxisMode === "price") {
+        viewSpan = clamp(pinchStartSpanPrice * scale, MIN_SPAN, MAX_SPAN);
+      } else {
+        timeSpanMs = clamp(pinchStartSpanTime * scale, MIN_TIME_SPAN_MS, MAX_TIME_SPAN_MS);
+      }
     }
   });
 
@@ -405,26 +566,35 @@ HTML = r"""
     pointers.delete(e.pointerId);
     if (pointers.size < 2) {
       pinchStartDist = null;
-      pinchStartSpan = null;
+      pinchStartSpanPrice = null;
+      pinchStartSpanTime = null;
+      pinchAxisMode = null;
     }
     if (pointers.size === 0) {
+      dragStartX = null;
       dragStartY = null;
       dragStartMid = null;
+      dragStartTimeEnd = null;
+      dragMode = null;
     }
   }
   cv.addEventListener("pointerup", endPointer);
   cv.addEventListener("pointercancel", endPointer);
   cv.addEventListener("pointerout", endPointer);
 
-  // Desktop wheel zoom (optional)
+  // Desktop wheel: zoom price. Shift+wheel: zoom time
   cv.addEventListener("wheel", (e) => {
-    if (viewMid === null) return;
+    if (viewMid === null || timeEndMs === null) return;
     e.preventDefault();
-    autoFollow = false;
-    btn.textContent = "AutoFollow: OFF";
+    setFollow(false);
 
     const factor = (e.deltaY > 0) ? 1.10 : 0.90;
-    viewSpan = clamp(viewSpan * factor, MIN_SPAN, MAX_SPAN);
+
+    if (e.shiftKey) {
+      timeSpanMs = clamp(timeSpanMs * factor, MIN_TIME_SPAN_MS, MAX_TIME_SPAN_MS);
+    } else {
+      viewSpan = clamp(viewSpan * factor, MIN_SPAN, MAX_SPAN);
+    }
   }, {passive:false});
 
   // -----------------------------
@@ -441,29 +611,93 @@ HTML = r"""
     return idx;
   }
 
-  function percentile(arr, q) {
-    // arr: Float32Array, q in [0,1]
-    const tmp = Array.from(arr);
-    tmp.sort((a,b) => a-b);
-    const i = Math.floor(q * (tmp.length-1));
-    return tmp[clamp(i, 0, tmp.length-1)];
+  // Single-channel intensity colormap (Bookmap-like glow: dark->cyan/yellow->white)
+  function heatRGBA(a) {
+    // a in [0..1]
+    // We'll create a smooth gradient: low=transparent dark, mid=cyan, high=yellow/white
+    const t = clamp(a, 0, 1);
+    const g1 = Math.pow(t, 0.55);
+
+    let r, g, b, alpha;
+    alpha = 0.05 + 0.90 * g1;
+
+    if (t < 0.55) {
+      // dark -> cyan/blue
+      const u = t / 0.55;
+      r = 20 + 40*u;
+      g = 40 + 170*u;
+      b = 80 + 170*u;
+    } else {
+      // cyan -> yellow -> white
+      const u = (t - 0.55) / 0.45;
+      r = 60 + 195*u;
+      g = 210 + 45*u;
+      b = 250 - 170*u;
+    }
+    return `rgba(${Math.floor(r)},${Math.floor(g)},${Math.floor(b)},${alpha.toFixed(3)})`;
   }
 
-  // Color map (simple "bookmap-ish" glow)
-  // intensity -> rgba with stronger at high.
-  function heatColor(isBid, a) {
-    // a in [0,1]
-    if (isBid) {
-      // green/cyan glow
-      const g = 180 + Math.floor(75*a);
-      const b = 120 + Math.floor(90*a);
-      return `rgba(40, ${g}, ${b}, ${0.10 + 0.70*a})`;
-    } else {
-      // red/orange glow
-      const r = 200 + Math.floor(55*a);
-      const g = 90 + Math.floor(60*a);
-      return `rgba(${r}, ${g}, 80, ${0.10 + 0.70*a})`;
+  function heatGet(bin, col) {
+    return heat[bin * heatCols + col];
+  }
+  function heatSet(bin, col, v) {
+    heat[bin * heatCols + col] = v;
+  }
+
+  function pushHeatColumn(pMin, pMax) {
+    if (!last || !last.book || !heat) return;
+
+    const bids = last.book.bids || [];
+    const asks = last.book.asks || [];
+
+    // Slow decay across entire matrix once per column push (true persistence)
+    // Half-life ~ 90s (tunable)
+    const halfLife = 90.0;
+    const decay = Math.pow(0.5, (HEAT_COL_MS/1000.0) / halfLife);
+    for (let i=0; i<heat.length; i++) {
+      heat[i] *= decay;
     }
+
+    // Build new column vector from RESTING book liquidity (both sides, intensity-based)
+    const col = colWrite;
+    // clear current column (after decay, set to 0 so it represents "new density added this second")
+    for (let b=0; b<BINS; b++) heatSet(b, col, 0);
+
+    // Intensity weight:
+    // Use log(1+notional) to reduce domination by huge levels.
+    function addLevels(levels) {
+      for (const pair of levels) {
+        const p = pair[0], q = pair[1];
+        if (!(q > 0) || !(p > 0)) continue;
+        const idx = heatIndex(p, pMin, pMax);
+        if (idx < 0 || idx >= BINS) continue;
+        const notional = p * q;
+        const w = Math.log(1 + notional);
+        heatSet(idx, col, heatGet(idx, col) + w);
+      }
+    }
+    addLevels(bids);
+    addLevels(asks);
+
+    // timestamp this column
+    colTimes[col] = Date.now();
+
+    // update exposure (EWMA of column max)
+    let cmax = 0;
+    for (let b=0; b<BINS; b++) cmax = Math.max(cmax, heatGet(b, col));
+    cmax = Math.max(1e-6, cmax);
+    const alpha = 0.08;
+    vmaxEwma = (1-alpha)*vmaxEwma + alpha*cmax;
+
+    colWrite = (colWrite + 1) % heatCols;
+  }
+
+  function orderedColIndex(oldestToNewestIdx) {
+    // Convert ordered index (0 oldest .. heatCols-1 newest) into ring physical index
+    // Newest column is at (colWrite-1), oldest at colWrite
+    // Our ring writes at colWrite then increments, so colWrite is the "oldest slot".
+    const phys = (colWrite + oldestToNewestIdx) % heatCols;
+    return phys;
   }
 
   // -----------------------------
@@ -478,7 +712,7 @@ HTML = r"""
     ctx.fillStyle = "#0b0f14";
     ctx.fillRect(0,0,w,h);
 
-    if (!last || !last.book || viewMid === null) {
+    if (!last || !last.book || viewMid === null || timeEndMs === null || !heat) {
       ctx.fillStyle = "#94a3b8";
       ctx.font = "14px -apple-system, system-ui, Arial";
       ctx.fillText("Waiting for data...", 12, 24);
@@ -486,62 +720,79 @@ HTML = r"""
       return;
     }
 
-    // Auto-follow keeps center locked to last price
-    if (autoFollow && lastPx) {
-      viewMid = lastPx;
+    // Auto-follow keeps center locked to last price AND time pinned to now
+    if (autoFollow) {
+      if (lastPx) viewMid = lastPx;
+      timeEndMs = Date.now();
     }
 
     const pMin = viewMid - viewSpan/2;
     const pMax = viewMid + viewSpan/2;
 
-    // Decay heatmap over time
-    const tNow = performance.now();
-    const dt = Math.max(0.0, (tNow - lastHeatTs) / 1000.0);
-    lastHeatTs = tNow;
-    // half-life feel: ~8 seconds (tune)
-    const decay = Math.pow(0.5, dt / 8.0);
-    for (let i=0;i<BINS;i++) {
-      heatBid[i] *= decay;
-      heatAsk[i] *= decay;
+    // push heat columns on a fixed cadence
+    const now = Date.now();
+    if (lastColPushMs === null) lastColPushMs = now;
+    while ((now - lastColPushMs) >= HEAT_COL_MS) {
+      pushHeatColumn(pMin, pMax);
+      lastColPushMs += HEAT_COL_MS;
     }
 
-    // Accumulate latest depth into heat bins
-    const bids = last.book.bids || [];
-    const asks = last.book.asks || [];
+    // Time visible range
+    const tEnd = timeEndMs;
+    const tStart = tEnd - timeSpanMs;
 
-    // Add log-scaled qty to bins (reduces domination by huge levels)
-    for (const [p,q] of bids) {
-      const idx = heatIndex(p, pMin, pMax);
-      if (idx >= 0 && idx < BINS && q > 0) heatBid[idx] += Math.log(1 + q);
+    // Render TRUE heatmap: time×price
+    // We draw vertical strips per heat column within visible time.
+    // For each column, we draw bins with intensity.
+    const colsToDraw = Math.min(heatCols, Math.max(60, Math.floor(timeSpanMs / HEAT_COL_MS)));
+    // determine mapping from time -> ordered column indices by looking at colTimes
+    // We'll draw by scanning columns and selecting those in [tStart..tEnd]
+    // For speed, approximate by drawing all columns but skip those outside.
+    const stripW = w / Math.max(1, colsToDraw);
+
+    // Find columns in time window; build a list (oldest->newest)
+    const selected = [];
+    for (let k=0; k<heatCols; k++) {
+      const phys = orderedColIndex(k);
+      const ts = colTimes[phys] || 0;
+      if (ts >= tStart && ts <= tEnd) selected.push(phys);
     }
-    for (const [p,q] of asks) {
-      const idx = heatIndex(p, pMin, pMax);
-      if (idx >= 0 && idx < BINS && q > 0) heatAsk[idx] += Math.log(1 + q);
+
+    // If not enough selected (startup), use the most recent tail
+    if (selected.length < 10) {
+      selected.length = 0;
+      for (let k=Math.max(0, heatCols - colsToDraw); k<heatCols; k++) {
+        selected.push(orderedColIndex(k));
+      }
     }
 
-    // Normalize heat by percentile (auto exposure)
-    const bidP = Math.max(1e-6, percentile(heatBid, 0.98));
-    const askP = Math.max(1e-6, percentile(heatAsk, 0.98));
-
-    // Draw heatmap as vertical bins (full width)
+    // Draw heat strips
     const binH = h / BINS;
-    for (let i=0;i<BINS;i++) {
-      const y = i * binH;
-      const vb = clamp(heatBid[i] / bidP, 0, 1);
-      const va = clamp(heatAsk[i] / askP, 0, 1);
+    const vmax = Math.max(1e-6, vmaxEwma);
 
-      // Blend ask + bid; draw ask then bid for richer mixing
-      if (va > 0.02) {
-        ctx.fillStyle = heatColor(false, Math.pow(va, 0.75));
-        ctx.fillRect(0, y, w, binH + 1);
-      }
-      if (vb > 0.02) {
-        ctx.fillStyle = heatColor(true, Math.pow(vb, 0.75));
-        ctx.fillRect(0, y, w, binH + 1);
+    // Use mild gamma to increase low-intensity visibility
+    const gamma = 0.65;
+
+    // selected is in chronological order by orderedColIndex scanning; good enough
+    const nSel = selected.length;
+    for (let i=0; i<nSel; i++) {
+      const col = selected[i];
+      const x = (i / Math.max(1, nSel)) * w;
+      // draw bins
+      // (This is BINS*nSel rectangles per frame; BINS=360, nSel~720 => heavy but acceptable on modern devices.
+      // If needed later, we optimize via ImageData/offscreen.)
+      for (let b=0; b<BINS; b++) {
+        const v = heatGet(b, col);
+        if (v <= 0) continue;
+        let a = clamp(v / vmax, 0, 1);
+        a = Math.pow(a, gamma);
+        if (a < 0.02) continue;
+        ctx.fillStyle = heatRGBA(a);
+        ctx.fillRect(x, b * binH, stripW + 1, binH + 1);
       }
     }
 
-    // Price axis grid (light)
+    // Light grid (price)
     ctx.strokeStyle = "rgba(148,163,184,0.08)";
     ctx.lineWidth = 1;
     const gridN = 8;
@@ -553,23 +804,26 @@ HTML = r"""
       ctx.stroke();
     }
 
-    // Trade bubbles (time on X, price on Y)
-    const now = Date.now();
-    const windowMs = 12 * 60 * 1000;
+    // Trade bubbles (time on X, price on Y) based on current time view
     const xOf = (tms) => {
-      const dtm = now - tms;
-      const frac = 1 - (dtm / windowMs);
+      const frac = (tms - tStart) / Math.max(1, (tEnd - tStart));
       return clamp(frac, 0, 1) * w;
     };
 
     let vMax = 0;
-    for (const t of trades) vMax = Math.max(vMax, t.v || 0);
+    for (const t of trades) {
+      if (t.t >= tStart && t.t <= tEnd) vMax = Math.max(vMax, t.v || 0);
+    }
     vMax = Math.max(vMax, 1e-9);
 
     for (const t of trades) {
+      const tms = t.t;
+      if (!(tms >= tStart && tms <= tEnd)) continue;
+
       const p = t.p;
       if (!(p >= pMin && p <= pMax)) continue;
-      const x = xOf(t.t);
+
+      const x = xOf(tms);
       const y = yOf(p, pMin, pMax, h);
 
       const v = (t.v || 0);
@@ -577,30 +831,47 @@ HTML = r"""
 
       const isBuy = (t.T === 1);
       ctx.beginPath();
-      ctx.fillStyle = isBuy ? "rgba(59,130,246,0.65)" : "rgba(245,158,11,0.65)";
+      ctx.fillStyle = isBuy ? "rgba(59,130,246,0.70)" : "rgba(245,158,11,0.70)";
       ctx.arc(x, y, r, 0, Math.PI*2);
       ctx.fill();
     }
 
-    // Last price line + label
+    // Last trade price line
     if (lastPx) {
       const y = yOf(lastPx, pMin, pMax, h);
-      ctx.strokeStyle = "rgba(226,232,240,0.9)";
+      ctx.strokeStyle = "rgba(226,232,240,0.95)";
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(0,y);
       ctx.lineTo(w,y);
       ctx.stroke();
 
-      ctx.fillStyle = "rgba(226,232,240,0.9)";
+      ctx.fillStyle = "rgba(226,232,240,0.95)";
       ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      ctx.fillText(`PX ${lastPx.toFixed(2)}`, 10, clamp(y-6, 14, h-8));
+      ctx.fillText(`LAST ${lastPx.toFixed(3)}`, 10, clamp(y-6, 14, h-8));
     }
 
-    // Footer scale text
-    ctx.fillStyle = "rgba(148,163,184,0.85)";
-    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-    ctx.fillText(`view: ${pMin.toFixed(1)} .. ${pMax.toFixed(1)} | span=${viewSpan.toFixed(1)} | 1-finger pan | pinch zoom`, 10, h - 10);
+    // Mid price line (optional)
+    if (midPx) {
+      const y = yOf(midPx, pMin, pMax, h);
+      ctx.strokeStyle = "rgba(148,163,184,0.55)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4,4]);
+      ctx.beginPath();
+      ctx.moveTo(0,y);
+      ctx.lineTo(w,y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = "rgba(148,163,184,0.85)";
+      ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+      ctx.fillText(`MID ${midPx.toFixed(3)}`, 10, clamp(y+14, 18, h-4));
+    }
+
+    // View info (topbar)
+    const spanSec = (timeSpanMs/1000).toFixed(1);
+    const ageMs = (last && last.health) ? (last.health.trade_age_ms ?? "None") : "None";
+    viewInfoEl.textContent = `Tspan=${spanSec}s | Pspan=${viewSpan.toFixed(1)} | trade_age=${ageMs}ms | history=${Math.floor(HEAT_WINDOW_MS/60000)}m`;
 
     requestAnimationFrame(draw);
   }
@@ -622,16 +893,28 @@ async def index():
 
 @app.get("/health")
 async def health():
+    bb, ba = feed.book.best_bid_ask()
+    mid = (bb + ba)/2.0 if (bb is not None and ba is not None and bb > 0 and ba > 0) else None
     return {
-        "service": "bookmap-ui-mvp",
+        "service": "quantdesk-bookmap-ui",
         "symbol": SYMBOL_WS,
+        "ws_url": WS_URL,
         "ws_ok": feed.ws_ok,
         "last_px": feed.last_px,
+        "mid_px": mid,
+        "best_bid": bb,
+        "best_ask": ba,
         "bids_n": len(feed.book.bids),
         "asks_n": len(feed.book.asks),
         "trades_n": len(feed.trades.dq),
         "depth_age_ms": (now_ms() - feed.last_depth_ms) if feed.last_depth_ms else None,
         "trade_age_ms": (now_ms() - feed.last_trade_ms) if feed.last_trade_ms else None,
+        "ui_defaults": {
+            "heat_window_sec": HEAT_WINDOW_SEC,
+            "heat_col_ms": HEAT_COL_MS,
+            "heat_bins": HEAT_BINS,
+            "default_price_span": DEFAULT_PRICE_SPAN,
+        }
     }
 
 @app.websocket("/ws")
@@ -648,4 +931,5 @@ async def ws_endpoint(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=PORT)
+    # Run directly without relying on filename/module import name
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
