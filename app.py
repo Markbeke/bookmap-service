@@ -703,8 +703,6 @@ async def index() -> str:
         hctx.fillRect(x0, y - stripe*0.5, colsPx, stripe);
       }
     }
-    const binUsd = (snap && snap.bin_usd) ? snap.bin_usd : __BIN_USD__;
-
     if (testPattern) {
       bins = [];
       const steps = 48;
