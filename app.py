@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 # -----------------------------
 # Build
 # -----------------------------
-BUILD_TAG = "FIX4"
+BUILD_TAG = "FIX5"
 
 # -----------------------------
 # Config (env)
@@ -460,7 +460,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (FIX4)</title>
+  <title>QuantDesk Bookmap (FIX5)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
     #topbar {
@@ -539,6 +539,7 @@ HTML = r"""
   const symEl = document.getElementById("sym");
   const dot = document.getElementById("statusDot");
   const healthEl = document.getElementById("health");
+  const buildTag = "FIX5";
 
   const btnAF = document.getElementById("btnAF");
   const btnTm = document.getElementById("btnTm");
@@ -1063,9 +1064,13 @@ const [rr, gg, bb, aa] = heatRGBA(a);
     for (const t of trades) vMax = Math.max(vMax, t.v || 0);
     vMax = Math.max(vMax, 1e-9);
 
+    let bubblesDrawn = 0;
+    let bubblesVisible = 0;
     for (const t of trades) {
       const p = t.p;
       if (!(p >= pMin && p <= pMax)) continue;
+      bubblesVisible += 1;
+
       const vv = (t.v || 0);
       const vFrac = Math.sqrt(vv / vMax);
       if (vFrac < bubMin) continue;
@@ -1079,8 +1084,24 @@ const [rr, gg, bb, aa] = heatRGBA(a);
       ctx.fillStyle = isBuy ? `rgba(59,130,246,${bubOp})` : `rgba(245,158,11,${bubOp})`;
       ctx.arc(x, y, r, 0, Math.PI*2);
       ctx.fill();
+      bubblesDrawn += 1;
     }
 
+    // If bubbles aren't drawing, render a deterministic "probe" marker at PRIMARY to verify canvas/view mapping.
+    if (bubblesDrawn === 0 && (midPx || lastPx)) {
+      const probeP = (midPx ?? lastPx);
+      const probeX = w * 0.98;
+      const probeY = yOf(probeP, pMin, pMax, h);
+      ctx.beginPath();
+      ctx.fillStyle = "rgba(236,72,153,0.9)"; // magenta probe
+      ctx.arc(probeX, probeY, 6, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // Bubble diagnostics overlay (on-canvas; no console spam)
+    ctx.fillStyle = "rgba(148,163,184,0.95)";
+    ctx.font = "14px -apple-system, system-ui, Arial";
+    ctx.fillText(`build=${buildTag} trades=${trades.length} vis=${bubblesVisible} drawn=${bubblesDrawn} vMax=${vMax.toFixed(3)} bubMin=${bubMin.toFixed(2)} op=${bubOp.toFixed(2)} ts=${timeSpanSec}s`, 14, h - 14);
     // price lines
     if (lastPx) {
       const y = yOf(lastPx, pMin, pMax, h);
