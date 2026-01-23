@@ -50,7 +50,7 @@ BIN_USD = float(os.getenv("QD_BIN_USD", "5"))            # price bin size for sn
 TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))    # levels retained per side
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX4_RENDER_BRIDGE_FIX3_WS_HEALTH"
+BUILD = "FIX4_RENDER_BRIDGE_FIX3_WS_DERIVE"
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
 # ---------------------------
@@ -557,7 +557,7 @@ async def index() -> str:
         setStatus(false, 'API unreachable');
         return;
       }
-      const wsOk = (snap.ws_ok !== undefined) ? !!snap.ws_ok : !!snap.ws_connected;
+      const wsOk = !!snap.ws_connected;
       const depthAge = snap.depth_age_ms;
       const tradeAge = snap.trade_age_ms;
 
@@ -645,16 +645,6 @@ async def index() -> str:
 async def state() -> JSONResponse:
     # Compatibility endpoint for FOUNDATION checks
     async with STATE_LOCK:
-    # --- Derived WS health (authoritative): based on last message age ---
-    # Some platforms can momentarily flip a boolean flag during reconnect; last message age is more reliable.
-    ws_msg_age_ms = None
-    derived_ws_ok = False
-    try:
-        ws_msg_age_ms = max(0.0, (now - float(STATE.ws_last_msg_ts)) * 1000.0) if STATE.ws_last_msg_ts else None
-        derived_ws_ok = (ws_msg_age_ms is not None) and (ws_msg_age_ms < 2500.0)
-    except Exception:
-        ws_msg_age_ms = None
-        derived_ws_ok = False
         return JSONResponse(dict(STATE))
 
 
@@ -666,10 +656,8 @@ async def snapshot() -> JSONResponse:
       - heat_bins: snapshot ladder bins from current depth only
     """
     async with STATE_LOCK:
-        ws_ok = bool(STATE.get("ws_ok"))
-        ws_last_rx_ms = STATE.get("ws_last_rx_ms")
-        now_ms = _now_ms()
-        ws_msg_age_ms = (now_ms - ws_last_rx_ms) if ws_last_rx_ms else 10**9
+        ws_ok_raw = bool(STATE.get("ws_ok"))  # raw flag (may flicker)
+        ws_ok = bool(ws_msg_age_ms < 2500.0)  # authoritative derived health
 
         best_bid = STATE.get("best_bid")
         best_ask = STATE.get("best_ask")
@@ -694,8 +682,9 @@ async def snapshot() -> JSONResponse:
         payload = {
             "build": BUILD,
             "symbol": SYMBOL,
-            "ws_ok": ws_ok,
-            "ws_msg_age_ms": ws_msg_age_ms,
+            "ws_ok": bool(ws_ok),
+            "ws_ok_raw": bool(ws_ok_raw),
+            "ws_msg_age_ms": float(ws_msg_age_ms),
             "depth_age_ms": STATE.get("depth_age_ms"),
             "trade_age_ms": STATE.get("trade_age_ms"),
             "prints_60s": STATE.get("prints_60s", 0),
