@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 # -----------------------------
 # Build
 # -----------------------------
-BUILD_TAG = "FIX9"
+BUILD_TAG = "FIX10"
 
 # -----------------------------
 # Config (env)
@@ -599,6 +599,40 @@ HTML = r"""
   const MIN_PSPAN = 40;
   const MAX_PSPAN = 20000;
 
+
+  // tick size (client-side inference; required for stable row mapping)
+  // Default is conservative; we update it from live prices.
+  let tickSize = 0.1;
+  function inferTickSizeFromPrices(bid, ask, lastp) {
+    try {
+      const vals = [bid, ask, lastp].filter(v => v !== null && v !== undefined && Number.isFinite(v));
+      if (vals.length === 0) return tickSize;
+      // Candidate tick ladder (coarse -> fine). We choose the first tick that makes all vals near-integers.
+      const ladder = [1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001, 0.00005, 0.00002, 0.00001, 0.000001, 0.0000001, 0.00000001];
+      const eps = 1e-6;
+      for (const t of ladder) {
+        let ok = true;
+        for (const v of vals) {
+          const q = v / t;
+          if (!Number.isFinite(q) || Math.abs(q - Math.round(q)) > eps) { ok = false; break; }
+        }
+        if (ok) return t;
+      }
+      // Fallback: use spread-derived tick if reasonable
+      if (bid !== null && ask !== null && Number.isFinite(bid) && Number.isFinite(ask)) {
+        const spr = Math.abs(ask - bid);
+        if (spr > 0) {
+          // snap spread to nearest power-of-10 ladder
+          const pow = Math.pow(10, Math.floor(Math.log10(spr)));
+          return Math.max(pow, 1e-8);
+        }
+      }
+      return tickSize;
+    } catch (e) {
+      return tickSize;
+    }
+  }
+
   // heat ring
   let heat = {
     ready: false,
@@ -699,8 +733,9 @@ HTML = r"""
     const bid = (msg.best_bid ?? null);
     const ask = (msg.best_ask ?? null);
     const primaryPx = (midPx ?? lastPx);
+    tickSize = inferTickSizeFromPrices(bid, ask, primaryPx);
     const primaryTag = (midPx !== null && midPx !== undefined) ? "MID" : "TRADE";
-    symEl.textContent = `${msg.symbol} | build=${(msg.health && msg.health.build) ? msg.health.build : 'FIX?'} | PRIMARY(${primaryTag})=${(primaryPx ?? 'None')} | TRADE=${(lastPx ?? 'None')} | MID=${(midPx ?? 'None')} | bid=${(bid ?? 'None')} ask=${(ask ?? 'None')}`;
+    symEl.textContent = `${msg.symbol} | build=${(msg.health && msg.health.build) ? msg.health.build : 'FIX?'} | PRIMARY(${primaryTag})=${(primaryPx ?? 'None')} | TRADE=${(lastPx ?? 'None')} | MID=${(midPx ?? 'None')} | bid=${(bid ?? 'None')} ask=${(ask ?? 'None')} | tick=${tickSize}`;
 
     healthEl.textContent =
       `book: bids=${msg.health.bids_n} asks=${msg.health.asks_n} age: depth=${msg.health.depth_age_ms ?? "None"}ms trade=${msg.health.trade_age_ms ?? "None"}ms`;
@@ -1181,7 +1216,7 @@ const [rr, gg, bb, aa] = heatRGBA(a);
         msg = String(e);
       }
       const lines = msg.split("\n").slice(0,8);
-      ctx.fillText("JS ERROR (FIX9) step="+(__step||"?"), 16, 28);
+      ctx.fillText("JS ERROR (FIX10) step="+(__step||"?"), 16, 28);
       for (let i=0;i<lines.length;i++) ctx.fillText(lines[i].slice(0,120), 16, 52 + i*18);
     }
 
