@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 # -----------------------------
 # Build
 # -----------------------------
-BUILD_TAG = "FIX5"
+BUILD_TAG = "FIX6"
 
 # -----------------------------
 # Config (env)
@@ -460,10 +460,10 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (FIX5)</title>
+  <title>QuantDesk Bookmap (FIX6)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
-    #topbar {
+    #topbar { flex:0 0 auto;
       padding:10px 12px;
       font-family: -apple-system, system-ui, Arial;
       font-size:14px;
@@ -487,8 +487,9 @@ HTML = r"""
     }
     .ctl { display:flex; align-items:center; gap:8px; }
     input[type="range"] { width: 160px; }
-    #wrap { height: calc(100% - 96px); display:flex; }
-    canvas { width: 100%; height: 100%; display:block; touch-action:none; }
+    #wrap { flex:1; min-height:0; display:flex; }
+    body { display:flex; flex-direction:column; }
+    canvas { width: 100%; height: 100%; display:block; touch-action:none; outline:1px solid rgba(148,163,184,0.15); }
   </style>
 </head>
 <body>
@@ -539,7 +540,7 @@ HTML = r"""
   const symEl = document.getElementById("sym");
   const dot = document.getElementById("statusDot");
   const healthEl = document.getElementById("health");
-  const buildTag = "FIX5";
+  const buildTag = "FIX6";
 
   const btnAF = document.getElementById("btnAF");
   const btnTm = document.getElementById("btnTm");
@@ -557,9 +558,23 @@ HTML = r"""
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-    cv.width = Math.floor(cv.clientWidth * dpr);
-    cv.height = Math.floor(cv.clientHeight * dpr);
-    // draw in device pixels; no transform drift
+
+    // Robust sizing on mobile/iPad: canvas clientHeight can become 0 when the topbar wraps.
+    // We explicitly allocate remaining viewport height below the topbar.
+    const top = document.getElementById("topbar");
+    const topH = top ? Math.ceil(top.getBoundingClientRect().height) : 0;
+    const availH = Math.max(120, Math.floor(window.innerHeight - topH));
+
+    // Force canvas CSS height to the available viewport height.
+    cv.style.height = availH + "px";
+    cv.style.width = "100%";
+
+    // Now map CSS pixels -> device pixels.
+    const cssW = Math.max(300, Math.floor(cv.clientWidth || window.innerWidth));
+    const cssH = Math.max(120, Math.floor(cv.clientHeight || availH));
+    cv.width = Math.floor(cssW * dpr);
+    cv.height = Math.floor(cssH * dpr);
+
     ctx.setTransform(1,0,0,1,0,0);
   }
   window.addEventListener("resize", resize);
