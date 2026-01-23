@@ -50,7 +50,7 @@ BIN_USD = float(os.getenv("QD_BIN_USD", "5"))            # price bin size for sn
 TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))    # levels retained per side
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX4_RENDER_BRIDGE_FIX4_SNAPSHOT_GUARD"
+BUILD = "FIX5_HEAT_ACCUMULATOR_FIX1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -310,10 +310,10 @@ async def _startup() -> None:
 # Routes
 # ---------------------------
 
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     # IMPORTANT: This HTML/JS/CSS must NOT use Python f-strings.
-    # We inject a few numeric constants via token replacement.
     html = r"""<!doctype html>
 <html>
 <head>
@@ -321,48 +321,26 @@ async def index() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>QuantDesk Bookmap — __BUILD__</title>
   <style>
-    html, body {
-      margin: 0; padding: 0; height: 100%; background: #000; color: #ddd;
-      font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif;
-      overflow: hidden;
-    }
-    #wrap { position: relative; width: 100%; height: 100%; }
-    #c { width: 100%; height: 100%; display: block; touch-action: none; background: #000; }
+    html, body { margin:0; padding:0; height:100%; background:#000; color:#ddd;
+      font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; overflow:hidden; }
+    #wrap { position:relative; width:100%; height:100%; }
+    #c { width:100%; height:100%; display:block; touch-action:none; background:#000; }
     #hud {
-      position: absolute; left: 12px; top: 10px;
-      background: rgba(0,0,0,0.55);
-      border: 1px solid rgba(255,255,255,0.12);
-      border-radius: 10px;
-      padding: 10px 12px;
-      font-size: 12px;
-      line-height: 1.35;
-      max-width: 92vw;
-      z-index: 10;
-      pointer-events: auto;
+      position:absolute; left:12px; top:10px; z-index:10;
+      background:rgba(0,0,0,0.55); border:1px solid rgba(255,255,255,0.12);
+      border-radius:10px; padding:10px 12px; font-size:12px; line-height:1.35;
+      max-width:92vw; pointer-events:auto;
     }
-    .row { white-space: nowrap; }
-    .k { color: #9aa; }
-    .v { color: #e6e6e6; }
-    #btns { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
-    button {
-      background: rgba(255,255,255,0.08);
-      color: #eee;
-      border: 1px solid rgba(255,255,255,0.15);
-      border-radius: 10px;
-      padding: 8px 10px;
-      font-size: 12px;
-    }
-    button:active { transform: scale(0.99); }
-    #statusDot {
-      display:inline-block; width:8px; height:8px; border-radius:50%;
-      margin-right:6px; vertical-align:middle; background: #666;
-    }
-    #err {
-      margin-top: 8px;
-      color: #ffb3b3;
-      max-width: 92vw;
-      white-space: pre-wrap;
-    }
+    .row { white-space:nowrap; }
+    .k { color:#9aa; }
+    .v { color:#e6e6e6; }
+    #btns { margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; }
+    button { background:rgba(255,255,255,0.08); color:#eee; border:1px solid rgba(255,255,255,0.15);
+      border-radius:10px; padding:8px 10px; font-size:12px; }
+    button:active { transform:scale(0.99); }
+    #statusDot { display:inline-block; width:8px; height:8px; border-radius:50%;
+      margin-right:6px; vertical-align:middle; background:#666; }
+    #err { margin-top:8px; color:#ffb3b3; max-width:92vw; white-space:pre-wrap; }
   </style>
 </head>
 <body>
@@ -393,6 +371,10 @@ async def index() -> str:
   const CANVAS = document.getElementById('c');
   const ctx = CANVAS.getContext('2d');
 
+  // Offscreen heat buffer (time-accumulator)
+  const heat = document.createElement('canvas');
+  const hctx = heat.getContext('2d');
+
   const elStatusDot = document.getElementById('statusDot');
   const elStatusTxt = document.getElementById('statusTxt');
   const elLast = document.getElementById('lastPx');
@@ -410,11 +392,21 @@ async def index() -> str:
 
   let autofollow = true;
   let testPattern = false;
+
+  // View state
   let centerPx = null;
   let zoom = 1.0;
   let panPx = 0.0;
   let dragging = false;
   let lastY = 0;
+
+  // Heat accumulator settings (Phase 3)
+  const COL_PX = 2;            // width of the newest time column in pixels
+  const DECAY_ALPHA = 0.035;   // how quickly old heat fades (overlay black with this alpha each tick)
+  const MAX_EMA_ALPHA = 0.08;  // EMA smoothing for exposure scaling (Phase 4 later improves this)
+
+  let emaMax = 0.0;            // running max for scaling
+  let lastDrawSnap = null;
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -423,6 +415,23 @@ async def index() -> str:
     if (CANVAS.width !== w || CANVAS.height !== h) {
       CANVAS.width = w;
       CANVAS.height = h;
+    }
+    if (heat.width !== CANVAS.width || heat.height !== CANVAS.height) {
+      // Preserve existing heat if possible: draw into a resized canvas
+      const prev = document.createElement('canvas');
+      prev.width = heat.width; prev.height = heat.height;
+      const pctx = prev.getContext('2d');
+      pctx.drawImage(heat, 0, 0);
+
+      heat.width = CANVAS.width;
+      heat.height = CANVAS.height;
+      hctx.fillStyle = '#000';
+      hctx.fillRect(0, 0, heat.width, heat.height);
+
+      if (prev.width > 0 && prev.height > 0) {
+        // Fit old heat (simple stretch to keep continuity)
+        hctx.drawImage(prev, 0, 0, prev.width, prev.height, 0, 0, heat.width, heat.height);
+      }
     }
   }
   window.addEventListener('resize', resize);
@@ -434,6 +443,7 @@ async def index() -> str:
     return (Math.round(x * 100) / 100).toFixed(2);
   }
 
+  // Simple blue->red heat mapping (Phase 4 will replace with percentile/log/gamma)
   function heatColor(t) {
     t = Math.max(0, Math.min(1, t));
     const r = Math.floor(255 * Math.pow(t, 0.85));
@@ -442,44 +452,55 @@ async def index() -> str:
     return `rgb(${r},${g},${b})`;
   }
 
-  function draw(snapshot) {
-    const W = CANVAS.width, H = CANVAS.height;
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, W, H);
+  function setStatus(ok, txt) {
+    elStatusTxt.textContent = txt;
+    elStatusDot.style.background = ok ? '#2bd26b' : '#d24b2b';
+  }
 
-    const pxCenter = snapshot.center_px;
-    if (autofollow && pxCenter !== null && isFinite(pxCenter)) {
-      centerPx = pxCenter;
-      panPx = 0.0;
-    }
-    if (centerPx === null) centerPx = pxCenter;
-
-    if (centerPx === null || !isFinite(centerPx)) {
-      if (testPattern) { centerPx = 0.0; panPx = 0.0; }
-      else {
-      ctx.fillStyle = 'rgba(255,255,255,0.75)';
-      ctx.font = `${Math.floor(14 * (window.devicePixelRatio||1))}px sans-serif`;
-      ctx.fillText('Waiting for first price/book…', 16, 28);
-      return;
-      }
-    }
-
-    const halfRange = snapshot.half_range || __RANGE_USD__;
+  function viewBounds(snap) {
+    const halfRange = (snap && snap.half_range) ? snap.half_range : __RANGE_USD__;
     const effHalf = (halfRange / zoom);
-    const lo = (centerPx + panPx) - effHalf;
-    const hi = (centerPx + panPx) + effHalf;
+    const c = (centerPx === null || !isFinite(centerPx)) ? 0.0 : centerPx;
+    const lo = (c + panPx) - effHalf;
+    const hi = (c + panPx) + effHalf;
+    return { lo, hi, halfRange, effHalf };
+  }
 
-    function yOfPrice(p) {
-      return (hi - p) / (hi - lo) * H;
-    }
+  function yOfPrice(p, lo, hi, H) {
+    return (hi - p) / (hi - lo) * H;
+  }
 
-    let bins = snapshot.heat_bins || [];
-    let maxv = snapshot.heat_max || 0;
-    const binUsd = snapshot.bin_usd || __BIN_USD__;
+  function updateHeat(snap) {
+    const W = heat.width, H = heat.height;
+    if (W <= 0 || H <= 0) return;
+
+    // decay old heat
+    hctx.fillStyle = `rgba(0,0,0,${DECAY_ALPHA})`;
+    hctx.fillRect(0, 0, W, H);
+
+    // shift left by COL_PX (time passes)
+    // drawImage on itself is allowed in browsers; still safe to do via temp for iPad stability.
+    const tmp = document.createElement('canvas');
+    tmp.width = W; tmp.height = H;
+    const tctx = tmp.getContext('2d');
+    tctx.drawImage(heat, 0, 0);
+    hctx.clearRect(0, 0, W, H);
+    hctx.drawImage(tmp, -COL_PX, 0);
+
+    // clear the newest column region
+    hctx.fillStyle = '#000';
+    hctx.fillRect(W - COL_PX, 0, COL_PX, H);
+
+    // Decide bins/max
+    let bins = (snap && snap.heat_bins) ? snap.heat_bins : [];
+    let maxv = (snap && snap.heat_max) ? snap.heat_max : 0;
+
+    const { lo, hi } = viewBounds(snap);
+    const binUsd = (snap && snap.bin_usd) ? snap.bin_usd : __BIN_USD__;
 
     if (testPattern) {
       bins = [];
-      const steps = 40;
+      const steps = 48;
       for (let i=0; i<=steps; i++) {
         const p = lo + (hi-lo) * (i/steps);
         const t = i/steps;
@@ -488,30 +509,55 @@ async def index() -> str:
       maxv = 1.0;
     }
 
-    if (bins.length > 0 && maxv > 0) {
+    // Update exposure EMA
+    if (maxv && isFinite(maxv) && maxv > 0) {
+      emaMax = (1 - MAX_EMA_ALPHA) * emaMax + (MAX_EMA_ALPHA) * maxv;
+      if (emaMax < maxv) emaMax = maxv; // quick react up
+    }
+    const scaleMax = Math.max(1e-9, Math.max(maxv || 0, emaMax || 0));
+
+    // Draw new column
+    if (bins && bins.length > 0) {
       for (let i=0; i<bins.length; i++) {
         const p = bins[i][0];
         const v = bins[i][1];
         if (!(p >= lo && p <= hi)) continue;
-        const t = v / maxv;
+        const t = Math.max(0, Math.min(1, v / scaleMax));
 
-        const y = yOfPrice(p);
-        const y2 = yOfPrice(p + binUsd);
+        const y = yOfPrice(p, lo, hi, H);
+        const y2 = yOfPrice(p + binUsd, lo, hi, H);
         const hStripe = Math.max(1, Math.abs(y2 - y));
 
-        ctx.fillStyle = heatColor(t);
-        ctx.globalAlpha = 0.90;
-        ctx.fillRect(0, y - hStripe*0.5, W, hStripe);
+        hctx.fillStyle = heatColor(t);
+        hctx.globalAlpha = 0.95;
+        hctx.fillRect(W - COL_PX, y - hStripe*0.5, COL_PX, hStripe);
       }
-      ctx.globalAlpha = 1.0;
-    } else {
-      ctx.fillStyle = 'rgba(255,255,255,0.55)';
-      ctx.font = `${Math.floor(14 * (window.devicePixelRatio||1))}px sans-serif`;
-      ctx.fillText('No liquidity bins in range (yet).', 16, 28);
+      hctx.globalAlpha = 1.0;
     }
+  }
 
-    if (snapshot.last_px !== null && isFinite(snapshot.last_px)) {
-      const y = yOfPrice(snapshot.last_px);
+  function drawFrame(snap) {
+    const W = CANVAS.width, H = CANVAS.height;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    // follow center
+    const pxCenter = snap ? snap.center_px : null;
+    if (autofollow && pxCenter !== null && isFinite(pxCenter)) {
+      centerPx = pxCenter;
+      panPx = 0.0;
+    }
+    if (centerPx === null) centerPx = pxCenter;
+
+    // draw heat buffer
+    ctx.drawImage(heat, 0, 0);
+
+    // overlays
+    const { lo, hi } = viewBounds(snap);
+
+    // price line
+    if (snap && snap.last_px !== null && isFinite(snap.last_px)) {
+      const y = yOfPrice(snap.last_px, lo, hi, H);
       ctx.strokeStyle = 'rgba(255,255,255,0.9)';
       ctx.lineWidth = Math.max(1, Math.floor((window.devicePixelRatio||1)));
       ctx.beginPath();
@@ -520,6 +566,7 @@ async def index() -> str:
       ctx.stroke();
     }
 
+    // right-side price ladder labels + faint grid
     ctx.fillStyle = 'rgba(255,255,255,0.75)';
     ctx.font = `${Math.floor(12 * (window.devicePixelRatio||1))}px sans-serif`;
     ctx.textAlign = 'right';
@@ -528,9 +575,9 @@ async def index() -> str:
     const ticks = 8;
     for (let i=0; i<=ticks; i++) {
       const p = lo + (hi - lo) * (i / ticks);
-      const y = yOfPrice(p);
+      const y = yOfPrice(p, lo, hi, H);
       ctx.fillText(fmt(p), W - 8, y);
-      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.07)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(0, y);
@@ -549,11 +596,6 @@ async def index() -> str:
     }
   }
 
-  function setStatus(ok, txt) {
-    elStatusTxt.textContent = txt;
-    elStatusDot.style.background = ok ? '#2bd26b' : '#d24b2b';
-  }
-
   async function tick() {
     try {
       const snap = await fetchSnapshot();
@@ -561,12 +603,14 @@ async def index() -> str:
         setStatus(false, 'API unreachable');
         return;
       }
-      const wsOk = !!snap.ws_connected;
-      const depthAge = snap.depth_age_ms;
-      const tradeAge = snap.trade_age_ms;
 
-      const green = wsOk && depthAge !== null && depthAge < 2500 && snap.book_bids_n > 0 && snap.book_asks_n > 0;
-      const txt = green ? 'HEALTH GREEN' : (wsOk ? 'HEALTH YELLOW/RED' : 'WS DOWN');
+      // authoritative WS health: based on message age (not a raw boolean)
+      const age = (snap.ws_msg_age_ms === null || snap.ws_msg_age_ms === undefined) ? null : Number(snap.ws_msg_age_ms);
+      const wsUp = (age !== null) && isFinite(age) && (age < 2500);
+
+      const depthAge = snap.depth_age_ms;
+      const green = wsUp && depthAge !== null && depthAge < 2500 && snap.book_bids_n > 0 && snap.book_asks_n > 0;
+      const txt = green ? 'HEALTH GREEN' : (wsUp ? 'HEALTH YELLOW/RED' : 'WS DOWN');
       setStatus(green, txt);
 
       elLast.textContent = fmt(snap.last_px);
@@ -574,15 +618,22 @@ async def index() -> str:
       elAsk.textContent = fmt(snap.best_ask);
       elMid.textContent = fmt(snap.mid);
 
-      const da = (depthAge === null) ? '—' : `${Math.round(depthAge)}ms`;
-      const ta = (tradeAge === null) ? '—' : `${Math.round(tradeAge)}ms`;
-      elAges.textContent = `depth_age=${da} trade_age=${ta} ws_msg_age=${Math.round(snap.ws_msg_age_ms)}ms`;
+      const da = (depthAge === null || depthAge === undefined) ? '—' : `${Math.round(depthAge)}ms`;
+      const ta = (snap.trade_age_ms === null || snap.trade_age_ms === undefined) ? '—' : `${Math.round(snap.trade_age_ms)}ms`;
+      const wa = (age === null) ? '—' : `${Math.round(age)}ms`;
+      elAges.textContent = `depth_age=${da} trade_age=${ta} ws_msg_age=${wa}`;
 
       elBook.textContent = `bids=${snap.book_bids_n} asks=${snap.book_asks_n}`;
       elPrints.textContent = `${snap.prints_60s || 0}`;
 
-      draw(snap);
-      if (snap.ok === false && snap.error) { elErr.textContent = String(snap.error); } else { elErr.textContent = ''; }
+      lastDrawSnap = snap;
+
+      // Update heat accumulator then render frame
+      updateHeat(snap);
+      drawFrame(snap);
+
+      if (snap.ok === false && snap.error) elErr.textContent = String(snap.error);
+      else elErr.textContent = '';
     } catch (e) {
       elErr.textContent = String(e && e.stack ? e.stack : e);
     }
@@ -631,6 +682,7 @@ async def index() -> str:
     zoom = Math.max(0.25, Math.min(6.0, zoom * factor));
   }, { passive: false });
 
+  // Tick cadence
   const intervalMs = Math.max(250, Math.floor(1000 / Math.max(0.2, __SNAPSHOT_HZ__)));
   setInterval(tick, intervalMs);
   tick();
@@ -644,13 +696,6 @@ async def index() -> str:
     html = html.replace("__SNAPSHOT_HZ__", str(SNAPSHOT_HZ))
     html = html.replace("__BUILD__", BUILD)
     return html
-
-@app.get("/state")
-async def state() -> JSONResponse:
-    # Compatibility endpoint for FOUNDATION checks
-    async with STATE_LOCK:
-        return JSONResponse(dict(STATE))
-
 
 @app.get("/snapshot")
 async def snapshot() -> JSONResponse:
