@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 # -----------------------------
 # Build
 # -----------------------------
-BUILD_TAG = "FIX7"
+BUILD_TAG = "FIX8"
 
 # -----------------------------
 # Config (env)
@@ -460,7 +460,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (FIX7)</title>
+  <title>QuantDesk Bookmap (FIX8)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
     #topbar { flex:0 0 auto;
@@ -829,6 +829,9 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
   let imgW = 0, imgH = 0;
 
   function ensureImg(w, h) {
+    if (!Number.isFinite(w) || !Number.isFinite(h)) throw new Error("ensureImg non-finite w/h: "+w+","+h);
+    w = Math.max(1, Math.floor(w));
+    h = Math.max(1, Math.floor(h));
     if (!img || imgW !== w || imgH !== h) {
       imgW = w; imgH = h;
       off.width = w; off.height = h;
@@ -913,14 +916,18 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
   }
 
   function draw() {
+    let __step = "enter";
     try {
+    __step = "canvas_dims";
     const w = cv.width;
     const h = cv.height;
 
+    __step = "canvas_clear";
     ctx.clearRect(0,0,w,h);
     ctx.fillStyle = "#0b0f14";
     ctx.fillRect(0,0,w,h);
 
+    __step = "waiting_check";
     if (!last || viewMid === null || viewSpan === null) {
       ctx.fillStyle = "#94a3b8";
       ctx.font = "28px -apple-system, system-ui, Arial";
@@ -941,6 +948,7 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
     const pMin = viewMid - viewSpan/2;
     const pMax = viewMid + viewSpan/2;
 
+    __step = "heat_begin";
     // ---- HEATMAP ----
     heatDbg.ready = false;
     heatDbg.head = heat.head;
@@ -1165,7 +1173,7 @@ const [rr, gg, bb, aa] = heatRGBA(a);
       ctx.font = "16px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
       const msg = (e && (e.stack || e.message)) ? String(e.stack || e.message) : String(e);
       const lines = msg.split("\n").slice(0,6);
-      ctx.fillText("JS ERROR (FIX7)", 16, 28);
+      ctx.fillText("JS ERROR (FIX8) step="+(__step||"?"), 16, 28);
       for (let i=0;i<lines.length;i++) ctx.fillText(lines[i].slice(0,120), 16, 52 + i*18);
     }
 
