@@ -50,7 +50,7 @@ BIN_USD = float(os.getenv("QD_BIN_USD", "5"))            # price bin size for sn
 TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))    # levels retained per side
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX6_AUTO_EXPOSURE_PALETTE_FIX1"
+BUILD = "FIX7_BAND_QUALITY_FIX1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -364,6 +364,9 @@ async def index() -> str:
       <button id="gainBtn">Gain: 1.00</button>
       <button id="gammaBtn">Gamma: 0.65</button>
       <button id="floorBtn">Floor: 0.02</button>
+      <button id="topNBtn">TopN: 70</button>
+      <button id="smoothBtn">Smooth: ON</button>
+      <button id="consumeBtn">Consume: ON</button>
     </div>
     <div id="err"></div>
   </div>
@@ -395,6 +398,9 @@ async def index() -> str:
   const gainBtn = document.getElementById('gainBtn');
   const gammaBtn = document.getElementById('gammaBtn');
   const floorBtn = document.getElementById('floorBtn');
+  const topNBtn = document.getElementById('topNBtn');
+  const smoothBtn = document.getElementById('smoothBtn');
+  const consumeBtn = document.getElementById('consumeBtn');
 
   let autofollow = true;
   let testPattern = false;
@@ -421,6 +427,13 @@ async def index() -> str:
   let heatGain = 1.00;      // multiplies exposure
   let heatGamma = 0.65;     // <1 brightens bands, >1 darkens
   let heatFloor = 0.02;     // threshold below which pixels stay near-black
+  // Band quality (Phase 5)
+  let topNLevels = 70;        // keep strongest N levels per column (bids+asks combined)
+  let smoothBands = true;     // light vertical smoothing
+  let consumeOnPrints = true; // accelerate fade at traded price rows
+  let consumeStrength = 0.18; // 0..1 extra decay per hit
+  let consumeCols = 6;        // affect newest N columns
+  let consumeMinNotional = 1500.0; // USD threshold to count as consumption
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -481,6 +494,33 @@ async def index() -> str:
     return `rgb(${r},${g},${b})`;
   }
 
+  // --- Phase 5 helpers ---
+  function smoothArrayInPlace(a) {
+    // light 1D kernel [0.25, 0.5, 0.25]
+    const n = a.length;
+    if (n < 3) return;
+    let prev = a[0];
+    let curr = a[1];
+    for (let i = 1; i < n - 1; i++) {
+      const next = a[i + 1];
+      const v = 0.25 * prev + 0.50 * curr + 0.25 * next;
+      prev = curr;
+      curr = next;
+      a[i] = v;
+    }
+  }
+
+  function topNIndicesByValue(a, topN) {
+    const idxs = [];
+    for (let i = 0; i < a.length; i++) {
+      const v = a[i];
+      if (v && isFinite(v) && v > 0) idxs.push(i);
+    }
+    if (idxs.length <= topN) return idxs;
+    idxs.sort((i,j)=>a[j]-a[i]);
+    return idxs.slice(0, topN);
+  }
+
   function setStatus(ok, txt) {
     elStatusTxt.textContent = txt;
     elStatusDot.style.background = ok ? '#2bd26b' : '#d24b2b';
@@ -520,11 +560,31 @@ async def index() -> str:
     hctx.fillStyle = '#000';
     hctx.fillRect(W - COL_PX, 0, COL_PX, H);
 
+
     // Decide bins/max
     let bins = (snap && snap.heat_bins) ? snap.heat_bins : [];
     let maxv = (snap && snap.heat_max) ? snap.heat_max : 0;
 
     const { lo, hi } = viewBounds(snap);
+
+    // Consumption fade (Phase 5): large prints fade bands at the traded price row.
+    if (consumeOnPrints && snap && snap.trades && snap.trades.length) {
+      const colsPx = Math.max(1, Math.floor(consumeCols)) * COL_PX;
+      const x0 = Math.max(0, W - colsPx);
+      const alpha = Math.max(0, Math.min(1, consumeStrength));
+      for (let k=0; k<snap.trades.length; k++) {
+        const tr = snap.trades[k];
+        const p = tr && (tr.p ?? tr.price);
+        const v = tr && (tr.v ?? tr.size);
+        if (!isFinite(p) || !isFinite(v)) continue;
+        const notional = Math.abs(p * v);
+        if (notional < consumeMinNotional) continue;
+        const y = yOfPrice(p, lo, hi, H);
+        const stripe = Math.max(2, Math.floor((window.devicePixelRatio||1) * 2));
+        hctx.fillStyle = `rgba(0,0,0,${alpha})`;
+        hctx.fillRect(x0, y - stripe*0.5, colsPx, stripe);
+      }
+    }
     const binUsd = (snap && snap.bin_usd) ? snap.bin_usd : __BIN_USD__;
 
     if (testPattern) {
@@ -564,24 +624,41 @@ async def index() -> str:
     // apply gain (higher gain => brighter => lower scaleMax)
     scaleMax = scaleMax / Math.max(1e-6, heatGain);
 
-    // Draw new column
+    // Draw new column (Phase 5 quality: smooth + TopN)
     if (bins && bins.length > 0) {
+      // Quantize into uniform price bins so smoothing + TopN are stable.
+      const nBins = Math.max(1, Math.floor((hi - lo) / Math.max(1e-9, binUsd)) + 1);
+      const arr = new Float32Array(nBins);
+
       for (let i=0; i<bins.length; i++) {
         const p = bins[i][0];
         const v = bins[i][1];
         if (!(p >= lo && p <= hi)) continue;
+        const idx = Math.max(0, Math.min(nBins-1, Math.floor((p - lo) / binUsd)));
+        // use max so ladder spikes don't smear by summation
+        if (v > arr[idx]) arr[idx] = v;
+      }
+
+      if (smoothBands) smoothArrayInPlace(arr);
+
+      // auto-exposure is based on scaleMax; convert to normalized t after TopN selection
+      const keepIdxs = topNIndicesByValue(arr, Math.max(1, Math.floor(topNLevels)));
+      // draw kept rows only
+      hctx.globalAlpha = 0.95;
+      for (let k=0; k<keepIdxs.length; k++) {
+        const idx = keepIdxs[k];
+        const p = lo + idx * binUsd;
+        const v = arr[idx];
+
         let t = Math.max(0, Math.min(1, v / scaleMax));
-        // floor (suppress noise) then gamma shaping
         t = Math.max(0, (t - heatFloor) / Math.max(1e-6, (1 - heatFloor)));
         t = Math.pow(t, heatGamma);
-
 
         const y = yOfPrice(p, lo, hi, H);
         const y2 = yOfPrice(p + binUsd, lo, hi, H);
         const hStripe = Math.max(1, Math.abs(y2 - y));
 
         hctx.fillStyle = heatColor(t);
-        hctx.globalAlpha = 0.95;
         hctx.fillRect(W - COL_PX, y - hStripe*0.5, COL_PX, hStripe);
       }
       hctx.globalAlpha = 1.0;
@@ -606,6 +683,25 @@ async def index() -> str:
 
     // overlays
     const { lo, hi } = viewBounds(snap);
+
+    // Consumption fade (Phase 5): large prints fade bands at the traded price row.
+    if (consumeOnPrints && snap && snap.trades && snap.trades.length) {
+      const colsPx = Math.max(1, Math.floor(consumeCols)) * COL_PX;
+      const x0 = Math.max(0, W - colsPx);
+      const alpha = Math.max(0, Math.min(1, consumeStrength));
+      for (let k=0; k<snap.trades.length; k++) {
+        const tr = snap.trades[k];
+        const p = tr && (tr.p ?? tr.price);
+        const v = tr && (tr.v ?? tr.size);
+        if (!isFinite(p) || !isFinite(v)) continue;
+        const notional = Math.abs(p * v);
+        if (notional < consumeMinNotional) continue;
+        const y = yOfPrice(p, lo, hi, H);
+        const stripe = Math.max(2, Math.floor((window.devicePixelRatio||1) * 2));
+        hctx.fillStyle = `rgba(0,0,0,${alpha})`;
+        hctx.fillRect(x0, y - stripe*0.5, colsPx, stripe);
+      }
+    }
 
     // price line
     if (snap && snap.last_px !== null && isFinite(snap.last_px)) {
@@ -709,6 +805,9 @@ async def index() -> str:
     gainBtn.textContent = `Gain: ${heatGain.toFixed(2)}`;
     gammaBtn.textContent = `Gamma: ${heatGamma.toFixed(2)}`;
     floorBtn.textContent = `Floor: ${heatFloor.toFixed(2)}`;
+    topNBtn.textContent = `TopN: ${topNLevels}`;
+    smoothBtn.textContent = `Smooth: ${smoothBands ? 'ON' : 'OFF'}`;
+    consumeBtn.textContent = `Consume: ${consumeOnPrints ? 'ON' : 'OFF'}`;
   }
   updateExposureLabels();
 
@@ -731,6 +830,24 @@ async def index() -> str:
     let idx = steps.indexOf(Number(heatFloor.toFixed(2)));
     if (idx < 0) idx = 2;
     heatFloor = steps[(idx + 1) % steps.length];
+    updateExposureLabels();
+  });
+
+  topNBtn.addEventListener('click', () => {
+    const steps = [40, 55, 70, 90, 120];
+    let idx = steps.indexOf(topNLevels);
+    if (idx < 0) idx = 2;
+    topNLevels = steps[(idx + 1) % steps.length];
+    updateExposureLabels();
+  });
+
+  smoothBtn.addEventListener('click', () => {
+    smoothBands = !smoothBands;
+    updateExposureLabels();
+  });
+
+  consumeBtn.addEventListener('click', () => {
+    consumeOnPrints = !consumeOnPrints;
     updateExposureLabels();
   });
 
