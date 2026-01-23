@@ -1,4 +1,4 @@
-# QuantDesk Bookmap Service (Replit/GitHub) — FIX1
+# QuantDesk Bookmap Service (Replit/GitHub) — FIX2
 # Goals:
 # 1) Smooth, stable Bookmap-like scroll/zoom (no "pressed to left" drift)
 # 2) Correct heat palette: weak=light blue, strong=red, none=black
@@ -452,7 +452,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (FIX1)</title>
+  <title>QuantDesk Bookmap (FIX2)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
     #topbar {
@@ -670,7 +670,9 @@ HTML = r"""
     // show "actual" price sources: trade, mid, bid/ask
     const bid = (msg.best_bid ?? null);
     const ask = (msg.best_ask ?? null);
-    symEl.textContent = `${msg.symbol} | TRADE=${(lastPx ?? "None")} | MID=${(midPx ?? "None")} | bid=${(bid ?? "None")} ask=${(ask ?? "None")}`;
+    const primaryPx = (midPx ?? lastPx);
+    const primaryTag = (midPx !== null && midPx !== undefined) ? "MID" : "TRADE";
+    symEl.textContent = `${msg.symbol} | PRIMARY(${primaryTag})=${(primaryPx ?? "None")} | TRADE=${(lastPx ?? "None")} | MID=${(midPx ?? "None")} | bid=${(bid ?? "None")} ask=${(ask ?? "None")}`;
 
     healthEl.textContent =
       `book: bids=${msg.health.bids_n} asks=${msg.health.asks_n} age: depth=${msg.health.depth_age_ms ?? "None"}ms trade=${msg.health.trade_age_ms ?? "None"}ms`;
@@ -846,7 +848,8 @@ HTML = r"""
     }
 
     if (autoFollow && (midPx || lastPx)) {
-      viewMid = (midPx ?? lastPx);
+      const primaryPx = (midPx ?? lastPx);
+      viewMid = primaryPx;
     }
 
     const pMin = viewMid - viewSpan/2;
@@ -868,30 +871,58 @@ HTML = r"""
       const img = ensureImg(colsVisible, rowsVisible);
       const data = img.data;
 
-      // Exposure: compute robust vmax on recent sample; then apply "heatDim"
-      // heatDim low => brighter (reduce vmax), high => dimmer (increase vmax)
-      let vmax = 1;
-      if (autoExp) {
-        const sampleCols = Math.min(colsVisible, 80);
-        const step = Math.max(1, Math.floor(colsVisible / sampleCols));
-        for (let ci = startCol; ci <= head; ci += step) {
-          const col = heat.ring[((ci % heat.cols)+heat.cols)%heat.cols];
-          if (!col) continue;
-          for (let rr = rTop; rr <= rBot; rr += 6) {
-            const v = col[rr] || 0;
-            if (v > vmax) vmax = v;
-          }
-        }
-        vmax = Math.max(vmax, 16);
-      } else {
-        vmax = 64; // fixed fallback
-      }
+      
+// Exposure (Bookmap-like): use histogram percentile (NOT max) + dimming as contrast compression
+// We treat incoming u8 values as "density" in [0..255].
+//  - AutoExp computes a robust percentile-based vmax from sampled recent columns.
+//  - Heat Dim moves the target percentile higher (keeps only dense bands).
+//  - Heat Thr is applied AFTER normalization as a floor, but we also re-map so bands survive.
+//
+// Notes:
+//  - This prevents global saturation (everything red).
+//  - This prevents "uniform dim" behavior; dimming suppresses weak bins first.
 
-      // dimmer acts like a multiplier on vmax (not a flat alpha kill)
-      // heatDim in [0,1] => scale vmax by [0.55 .. 2.2]
-      const dimScale = 0.55 + 1.65 * heatDim;
-      vmax = vmax * dimScale;
+function histPercentileValue(hist, pct) {
+  const total = hist.reduce((a,b)=>a+b,0);
+  if (total <= 0) return 64;
+  const target = Math.max(1, Math.floor(total * pct));
+  let c = 0;
+  for (let i=0;i<hist.length;i++) { c += hist[i]; if (c >= target) return i; }
+  return hist.length - 1;
+}
 
+let vmax = 64;
+if (autoExp) {
+  // Build a 0..255 histogram from a sparse sample of recent heat columns.
+  // Sampling is O(visible) but bounded.
+  const hist = new Array(256).fill(0);
+  const sampleCols = Math.min(colsVisible, 120);
+  const step = Math.max(1, Math.floor(colsVisible / sampleCols));
+
+  for (let ci = startCol; ci <= head; ci += step) {
+    const col = heat.ring[((ci % heat.cols)+heat.cols)%heat.cols];
+    if (!col) continue;
+    // stride rows to keep CPU stable
+    for (let rr = rTop; rr <= rBot; rr += 4) {
+      const v = col[rr] || 0;
+      if (v > 0) hist[v] += 1;
+    }
+  }
+
+  // Dim controls the target percentile: low dim => brighter (lower pct), high dim => darker (higher pct).
+  // Range chosen to mimic Bookmap exposure behavior.
+  const pct = clamp(0.950 + 0.049 * heatDim, 0.90, 0.999); // 0.95 .. ~0.999
+  vmax = histPercentileValue(hist, pct);
+  vmax = Math.max(vmax, 24);
+} else {
+  vmax = 96; // fixed fallback
+}
+
+// Additional "contrast compression" knee: removes low-intensity clutter as heatDim increases.
+// knee in [0..0.35]
+const knee = 0.35 * heatDim;
+
+// fill pixels
       // fill pixels
       for (let x = 0; x < colsVisible; x++) {
         const colIdx = startCol + x;
@@ -903,10 +934,18 @@ HTML = r"""
           const v = col[row] || 0;
           if (v === 0) continue;
 
-          const a = clamp(v / vmax, 0, 1);
-          if (a < heatThr) continue;
+let a = clamp(v / vmax, 0, 1);
 
-          const [rr, gg, bb, aa] = heatRGBA(a);
+// "knee" removes low-density haze while preserving dense bands.
+if (knee > 0) {
+  a = clamp((a - knee) / Math.max(1e-6, (1 - knee)), 0, 1);
+}
+
+// HeatThr acts as a floor but re-maps so top bands remain visible.
+if (a < heatThr) continue;
+a = clamp((a - heatThr) / Math.max(1e-6, (1 - heatThr)), 0, 1);
+
+const [rr, gg, bb, aa] = heatRGBA(a);
           const i = (y*colsVisible + x) * 4;
           data[i+0] = rr;
           data[i+1] = gg;
@@ -929,7 +968,7 @@ HTML = r"""
     }
 
     // ---- Trade bubbles ----
-    const now = Date.now();
+    const now = (last && last.ts) ? last.ts : Date.now();
     const windowMs = timeSpanSec * 1000;
     const xOf = (tms) => {
       const dtm = now - tms;
