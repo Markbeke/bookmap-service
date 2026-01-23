@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 # -----------------------------
 # Build
 # -----------------------------
-BUILD_TAG = "FIX13"
+BUILD_TAG = "FIX14"
 
 # -----------------------------
 # Config (env)
@@ -460,7 +460,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (FIX13)</title>
+  <title>QuantDesk Bookmap (FIX14)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
     #topbar { flex:0 0 auto;
@@ -822,13 +822,14 @@ HTML = r"""
   cv.addEventListener("pointermove", (e) => {
     if (!pointers.has(e.pointerId)) return;
     pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
-    if (viewMid === null || viewSpan === null) return;
+    if (viewMid === null) return;
+    if (viewSpan === null) viewSpan = (last?.ui_defaults?.default_price_span ?? 600.0);
 
     if (pointers.size === 1 && dragStartY !== null) {
       autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
       const dy = e.clientY - dragStartY;
       const pxPerPrice = (cv.clientHeight) / viewSpan;
-      const dPrice = (-dy) / Math.max(1, pxPerPrice);
+      const dPrice = (dy) / Math.max(1, pxPerPrice);
       viewMid = (dragStartMid ?? viewMid) + dPrice;
     }
 
@@ -864,7 +865,8 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
   cv.addEventListener("pointerout", endPointer);
 
   cv.addEventListener("wheel", (e) => {
-    if (viewMid === null || viewSpan === null) return;
+    if (viewMid === null) return;
+    if (viewSpan === null) viewSpan = (last?.ui_defaults?.default_price_span ?? 600.0);
     e.preventDefault();
     autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
 
@@ -977,6 +979,7 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
   }
 
   function draw() {
+    try {
     let __step = "enter";
     try {
     __step = "canvas_dims";
@@ -1251,7 +1254,11 @@ const [rr, gg, bb, aa] = heatRGBA(a);
     requestAnimationFrame(draw);
   }
 
-  requestAnimationFrame(draw);
+  
+    } catch (e) {
+      errEl.textContent = `JS ERROR (FIX14) ${String(e)}`;
+    }
+requestAnimationFrame(draw);
 })();
 </script>
 </body>
