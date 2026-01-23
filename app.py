@@ -309,24 +309,26 @@ async def _startup() -> None:
 # ---------------------------
 # Routes
 # ---------------------------
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    html = """<!doctype html>
+    # IMPORTANT: This HTML/JS/CSS must NOT use Python f-strings.
+    # We inject a few numeric constants via token replacement.
+    html = r"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>QuantDesk Bookmap — {BUILD}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QuantDesk Bookmap — __BUILD__</title>
   <style>
-    html, body {{
-      margin: 0; padding: 0; height: 100%;
-      background: #000; color: #ddd;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    html, body {
+      margin: 0; padding: 0; height: 100%; background: #000; color: #ddd;
+      font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif;
       overflow: hidden;
-    }}
-    #wrap {{ position: relative; width: 100%; height: 100%; }}
-    #c {{ width: 100%; height: 100%; display: block; touch-action: none; }}
-    #hud {{
+    }
+    #wrap { position: relative; width: 100%; height: 100%; }
+    #c { width: 100%; height: 100%; display: block; touch-action: none; background: #000; }
+    #hud {
       position: absolute; left: 12px; top: 10px;
       background: rgba(0,0,0,0.55);
       border: 1px solid rgba(255,255,255,0.12);
@@ -335,38 +337,39 @@ async def index() -> str:
       font-size: 12px;
       line-height: 1.35;
       max-width: 92vw;
-      user-select: none;
-    }}
-    .row {{ white-space: nowrap; }}
-    .k {{ color: #9aa; }}
-    .v {{ color: #e6e6e6; }}
-    #btns {{ margin-top: 8px; display:flex; gap:8px; flex-wrap: wrap; }}
-    button {{
+      z-index: 10;
+      pointer-events: auto;
+    }
+    .row { white-space: nowrap; }
+    .k { color: #9aa; }
+    .v { color: #e6e6e6; }
+    #btns { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+    button {
       background: rgba(255,255,255,0.08);
       color: #eee;
       border: 1px solid rgba(255,255,255,0.15);
       border-radius: 10px;
       padding: 8px 10px;
       font-size: 12px;
-    }}
-    #statusDot {{
+    }
+    button:active { transform: scale(0.99); }
+    #statusDot {
       display:inline-block; width:8px; height:8px; border-radius:50%;
       margin-right:6px; vertical-align:middle; background: #666;
-    }}
-    #err {{
+    }
+    #err {
       margin-top: 8px;
-      color: #ff8a8a;
-      max-width: 90vw;
-      white-space: normal;
-    }}
+      color: #ffb3b3;
+      max-width: 92vw;
+      white-space: pre-wrap;
+    }
   </style>
 </head>
 <body>
 <div id="wrap">
   <canvas id="c"></canvas>
-
   <div id="hud">
-    <div class="row"><span id="statusDot"></span><span class="k">Build:</span> <span class="v">{BUILD}</span></div>
+    <div class="row"><span id="statusDot"></span><span class="k">Build:</span> <span class="v">__BUILD__</span></div>
     <div class="row"><span class="k">Status:</span> <span class="v" id="statusTxt">…</span></div>
     <div class="row"><span class="k">Last:</span> <span class="v" id="lastPx">—</span>
       <span class="k">Bid:</span> <span class="v" id="bestBid">—</span>
@@ -386,7 +389,7 @@ async def index() -> str:
 </div>
 
 <script>
-(function() {{
+(function() {
   const CANVAS = document.getElementById('c');
   const ctx = CANVAS.getContext('2d');
 
@@ -405,114 +408,85 @@ async def index() -> str:
   const resetBtn = document.getElementById('resetBtn');
   const testBtn = document.getElementById('testBtn');
 
-  // View state
   let autofollow = true;
   let testPattern = false;
-
-  let centerPx = null;   // price center
-  let zoom = 1.0;        // vertical zoom factor
-  let panPx = 0.0;       // vertical pan in price units
+  let centerPx = null;
+  let zoom = 1.0;
+  let panPx = 0.0;
   let dragging = false;
   let lastY = 0;
 
-  function resize() {{
+  function resize() {
     const dpr = window.devicePixelRatio || 1;
     const w = Math.floor(window.innerWidth * dpr);
     const h = Math.floor(window.innerHeight * dpr);
-    if (CANVAS.width !== w || CANVAS.height !== h) {{
-      CANVAS.width = w; CANVAS.height = h;
-    }}
-  }}
+    if (CANVAS.width !== w || CANVAS.height !== h) {
+      CANVAS.width = w;
+      CANVAS.height = h;
+    }
+  }
   window.addEventListener('resize', resize);
   resize();
 
-  function fmt(x) {{
+  function fmt(x) {
     if (x === null || x === undefined) return '—';
     if (!isFinite(x)) return '—';
     return (Math.round(x * 100) / 100).toFixed(2);
-  }}
+  }
 
-  // Palette (Bookmap direction: black -> blue -> yellow -> orange/red).
-  // FIX4 keeps a simple continuous map; later we add auto-exposure + better shaping.
-  function heatColor(t) {{
+  function heatColor(t) {
     t = Math.max(0, Math.min(1, t));
-    // 4-stop blend: (0) dark blue -> (0.5) cyan -> (0.75) yellow -> (1) red
-    function lerp(a,b,x) {{ return a + (b-a)*x; }}
-    let r,g,b;
-    if (t < 0.5) {{
-      const x = t/0.5;
-      r = lerp(0, 0, x);
-      g = lerp(30, 200, x);
-      b = lerp(90, 255, x);
-    }} else if (t < 0.75) {{
-      const x = (t-0.5)/0.25;
-      r = lerp(0, 255, x);
-      g = lerp(200, 240, x);
-      b = lerp(255, 40, x);
-    }} else {{
-      const x = (t-0.75)/0.25;
-      r = lerp(255, 255, x);
-      g = lerp(240, 60, x);
-      b = lerp(40, 0, x);
-    }}
-    r = Math.floor(r); g = Math.floor(g); b = Math.floor(b);
+    const r = Math.floor(255 * Math.pow(t, 0.85));
+    const g = Math.floor(60 * Math.pow(t, 1.2));
+    const b = Math.floor(255 * Math.pow(1 - t, 0.25));
     return `rgb(${r},${g},${b})`;
-  }}
+  }
 
-  function setStatus(ok, txt) {{
-    elStatusTxt.textContent = txt;
-    elStatusDot.style.background = ok ? '#2bd26b' : '#d24b2b';
-  }}
-
-  function draw(snapshot) {{
+  function draw(snapshot) {
     const W = CANVAS.width, H = CANVAS.height;
-    ctx.clearRect(0,0,W,H);
-    ctx.fillStyle = 'black';
-    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
 
-    // Determine center
     const pxCenter = snapshot.center_px;
-    if (autofollow && pxCenter !== null && isFinite(pxCenter)) {{
+    if (autofollow && pxCenter !== null && isFinite(pxCenter)) {
       centerPx = pxCenter;
       panPx = 0.0;
-    }}
+    }
     if (centerPx === null) centerPx = pxCenter;
 
-    if (centerPx === null || !isFinite(centerPx)) {{
-      ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    if (centerPx === null || !isFinite(centerPx)) {
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
       ctx.font = `${Math.floor(14 * (window.devicePixelRatio||1))}px sans-serif`;
       ctx.fillText('Waiting for first price/book…', 16, 28);
       return;
-    }}
+    }
 
-    const halfRange = snapshot.half_range || {RANGE_USD};
+    const halfRange = snapshot.half_range || __RANGE_USD__;
     const effHalf = (halfRange / zoom);
     const lo = (centerPx + panPx) - effHalf;
     const hi = (centerPx + panPx) + effHalf;
 
-    function yOfPrice(p) {{
+    function yOfPrice(p) {
       return (hi - p) / (hi - lo) * H;
-    }}
+    }
 
-    // Build bins: from server snapshot or test pattern
     let bins = snapshot.heat_bins || [];
     let maxv = snapshot.heat_max || 0;
-    const binUsd = snapshot.bin_usd || {BIN_USD};
+    const binUsd = snapshot.bin_usd || __BIN_USD__;
 
-    if (testPattern) {{
+    if (testPattern) {
       bins = [];
-      const steps = 80;
-      for (let i=0;i<steps;i++) {{
-        const p = lo + (hi-lo)*(i/(steps-1));
-        const v = Math.sin(i*0.18)*0.5 + 0.5;
-        bins.push([p, Math.max(0, v)]);
-      }}
+      const steps = 40;
+      for (let i=0; i<=steps; i++) {
+        const p = lo + (hi-lo) * (i/steps);
+        const t = i/steps;
+        bins.push([p, t]);
+      }
       maxv = 1.0;
-    }}
+    }
 
-    // Render bins as horizontal stripes (snapshot ladder)
-    if (bins.length > 0 && maxv > 0) {{
-      for (let i=0;i<bins.length;i++) {{
+    if (bins.length > 0 && maxv > 0) {
+      for (let i=0; i<bins.length; i++) {
         const p = bins[i][0];
         const v = bins[i][1];
         if (!(p >= lo && p <= hi)) continue;
@@ -523,59 +497,68 @@ async def index() -> str:
         const hStripe = Math.max(1, Math.abs(y2 - y));
 
         ctx.fillStyle = heatColor(t);
-        ctx.globalAlpha = 0.85;
+        ctx.globalAlpha = 0.90;
         ctx.fillRect(0, y - hStripe*0.5, W, hStripe);
-      }}
+      }
       ctx.globalAlpha = 1.0;
-    }} else {{
-      ctx.fillStyle = 'rgba(255,255,255,0.45)';
+    } else {
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
       ctx.font = `${Math.floor(14 * (window.devicePixelRatio||1))}px sans-serif`;
       ctx.fillText('No liquidity bins in range (yet).', 16, 28);
-    }}
+    }
 
-    // Last price line
-    if (snapshot.last_px !== null && isFinite(snapshot.last_px)) {{
+    if (snapshot.last_px !== null && isFinite(snapshot.last_px)) {
       const y = yOfPrice(snapshot.last_px);
-      ctx.strokeStyle = 'rgba(255,255,255,0.92)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.9)';
       ctx.lineWidth = Math.max(1, Math.floor((window.devicePixelRatio||1)));
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(W, y);
       ctx.stroke();
-    }}
+    }
 
-    // Axis labels (right)
     ctx.fillStyle = 'rgba(255,255,255,0.75)';
     ctx.font = `${Math.floor(12 * (window.devicePixelRatio||1))}px sans-serif`;
     ctx.textAlign = 'right';
     ctx.textBaseline = 'middle';
 
     const ticks = 8;
-    for (let i=0;i<=ticks;i++) {{
-      const p = lo + (hi-lo) * (i/ticks);
+    for (let i=0; i<=ticks; i++) {
+      const p = lo + (hi - lo) * (i / ticks);
       const y = yOfPrice(p);
-      ctx.fillText(fmt(p), W-8, y);
-      ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+      ctx.fillText(fmt(p), W - 8, y);
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(W, y);
       ctx.stroke();
-    }}
-  }}
+    }
+  }
 
-  async function fetchSnapshot() {{
-    const r = await fetch('/snapshot', {{cache:'no-store'}});
-    if (!r.ok) throw new Error('bad http');
-    return await r.json();
-  }}
+  async function fetchSnapshot() {
+    try {
+      const r = await fetch('/snapshot', { cache: 'no-store' });
+      if (!r.ok) throw new Error('bad http');
+      return await r.json();
+    } catch (e) {
+      return null;
+    }
+  }
 
-  async function tick() {{
-    try {{
+  function setStatus(ok, txt) {
+    elStatusTxt.textContent = txt;
+    elStatusDot.style.background = ok ? '#2bd26b' : '#d24b2b';
+  }
+
+  async function tick() {
+    try {
       const snap = await fetchSnapshot();
-      elErr.textContent = '';
-
-      const wsOk = !!snap.ws_ok;
+      if (!snap) {
+        setStatus(false, 'API unreachable');
+        return;
+      }
+      const wsOk = !!snap.ws_connected;
       const depthAge = snap.depth_age_ms;
       const tradeAge = snap.trade_age_ms;
 
@@ -596,68 +579,68 @@ async def index() -> str:
       elPrints.textContent = `${snap.prints_60s || 0}`;
 
       draw(snap);
-    }} catch(e) {{
-      setStatus(false, 'UI fetch/render error');
-      elErr.textContent = String(e);
-    }}
-  }}
+      elErr.textContent = '';
+    } catch (e) {
+      elErr.textContent = String(e && e.stack ? e.stack : e);
+    }
+  }
 
-  // Buttons
-  followBtn.addEventListener('click', () => {{
+  followBtn.addEventListener('click', () => {
     autofollow = !autofollow;
     followBtn.textContent = `Autofollow: ${autofollow ? 'ON' : 'OFF'}`;
-  }});
-  resetBtn.addEventListener('click', () => {{
+  });
+  resetBtn.addEventListener('click', () => {
     zoom = 1.0;
     panPx = 0.0;
     autofollow = true;
     followBtn.textContent = 'Autofollow: ON';
-  }});
-  testBtn.addEventListener('click', () => {{
+  });
+  testBtn.addEventListener('click', () => {
     testPattern = !testPattern;
     testBtn.textContent = `Test pattern: ${testPattern ? 'ON' : 'OFF'}`;
-  }});
+  });
 
-  // Pan/zoom (minimal)
-  CANVAS.addEventListener('pointerdown', (e) => {{
+  CANVAS.addEventListener('pointerdown', (e) => {
     dragging = true;
     lastY = e.clientY;
-    try {{ CANVAS.setPointerCapture(e.pointerId); }} catch(_) {{}}
+    CANVAS.setPointerCapture(e.pointerId);
     autofollow = false;
     followBtn.textContent = 'Autofollow: OFF';
-  }});
-  CANVAS.addEventListener('pointermove', (e) => {{
+  });
+  CANVAS.addEventListener('pointermove', (e) => {
     if (!dragging) return;
     const dy = (e.clientY - lastY);
     lastY = e.clientY;
-    const pxPerScreen = ({RANGE_USD} / zoom) * 2;
+    const pxPerScreen = (__RANGE_USD__ / zoom) * 2;
     const dPrice = (dy / window.innerHeight) * pxPerScreen;
     panPx += dPrice;
-  }});
-  CANVAS.addEventListener('pointerup', (e) => {{
+  });
+  CANVAS.addEventListener('pointerup', (e) => {
     dragging = false;
-    try {{ CANVAS.releasePointerCapture(e.pointerId); }} catch(_) {{}}
-  }});
-  CANVAS.addEventListener('wheel', (e) => {{
+    try { CANVAS.releasePointerCapture(e.pointerId); } catch(_) {}
+  });
+  CANVAS.addEventListener('wheel', (e) => {
     e.preventDefault();
     autofollow = false;
     followBtn.textContent = 'Autofollow: OFF';
     const delta = Math.sign(e.deltaY);
     const factor = (delta > 0) ? 1.08 : 0.92;
     zoom = Math.max(0.25, Math.min(6.0, zoom * factor));
-  }}, {{passive:false}});
+  }, { passive: false });
 
-  setInterval(tick, {interval_ms});
+  const intervalMs = Math.max(250, Math.floor(1000 / Math.max(0.2, __SNAPSHOT_HZ__)));
+  setInterval(tick, intervalMs);
   tick();
-}})();
+})();
 </script>
 </body>
 </html>
 """
-    # Inject numeric constants safely (avoid f-string / brace collisions)
-    html = html.replace("__RANGE_USD__", str(RANGE_USD)).replace("__SNAPSHOT_HZ__", str(SNAPSHOT_HZ))
+    html = html.replace("__RANGE_USD__", str(RANGE_USD))
+    html = html.replace("__BIN_USD__", str(BIN_USD))
+    html = html.replace("__SNAPSHOT_HZ__", str(SNAPSHOT_HZ))
+    html = html.replace("__BUILD__", BUILD)
     return html
-
 
 @app.get("/state")
 async def state() -> JSONResponse:
