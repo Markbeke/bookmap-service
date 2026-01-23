@@ -1,9 +1,6 @@
-# QuantDesk Bookmap Service (Replit/GitHub) — FIX3
+# QuantDesk Bookmap Service (Replit/GitHub) — FIX15
 # Goals:
-# 1) Correct pan/zoom anchoring (no inverted drag; zoom stays aligned)
-# 2) Bookmap-like heat exposure: suppress weak liquidity haze; preserve dense bands
-# 3) Add liquidity 'consumption' burn so price movement cools bands it trades through
-# 4) Stable time window mapping + primary price truth
+# 1) Smooth, stable Bookmap-like scroll/zoom (no "pressed to left" drift)
 # 2) Correct heat palette: weak=light blue, strong=red, none=black
 # 3) Heat dimmer acts like a "vmax/exposure" control (keeps dense bands visible, doesn't nuke everything)
 # 4) Reduce over-crowding: client uses server trade list as authoritative (no duplicate appends)
@@ -27,11 +24,6 @@ from fastapi.responses import HTMLResponse
 
 
 # -----------------------------
-# Build
-# -----------------------------
-BUILD_TAG = "FIX14"
-
-# -----------------------------
 # Config (env)
 # -----------------------------
 WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
@@ -51,6 +43,7 @@ RANGE_USD = float(os.environ.get("QD_RANGE_USD", "4000"))
 DEFAULT_PRICE_SPAN = float(os.environ.get("QD_DEFAULT_PRICE_SPAN", "600.0"))
 
 HEAT_LOG_SCALE = float(os.environ.get("QD_HEAT_LOG_SCALE", "32.0"))
+HEAT_CONSUME_VOL_SCALE = float(os.environ.get("QD_HEAT_CONSUME_VOL_SCALE", "25.0"))
 HEAT_CELL_MAX = int(os.environ.get("QD_HEAT_CELL_MAX", "255"))
 
 # server-side optional decay (keeps very old resting levels from saturating to 255)
@@ -246,8 +239,37 @@ class HeatmapRing:
             return
         if v > HEAT_CELL_MAX:
             v = HEAT_CELL_MAX
-        nv = col[row] + v
-        col[row] = HEAT_CELL_MAX if nv > HEAT_CELL_MAX else nv
+         # Use max/overwrite behavior to avoid runaway saturation
+        # Bands still persist due to decay copy on column advance.
+        if v > col[row]:
+            col[row] = v
+
+    def consume_price(self, p: float, strength: float) -> None:
+        """Reduce heat around a traded price to mimic liquidity being taken.
+        strength in [0,1], higher = more reduction.
+        Applies to current head column and a few recent columns.
+        """
+        if self._head_col_idx < 0 or self._anchor_min_bin is None:
+            return
+        row = self._row_of_price(p)
+        if row is None:
+            return
+        s = max(0.0, min(1.0, float(strength)))
+        if s <= 0.0:
+            return
+        # affect +/-1 rows
+        rows = [r for r in (row-1, row, row+1) if 0 <= r < self.rows]
+        # apply to last few columns (head, head-1, head-2)
+        for back in (0,1,2):
+            ci = self._head_col_idx - back
+            if ci < 0:
+                continue
+            col = self._grid[ci % self.cols]
+            if col is None:
+                continue
+            for r in rows:
+                col[r] = int(col[r] * (1.0 - 0.65*s))
+
 
     def export_patch_b64(self, col_idx: int) -> Optional[str]:
         col = self._grid[col_idx % self.cols] if col_idx >= 0 else None
@@ -440,6 +462,12 @@ class MexcFeed:
                                     self.trades.append({"p": p, "v": v, "T": T, "t": tm})
                                     if p > 0:
                                         self.last_px = p
+                                        # Consume/rest liquidity near traded price (approximate)
+                                        try:
+                                            strength = min(1.0, (v or 0.0) / max(1e-9, HEAT_CONSUME_VOL_SCALE))
+                                            self.heat.consume_price(p, strength)
+                                        except Exception:
+                                            pass
                                     self.last_trade_ms = now_ms()
                             self._update_bba_mid()
 
@@ -460,10 +488,10 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (FIX14)</title>
+  <title>QuantDesk Bookmap (FIX15)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
-    #topbar { flex:0 0 auto;
+    #topbar {
       padding:10px 12px;
       font-family: -apple-system, system-ui, Arial;
       font-size:14px;
@@ -487,9 +515,8 @@ HTML = r"""
     }
     .ctl { display:flex; align-items:center; gap:8px; }
     input[type="range"] { width: 160px; }
-    #wrap { flex:1; min-height:0; display:flex; }
-    body { display:flex; flex-direction:column; }
-    canvas { width: 100%; height: 100%; display:block; touch-action:none; outline:1px solid rgba(148,163,184,0.15); }
+    #wrap { height: calc(100% - 96px); display:flex; }
+    canvas { width: 100%; height: 100%; display:block; touch-action:none; }
   </style>
 </head>
 <body>
@@ -540,7 +567,6 @@ HTML = r"""
   const symEl = document.getElementById("sym");
   const dot = document.getElementById("statusDot");
   const healthEl = document.getElementById("health");
-  const buildTag = "FIX6";
 
   const btnAF = document.getElementById("btnAF");
   const btnTm = document.getElementById("btnTm");
@@ -558,23 +584,9 @@ HTML = r"""
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-
-    // Robust sizing on mobile/iPad: canvas clientHeight can become 0 when the topbar wraps.
-    // We explicitly allocate remaining viewport height below the topbar.
-    const top = document.getElementById("topbar");
-    const topH = top ? Math.ceil(top.getBoundingClientRect().height) : 0;
-    const availH = Math.max(120, Math.floor(window.innerHeight - topH));
-
-    // Force canvas CSS height to the available viewport height.
-    cv.style.height = availH + "px";
-    cv.style.width = "100%";
-
-    // Now map CSS pixels -> device pixels.
-    const cssW = Math.max(300, Math.floor(cv.clientWidth || window.innerWidth));
-    const cssH = Math.max(120, Math.floor(cv.clientHeight || availH));
-    cv.width = Math.floor(cssW * dpr);
-    cv.height = Math.floor(cssH * dpr);
-
+    cv.width = Math.floor(cv.clientWidth * dpr);
+    cv.height = Math.floor(cv.clientHeight * dpr);
+    // draw in device pixels; no transform drift
     ctx.setTransform(1,0,0,1,0,0);
   }
   window.addEventListener("resize", resize);
@@ -585,7 +597,6 @@ HTML = r"""
   let trades = [];
   let lastPx = null;
   let midPx = null;
-  let prevLastPx = null;
 
   // time window
   let timeSpanSec = 90;
@@ -598,40 +609,6 @@ HTML = r"""
   let viewSpan = null;
   const MIN_PSPAN = 40;
   const MAX_PSPAN = 20000;
-
-
-  // tick size (client-side inference; required for stable row mapping)
-  // Default is conservative; we update it from live prices.
-  let tickSize = 0.1;
-  function inferTickSizeFromPrices(bid, ask, lastp) {
-    try {
-      const vals = [bid, ask, lastp].filter(v => v !== null && v !== undefined && Number.isFinite(v));
-      if (vals.length === 0) return tickSize;
-      // Candidate tick ladder (coarse -> fine). We choose the first tick that makes all vals near-integers.
-      const ladder = [1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001, 0.00005, 0.00002, 0.00001, 0.000001, 0.0000001, 0.00000001];
-      const eps = 1e-6;
-      for (const t of ladder) {
-        let ok = true;
-        for (const v of vals) {
-          const q = v / t;
-          if (!Number.isFinite(q) || Math.abs(q - Math.round(q)) > eps) { ok = false; break; }
-        }
-        if (ok) return t;
-      }
-      // Fallback: use spread-derived tick if reasonable
-      if (bid !== null && ask !== null && Number.isFinite(bid) && Number.isFinite(ask)) {
-        const spr = Math.abs(ask - bid);
-        if (spr > 0) {
-          // snap spread to nearest power-of-10 ladder
-          const pow = Math.pow(10, Math.floor(Math.log10(spr)));
-          return Math.max(pow, 1e-8);
-        }
-      }
-      return tickSize;
-    } catch (e) {
-      return tickSize;
-    }
-  }
 
   // heat ring
   let heat = {
@@ -646,9 +623,6 @@ HTML = r"""
     head: -1,
     ring: [],
   };
-
-  // last heat debug (for on-chart diagnostics)
-  let heatDbg = {ready:false, head:-1, colsVis:0, rowsVis:0, vmax:0, floor:0, knee:0, drawn:0, skipped:0};
 
   // UI controls
   let autoExp = true;
@@ -697,27 +671,7 @@ HTML = r"""
     const proto = (location.protocol === "https:") ? "wss" : "ws";
     return `${proto}://${location.host}/ws`;
   }
-  let WS = null;
-  let wsRetry = 0;
-  function wsBackoffMs() {
-    // 0.5s, 1s, 2s, 4s ... capped
-    const ms = Math.min(15000, 500 * Math.pow(2, wsRetry));
-    wsRetry = Math.min(wsRetry + 1, 10);
-    return ms;
-  }
-  function wsConnect() {
-    try {
-      WS = new WebSocket(wsUrl());
-      WS.binaryType = "arraybuffer";
-      WS.onopen = () => { wsRetry = 0; dot.style.background = "#22c55e"; };
-      WS.onmessage = onWsMessage;
-      WS.onerror = () => { try { WS.close(); } catch(e) {} };
-    } catch (e) {
-      dot.style.background = "#ef4444";
-      const wait = wsBackoffMs();
-      setTimeout(wsConnect, wait);
-    }
-  }
+  const WS = new WebSocket(wsUrl());
 
   function b64ToU8(b64) {
     const bin = atob(b64);
@@ -740,7 +694,7 @@ HTML = r"""
     heat.ready = !!(heat.anchorMinPrice !== null && heat.rows && heat.cols);
   }
 
-  function onWsMessage(ev) {
+  WS.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     last = msg;
 
@@ -752,10 +706,7 @@ HTML = r"""
     // show "actual" price sources: trade, mid, bid/ask
     const bid = (msg.best_bid ?? null);
     const ask = (msg.best_ask ?? null);
-    const primaryPx = (midPx ?? lastPx);
-    tickSize = inferTickSizeFromPrices(bid, ask, primaryPx);
-    const primaryTag = (midPx !== null && midPx !== undefined) ? "MID" : "TRADE";
-    symEl.textContent = `${msg.symbol} | build=${(msg.health && msg.health.build) ? msg.health.build : 'FIX?'} | PRIMARY(${primaryTag})=${(primaryPx ?? 'None')} | TRADE=${(lastPx ?? 'None')} | MID=${(midPx ?? 'None')} | bid=${(bid ?? 'None')} ask=${(ask ?? 'None')} | tick=${tickSize}`;
+    symEl.textContent = `${msg.symbol} | TRADE=${(lastPx ?? "None")} | MID=${(midPx ?? "None")} | bid=${(bid ?? "None")} ask=${(ask ?? "None")}`;
 
     healthEl.textContent =
       `book: bids=${msg.health.bids_n} asks=${msg.health.asks_n} age: depth=${msg.health.depth_age_ms ?? "None"}ms trade=${msg.health.trade_age_ms ?? "None"}ms`;
@@ -773,32 +724,20 @@ HTML = r"""
     }
 
     if (heat.ready && msg.heat_patch && msg.heat_patch.b64) {
-      const colIdxRaw = msg.heat_patch.col_idx;
-      const colIdx = ((colIdxRaw % heat.cols) + heat.cols) % heat.cols;
+      const colIdx = msg.heat_patch.col_idx;
       const u8 = b64ToU8(msg.heat_patch.b64);
       if (u8.length === heat.rows) {
-        // Apply "burn" using latest trade movement on the same column: price eats liquidity.
-        if (prevLastPx !== null && lastPx !== null && lastPx !== undefined) {
-          burnBetweenPx(u8, prevLastPx, lastPx);
-        }
-        // Store column into ring (this is required for heatmap rendering).
-        heat.ring[colIdx] = u8;
-        heat.head = colIdx;
-        heatDbg.patches = (heatDbg.patches || 0) + 1;
-      } else {
-        heatDbg.bad_patch = (heatDbg.bad_patch || 0) + 1;
+        heat.ring[colIdx % heat.cols] = u8;
       }
-
-    // track previous trade for next burn
-    prevLastPx = (lastPx !== null && lastPx !== undefined) ? lastPx : prevLastPx;
+    }
 
     // IMPORTANT: trades snapshot is authoritative; do NOT append (prevents drift/crowding)
     if (Array.isArray(msg.trades)) {
       trades = msg.trades;
     }
-  }
+  };
 
-  wsConnect();
+  WS.onclose = () => { dot.style.background = "#ef4444"; };
 
   // -------------- Interaction (pointer) --------------
   let pointers = new Map();
@@ -822,14 +761,13 @@ HTML = r"""
   cv.addEventListener("pointermove", (e) => {
     if (!pointers.has(e.pointerId)) return;
     pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
-    if (viewMid === null) return;
-    if (viewSpan === null) viewSpan = (last?.ui_defaults?.default_price_span ?? 600.0);
+    if (viewMid === null || viewSpan === null) return;
 
     if (pointers.size === 1 && dragStartY !== null) {
       autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
       const dy = e.clientY - dragStartY;
       const pxPerPrice = (cv.clientHeight) / viewSpan;
-      const dPrice = (dy) / Math.max(1, pxPerPrice);
+      const dPrice = dy / Math.max(1, pxPerPrice);
       viewMid = (dragStartMid ?? viewMid) + dPrice;
     }
 
@@ -839,19 +777,7 @@ HTML = r"""
       const dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
       const dist = Math.sqrt(dx*dx + dy*dy);
       const scale = pinchStartDist / Math.max(10, dist);
-
-// anchor around midpoint Y of the two pointers
-const midY = (pts[0].y + pts[1].y) / 2;
-const rect = cv.getBoundingClientRect();
-const y = (midY - rect.top);
-const yFrac = clamp(y / Math.max(1, rect.height), 0, 1);
-
-// price under midpoint before zoom
-const pUnder = viewMid + viewSpan * (0.5 - yFrac);
-
-const newSpan = clamp(pinchStartSpan * scale, MIN_PSPAN, MAX_PSPAN);
-viewSpan = newSpan;
-viewMid = pUnder - viewSpan * (0.5 - yFrac);
+      viewSpan = clamp(pinchStartSpan * scale, MIN_PSPAN, MAX_PSPAN);
     }
   });
 
@@ -865,24 +791,11 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
   cv.addEventListener("pointerout", endPointer);
 
   cv.addEventListener("wheel", (e) => {
-    if (viewMid === null) return;
-    if (viewSpan === null) viewSpan = (last?.ui_defaults?.default_price_span ?? 600.0);
+    if (viewMid === null || viewSpan === null) return;
     e.preventDefault();
     autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
-
-    const rect = cv.getBoundingClientRect();
-    const y = (e.clientY - rect.top);
-    const yFrac = clamp(y / Math.max(1, rect.height), 0, 1);
-
-    // price under cursor before zoom
-    const pUnder = viewMid + viewSpan * (0.5 - yFrac);
-
     const factor = (e.deltaY > 0) ? 1.10 : 0.90;
-    const newSpan = clamp(viewSpan * factor, MIN_PSPAN, MAX_PSPAN);
-
-    // keep pUnder anchored under cursor
-    viewSpan = newSpan;
-    viewMid = pUnder - viewSpan * (0.5 - yFrac);
+    viewSpan = clamp(viewSpan * factor, MIN_PSPAN, MAX_PSPAN);
   }, {passive:false});
 
   // -------------- Rendering pipeline (reused buffers) --------------
@@ -892,9 +805,6 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
   let imgW = 0, imgH = 0;
 
   function ensureImg(w, h) {
-    if (!Number.isFinite(w) || !Number.isFinite(h)) throw new Error("ensureImg non-finite w/h: "+w+","+h);
-    w = Math.max(1, Math.floor(w));
-    h = Math.max(1, Math.floor(h));
     if (!img || imgW !== w || imgH !== h) {
       imgW = w; imgH = h;
       off.width = w; off.height = h;
@@ -906,36 +816,13 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
   }
 
   function yOf(p, pMin, pMax, h) {
-    const span = Math.max(1e-9, (pMax - pMin));
-    const t = (p - pMin) / span;
-    return h - clamp(t,0,1)*h;
+    const t = (p - pMin) / (pMax - pMin);
+    return h - t*h;
   }
 
   function rowOfPrice(p) {
     return Math.floor((p - heat.anchorMinPrice) / heat.binUsd);
-  
-  // Liquidity "consumption" / burn: when trade price crosses levels, we reduce the latest heat column
-  // so bands behind price cool down (Bookmap-like: price eats liquidity).
-  const BURN_CAP_U8 = 36;         // upper cap for burned pixels (keeps them blue-ish, not red)
-  const BURN_BAND_ROWS = 1;       // widen burn corridor by +/- rows
-
-  function burnBetweenPx(colU8, pxA, pxB) {
-    if (!colU8 || !heat.ready) return;
-    if (pxA === null || pxB === null || pxA === undefined || pxB === undefined) return;
-    const rA = rowOfPrice(pxA);
-    const rB = rowOfPrice(pxB);
-    if (!isFinite(rA) || !isFinite(rB)) return;
-    let lo = Math.min(rA, rB) - BURN_BAND_ROWS;
-    let hi = Math.max(rA, rB) + BURN_BAND_ROWS;
-    lo = clamp(lo, 0, heat.rows-1);
-    hi = clamp(hi, 0, heat.rows-1);
-    for (let r = lo; r <= hi; r++) {
-      const v = colU8[r] || 0;
-      if (v > 0) colU8[r] = Math.min(v, BURN_CAP_U8);
-    }
   }
-
-}
 
   // Bookmap-like palette: light blue -> cyan -> yellow -> orange -> red (strongest)
   function heatRGBA(a) {
@@ -979,19 +866,13 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
   }
 
   function draw() {
-    try {
-    let __step = "enter";
-    try {
-    __step = "canvas_dims";
     const w = cv.width;
     const h = cv.height;
 
-    __step = "canvas_clear";
     ctx.clearRect(0,0,w,h);
     ctx.fillStyle = "#0b0f14";
     ctx.fillRect(0,0,w,h);
 
-    __step = "waiting_check";
     if (!last || viewMid === null || viewSpan === null) {
       ctx.fillStyle = "#94a3b8";
       ctx.font = "28px -apple-system, system-ui, Arial";
@@ -1001,21 +882,13 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
     }
 
     if (autoFollow && (midPx || lastPx)) {
-      const primaryPx = (midPx ?? lastPx);
-      viewMid = primaryPx;
+      viewMid = (midPx ?? lastPx);
     }
 
-        // Guard against zero/NaN span (Safari-safe: DO NOT assign to viewSpan during draw)
-    const minSpan = Math.max(tickSize*10, 1);
-    let span = (Number.isFinite(viewSpan) && viewSpan > 0) ? viewSpan : 400;
-    if (span < minSpan) span = minSpan;
-    const pMin = viewMid - span/2;
-    const pMax = viewMid + span/2;
+    const pMin = viewMid - viewSpan/2;
+    const pMax = viewMid + viewSpan/2;
 
-    __step = "heat_begin";
     // ---- HEATMAP ----
-    heatDbg.ready = false;
-    heatDbg.head = heat.head;
     if (heat.ready && heat.head >= 0 && heat.anchorMinPrice !== null) {
       const colsVisible = clamp(Math.floor((timeSpanSec*1000) / heat.colMs), 10, heat.cols);
       const head = heat.head;
@@ -1031,61 +904,30 @@ viewMid = pUnder - viewSpan * (0.5 - yFrac);
       const img = ensureImg(colsVisible, rowsVisible);
       const data = img.data;
 
-      
-// Exposure (Bookmap-like): use histogram percentile (NOT max) + dimming as contrast compression
-// We treat incoming u8 values as "density" in [0..255].
-//  - AutoExp computes a robust percentile-based vmax from sampled recent columns.
-//  - Heat Dim moves the target percentile higher (keeps only dense bands).
-//  - Heat Thr is applied AFTER normalization as a floor, but we also re-map so bands survive.
-//
-// Notes:
-//  - This prevents global saturation (everything red).
-//  - This prevents "uniform dim" behavior; dimming suppresses weak bins first.
+      // Exposure: compute robust vmax on recent sample; then apply "heatDim"
+      // heatDim low => brighter (reduce vmax), high => dimmer (increase vmax)
+      let vmax = 1;
+      if (autoExp) {
+        const sampleCols = Math.min(colsVisible, 80);
+        const step = Math.max(1, Math.floor(colsVisible / sampleCols));
+        for (let ci = startCol; ci <= head; ci += step) {
+          const col = heat.ring[((ci % heat.cols)+heat.cols)%heat.cols];
+          if (!col) continue;
+          for (let rr = rTop; rr <= rBot; rr += 6) {
+            const v = col[rr] || 0;
+            if (v > vmax) vmax = v;
+          }
+        }
+        vmax = Math.max(vmax, 16);
+      } else {
+        vmax = 64; // fixed fallback
+      }
 
-function histPercentileValue(hist, pct) {
-  const total = hist.reduce((a,b)=>a+b,0);
-  if (total <= 0) return 64;
-  const target = Math.max(1, Math.floor(total * pct));
-  let c = 0;
-  for (let i=0;i<hist.length;i++) { c += hist[i]; if (c >= target) return i; }
-  return hist.length - 1;
-}
+      // dimmer acts like a multiplier on vmax (not a flat alpha kill)
+      // heatDim in [0,1] => scale vmax by [0.55 .. 2.2]
+      const dimScale = 0.55 + 1.65 * heatDim;
+      vmax = vmax * dimScale;
 
-let vmax = 64;
-if (autoExp) {
-  // Build a 0..255 histogram from a sparse sample of recent heat columns.
-  // Sampling is O(visible) but bounded.
-  const hist = new Array(256).fill(0);
-  const sampleCols = Math.min(colsVisible, 120);
-  const step = Math.max(1, Math.floor(colsVisible / sampleCols));
-
-  for (let ci = startCol; ci <= head; ci += step) {
-    const col = heat.ring[((ci % heat.cols)+heat.cols)%heat.cols];
-    if (!col) continue;
-    // stride rows to keep CPU stable
-    for (let rr = rTop; rr <= rBot; rr += 4) {
-      const v = col[rr] || 0;
-      if (v > 0) hist[v] += 1;
-    }
-  }
-
-  // Dim controls the target percentile: low dim => brighter (lower pct), high dim => darker (higher pct).
-  // Range chosen to mimic Bookmap exposure behavior.
-  const pct = clamp(0.930 + 0.069 * heatDim, 0.85, 0.9995); // 0.95 .. ~0.999
-  vmax = histPercentileValue(hist, pct);
-  vmax = Math.max(vmax, 24);
-} else {
-  vmax = 96; // fixed fallback
-}
-
-// Additional "contrast compression" knee: removes low-intensity clutter as heatDim increases.
-// knee in [0..0.35]
-const knee = 0.50 * heatDim;
-const floorU8 = Math.floor(vmax * (0.02 + 0.12 * heatDim)); // u8 floor for haze suppression
-let drawn = 0;
-let skipped = 0;
-
-// fill pixels
       // fill pixels
       for (let x = 0; x < colsVisible; x++) {
         const colIdx = startCol + x;
@@ -1097,40 +939,17 @@ let skipped = 0;
           const v = col[row] || 0;
           if (v === 0) continue;
 
-          // floorU8 computed outside inner loop (Safari/WebKit-safe)
-          if (v < floorU8) { skipped++; continue; }
+          const a = clamp(v / vmax, 0, 1);
+          if (a < heatThr) continue;
 
-let a = clamp(v / vmax, 0, 1);
-
-// "knee" removes low-density haze while preserving dense bands.
-if (knee > 0) {
-  a = clamp((a - knee) / Math.max(1e-6, (1 - knee)), 0, 1);
-}
-
-// HeatThr acts as a floor but re-maps so top bands remain visible.
-if (a < heatThr) { skipped++; continue; }
-a = clamp((a - heatThr) / Math.max(1e-6, (1 - heatThr)), 0, 1);
-
-const [rr, gg, bb, aa] = heatRGBA(a);
+          const [rr, gg, bb, aa] = heatRGBA(a);
           const i = (y*colsVisible + x) * 4;
           data[i+0] = rr;
           data[i+1] = gg;
           data[i+2] = bb;
           data[i+3] = Math.floor(255 * aa);
-          drawn++;
         }
       }
-
-      // update on-chart heat diagnostics
-      heatDbg.ready = true;
-      heatDbg.head = heat.head;
-      heatDbg.colsVis = colsVisible;
-      heatDbg.rowsVis = rowsVisible;
-      heatDbg.vmax = vmax;
-      heatDbg.floor = floorU8;
-      heatDbg.knee = knee;
-      heatDbg.drawn = drawn;
-      heatDbg.skipped = skipped;
 
       octx.putImageData(img, 0, 0);
       ctx.imageSmoothingEnabled = true;
@@ -1146,7 +965,7 @@ const [rr, gg, bb, aa] = heatRGBA(a);
     }
 
     // ---- Trade bubbles ----
-    const now = (last && last.ts) ? last.ts : Date.now();
+    const now = Date.now();
     const windowMs = timeSpanSec * 1000;
     const xOf = (tms) => {
       const dtm = now - tms;
@@ -1158,13 +977,9 @@ const [rr, gg, bb, aa] = heatRGBA(a);
     for (const t of trades) vMax = Math.max(vMax, t.v || 0);
     vMax = Math.max(vMax, 1e-9);
 
-    let bubblesDrawn = 0;
-    let bubblesVisible = 0;
     for (const t of trades) {
       const p = t.p;
       if (!(p >= pMin && p <= pMax)) continue;
-      bubblesVisible += 1;
-
       const vv = (t.v || 0);
       const vFrac = Math.sqrt(vv / vMax);
       if (vFrac < bubMin) continue;
@@ -1178,24 +993,8 @@ const [rr, gg, bb, aa] = heatRGBA(a);
       ctx.fillStyle = isBuy ? `rgba(59,130,246,${bubOp})` : `rgba(245,158,11,${bubOp})`;
       ctx.arc(x, y, r, 0, Math.PI*2);
       ctx.fill();
-      bubblesDrawn += 1;
     }
 
-    // If bubbles aren't drawing, render a deterministic "probe" marker at PRIMARY to verify canvas/view mapping.
-    if (bubblesDrawn === 0 && (midPx || lastPx)) {
-      const probeP = (midPx ?? lastPx);
-      const probeX = w * 0.98;
-      const probeY = yOf(probeP, pMin, pMax, h);
-      ctx.beginPath();
-      ctx.fillStyle = "rgba(236,72,153,0.9)"; // magenta probe
-      ctx.arc(probeX, probeY, 6, 0, Math.PI*2);
-      ctx.fill();
-    }
-
-    // Bubble diagnostics overlay (on-canvas; no console spam)
-    ctx.fillStyle = "rgba(148,163,184,0.95)";
-    ctx.font = "14px -apple-system, system-ui, Arial";
-    ctx.fillText(`build=${buildTag} trades=${trades.length} vis=${bubblesVisible} drawn=${bubblesDrawn} vMax=${vMax.toFixed(3)} bubMin=${bubMin.toFixed(2)} op=${bubOp.toFixed(2)} ts=${timeSpanSec}s`, 14, h - 14);
     // price lines
     if (lastPx) {
       const y = yOf(lastPx, pMin, pMax, h);
@@ -1224,41 +1023,14 @@ const [rr, gg, bb, aa] = heatRGBA(a);
     ctx.fillStyle = "rgba(148,163,184,0.95)";
     ctx.font = "22px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
     ctx.fillText(
-      `Tspan=${timeSpanSec.toFixed(0)}s | Pspan=${viewSpan.toFixed(1)} | AutoExp=${autoExp?"ON":"OFF"} | Dim=${heatDim.toFixed(2)} Thr=${heatThr.toFixed(2)} Ctr=${heatCtr.toFixed(2)} | Heat:${heatDbg.ready?"ON":"OFF"} head=${heatDbg.head} vmax=${heatDbg.vmax} floor=${heatDbg.floor} knee=${heatDbg.knee.toFixed(2)} drawn=${heatDbg.drawn} skip=${heatDbg.skipped}`,
+      `Tspan=${timeSpanSec.toFixed(0)}s | Pspan=${viewSpan.toFixed(1)} | AutoExp=${autoExp?"ON":"OFF"} | Dim=${heatDim.toFixed(2)} Thr=${heatThr.toFixed(2)} Ctr=${heatCtr.toFixed(2)}`,
       24, h - 20
     );
 
-    }
-    catch (e) {
-      const w = cv.width, h = cv.height;
-      ctx.clearRect(0,0,w,h);
-      ctx.fillStyle = "#0b0f14";
-      ctx.fillRect(0,0,w,h);
-      ctx.fillStyle = "rgba(248,113,113,0.95)";
-      ctx.font = "16px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      let msg = "";
-      try {
-        const name = (e && e.name) ? String(e.name) : "Error";
-        const emsg = (e && e.message) ? String(e.message) : String(e);
-        const stack = (e && e.stack) ? String(e.stack) : "";
-        msg = name + ": " + emsg + (stack ? ("\n" + stack) : "");
-      } catch (_err) {
-        msg = String(e);
-      }
-      const lines = msg.split("\n").slice(0,8);
-      ctx.fillText("JS ERROR (FIX11) step="+(__step||"?"), 16, 28);
-      for (let i=0;i<lines.length;i++) ctx.fillText(lines[i].slice(0,120), 16, 52 + i*18);
-    }
-
-    // schedule next frame
     requestAnimationFrame(draw);
   }
 
-  
-    } catch (e) {
-      errEl.textContent = `JS ERROR (FIX14) ${String(e)}`;
-    }
-requestAnimationFrame(draw);
+  requestAnimationFrame(draw);
 })();
 </script>
 </body>
@@ -1278,7 +1050,6 @@ async def health():
     feed._update_bba_mid()
     return {
         "service": "quantdesk-bookmap-ui",
-        "build": BUILD_TAG,
         "symbol": SYMBOL_WS,
         "ws_url": WS_URL,
         "ws_ok": feed.ws_ok,
