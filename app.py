@@ -4,6 +4,8 @@ import time
 import gzip
 import zlib
 import asyncio
+import base64
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
@@ -12,22 +14,39 @@ import websockets
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 
+# ============================================================
+# QuantDesk Bookmap Service (Absolute Grid Heatmap Fix)
+# - Resting liquidity heatmap stored on an ABSOLUTE price grid
+# - Time columns are fixed (COL_MS), kept in a ring buffer
+# - UI preserves AutoFollow + pinch zoom (price) + time zoom (-T/+T)
+# - Heat does NOT "jump" on zoom because price grid is fixed
+# ============================================================
+
 # -----------------------------
 # Config (env)
 # -----------------------------
 WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
-SYMBOL_WS = os.environ.get("QD_SYMBOL_WS", "BTC_USDT")  # MEXC contract WS uses BTC_USDT
-PORT = int(os.environ.get("PORT", "8000"))
+SYMBOL_WS = os.environ.get("QD_SYMBOL_WS", "BTC_USDT")  # MEXC WS uses BTC_USDT
+PORT = int(os.environ.get("PORT", "5000"))
 
-MAX_TRADES = int(os.environ.get("QD_MAX_TRADES", "20000"))
-TOP_LEVELS = int(os.environ.get("QD_TOP_LEVELS", "200"))           # send depth levels each side
-SNAPSHOT_HZ = float(os.environ.get("QD_SNAPSHOT_HZ", "6"))          # UI snapshots/sec
+MAX_TRADES = int(os.environ.get("QD_MAX_TRADES", "6000"))
 
-# Heatmap defaults (UI-side uses these as max history)
-HEAT_WINDOW_SEC = int(os.environ.get("QD_HEAT_WINDOW_SEC", str(60 * 60)))  # 60m history stored
-HEAT_COL_MS = int(os.environ.get("QD_HEAT_COL_MS", "1000"))                # 1s columns
-HEAT_BINS = int(os.environ.get("QD_HEAT_BINS", "360"))                     # vertical resolution
-DEFAULT_PRICE_SPAN = float(os.environ.get("QD_PRICE_SPAN", "600"))          # USD visible span initial
+# Depth snapshot for UI (book ladder & trades)
+TOP_LEVELS = int(os.environ.get("QD_TOP_LEVELS", "250"))          # send depth levels each side
+SNAPSHOT_HZ = float(os.environ.get("QD_SNAPSHOT_HZ", "6"))         # UI snapshots/sec
+
+# Heatmap timeline storage
+HEAT_WINDOW_SEC = int(os.environ.get("QD_HEAT_WINDOW_SEC", "3600"))  # 60m
+HEAT_COL_MS = int(os.environ.get("QD_HEAT_COL_MS", "1000"))          # 1s columns
+
+# Absolute price grid
+PRICE_BIN_USD = float(os.environ.get("QD_PRICE_BIN_USD", "1.0"))     # $ per row (absolute)
+RANGE_USD = float(os.environ.get("QD_RANGE_USD", "4000"))            # total range stored (e.g., 4000 => +/-2000)
+DEFAULT_PRICE_SPAN = float(os.environ.get("QD_DEFAULT_PRICE_SPAN", "600.0"))
+
+# Heat quantization
+HEAT_LOG_SCALE = float(os.environ.get("QD_HEAT_LOG_SCALE", "32.0"))  # higher => brighter; 32 works well for BTC depth
+HEAT_CELL_MAX = int(os.environ.get("QD_HEAT_CELL_MAX", "255"))       # uint8
 
 # -----------------------------
 # Helpers
@@ -48,6 +67,12 @@ def try_decompress(payload: bytes) -> bytes:
 def safe_float(x: Any, default: float = 0.0) -> float:
     try:
         return float(x)
+    except Exception:
+        return default
+
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
     except Exception:
         return default
 
@@ -75,15 +100,15 @@ class OrderBook:
             else:
                 book[p] = q
 
-    def top_n(self, n: int) -> Dict[str, List[Tuple[float, float]]]:
-        bids_sorted = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:n]
-        asks_sorted = sorted(self.asks.items(), key=lambda x: x[0], reverse=False)[:n]
-        return {"bids": bids_sorted, "asks": asks_sorted}
-
     def best_bid_ask(self) -> Tuple[Optional[float], Optional[float]]:
         bb = max(self.bids.keys()) if self.bids else None
         ba = min(self.asks.keys()) if self.asks else None
         return bb, ba
+
+    def top_n(self, n: int) -> Dict[str, List[Tuple[float, float]]]:
+        bids_sorted = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:n]
+        asks_sorted = sorted(self.asks.items(), key=lambda x: x[0], reverse=False)[:n]
+        return {"bids": bids_sorted, "asks": asks_sorted}
 
 @dataclass
 class Trades:
@@ -92,18 +117,159 @@ class Trades:
     def append(self, t: Dict[str, Any]) -> None:
         self.dq.append(t)
 
+class HeatmapRing:
+    """
+    Absolute price grid heat storage:
+      - rows = fixed price bins (min_price + i*bin_usd)
+      - cols = fixed time columns (every HEAT_COL_MS), stored in a ring
+    We send *patches* (new columns) to clients; clients keep their own ring.
+    """
+    def __init__(self, bin_usd: float, range_usd: float, window_sec: int, col_ms: int) -> None:
+        self.bin_usd = float(bin_usd)
+        self.range_usd = float(range_usd)
+        self.window_sec = int(window_sec)
+        self.col_ms = int(col_ms)
+
+        self.cols = max(30, int((self.window_sec * 1000) // max(250, self.col_ms)))
+        half = max(50.0, self.range_usd / 2.0)
+        self.rows = max(200, int((2.0 * half) / max(0.25, self.bin_usd)))  # ensure enough rows
+
+        self._anchor_min_price: Optional[float] = None  # fixed for session once set
+        self._anchor_min_bin: Optional[int] = None      # int bin index for min
+        self._head_col_idx: int = -1
+        self._grid: List[Optional[bytearray]] = [None] * self.cols
+        self._last_col_open_ms: Optional[int] = None
+
+    @property
+    def anchor_min_price(self) -> Optional[float]:
+        return self._anchor_min_price
+
+    @property
+    def anchor_min_bin(self) -> Optional[int]:
+        return self._anchor_min_bin
+
+    @property
+    def head(self) -> int:
+        return self._head_col_idx
+
+    def _price_to_bin_index(self, p: float) -> int:
+        # absolute bin index in units of bin_usd
+        return int(math.floor(p / self.bin_usd))
+
+    def ensure_anchor(self, mid_px: float) -> None:
+        if self._anchor_min_price is not None:
+            return
+        half = self.range_usd / 2.0
+        min_price = max(0.0, mid_px - half)
+        # Align to bin grid
+        min_bin = self._price_to_bin_index(min_price)
+        self._anchor_min_bin = min_bin
+        self._anchor_min_price = float(min_bin) * self.bin_usd
+
+    def _row_of_price(self, p: float) -> Optional[int]:
+        if self._anchor_min_bin is None:
+            return None
+        b = self._price_to_bin_index(p)
+        row = b - self._anchor_min_bin
+        if 0 <= row < self.rows:
+            return row
+        return None
+
+    def maybe_open_new_column(self, t_ms: int) -> Optional[Tuple[int, bytearray]]:
+        """
+        Called frequently; opens a new column whenever col_ms boundary passes.
+        Returns (col_idx, column_bytes) if a new column is opened, else None.
+        """
+        if self._last_col_open_ms is None:
+            self._last_col_open_ms = t_ms
+            self._head_col_idx += 1
+            col = bytearray(self.rows)
+            self._grid[self._head_col_idx % self.cols] = col
+            return (self._head_col_idx, col)
+
+        if (t_ms - self._last_col_open_ms) >= self.col_ms:
+            steps = int((t_ms - self._last_col_open_ms) // self.col_ms)
+            # advance in increments; if lagging, we open multiple empty columns
+            for _ in range(steps):
+                self._last_col_open_ms += self.col_ms
+                self._head_col_idx += 1
+                col = bytearray(self.rows)
+                self._grid[self._head_col_idx % self.cols] = col
+            return (self._head_col_idx, self._grid[self._head_col_idx % self.cols] or bytearray(self.rows))
+
+        return None
+
+    def write_level(self, p: float, q: float) -> None:
+        """
+        Writes resting liquidity snapshot into the CURRENT head column.
+        We use side-neutral intensity: bids + asks contribute to same cell.
+        """
+        if self._head_col_idx < 0:
+            return
+        row = self._row_of_price(p)
+        if row is None:
+            return
+        col = self._grid[self._head_col_idx % self.cols]
+        if col is None:
+            col = bytearray(self.rows)
+            self._grid[self._head_col_idx % self.cols] = col
+
+        # log intensity
+        # typical depth qty can be huge; log compress keeps structure visible
+        inten = math.log1p(max(0.0, q)) * HEAT_LOG_SCALE
+        v = int(inten)
+        if v <= 0:
+            return
+        if v > HEAT_CELL_MAX:
+            v = HEAT_CELL_MAX
+
+        # accumulate (cap at 255)
+        nv = col[row] + v
+        if nv > HEAT_CELL_MAX:
+            nv = HEAT_CELL_MAX
+        col[row] = nv
+
+    def current_column_bytes(self) -> Optional[bytearray]:
+        if self._head_col_idx < 0:
+            return None
+        return self._grid[self._head_col_idx % self.cols]
+
+    def export_patch_b64(self, col_idx: int) -> Optional[str]:
+        if col_idx < 0:
+            return None
+        col = self._grid[col_idx % self.cols]
+        if col is None:
+            return None
+        # base64 encode raw bytes (small enough: rows ~ 4000 => 4KB per second)
+        return base64.b64encode(bytes(col)).decode("ascii")
+
 class MexcFeed:
     def __init__(self) -> None:
         self.book = OrderBook()
         self.trades = Trades()
+
         self.ws_ok = False
         self.last_px: Optional[float] = None
         self.last_trade_ms: Optional[int] = None
         self.last_depth_ms: Optional[int] = None
+
+        self.best_bid: Optional[float] = None
+        self.best_ask: Optional[float] = None
+        self.mid_px: Optional[float] = None
+
         self._stop = False
 
         self._clients: List[WebSocket] = []
         self._clients_lock = asyncio.Lock()
+
+        self.heat = HeatmapRing(
+            bin_usd=PRICE_BIN_USD,
+            range_usd=RANGE_USD,
+            window_sec=HEAT_WINDOW_SEC,
+            col_ms=HEAT_COL_MS,
+        )
+
+        self._last_patch_sent_head: int = -1
 
     async def add_client(self, ws: WebSocket) -> None:
         async with self._clients_lock:
@@ -113,24 +279,46 @@ class MexcFeed:
         async with self._clients_lock:
             self._clients = [c for c in self._clients if c is not ws]
 
-    async def broadcast_snapshot(self) -> None:
-        book = self.book.top_n(TOP_LEVELS)
-        trades = list(self.trades.dq)[-2500:]  # keep payload sane
-
+    def _update_bba_mid(self) -> None:
         bb, ba = self.book.best_bid_ask()
-        mid = None
+        self.best_bid = bb
+        self.best_ask = ba
         if bb is not None and ba is not None and bb > 0 and ba > 0:
-            mid = (bb + ba) / 2.0
+            self.mid_px = (bb + ba) / 2.0
+        elif self.last_px is not None:
+            self.mid_px = self.last_px
+
+    async def broadcast_snapshot(self) -> None:
+        self._update_bba_mid()
+
+        book = self.book.top_n(TOP_LEVELS)
+        trades = list(self.trades.dq)[-2000:]  # keep payload sane
+
+        # ensure heat anchor once we have a mid
+        if self.mid_px is not None:
+            self.heat.ensure_anchor(self.mid_px)
+
+        # send only the newest heat column as a patch (client keeps ring)
+        heat_patch = None
+        if self.heat.anchor_min_price is not None and self.heat.head >= 0:
+            if self.heat.head != self._last_patch_sent_head:
+                b64 = self.heat.export_patch_b64(self.heat.head)
+                if b64 is not None:
+                    heat_patch = {
+                        "col_idx": self.heat.head,
+                        "b64": b64,
+                    }
+                self._last_patch_sent_head = self.heat.head
 
         payload = {
             "ts": now_ms(),
-            "ws_url": WS_URL,
             "symbol": SYMBOL_WS,
+            "ws_url": WS_URL,
             "ws_ok": self.ws_ok,
             "last_px": self.last_px,
-            "mid_px": mid,
-            "best_bid": bb,
-            "best_ask": ba,
+            "best_bid": self.best_bid,
+            "best_ask": self.best_ask,
+            "mid_px": self.mid_px,
             "book": {"bids": book["bids"], "asks": book["asks"]},
             "trades": trades,
             "health": {
@@ -140,12 +328,27 @@ class MexcFeed:
                 "asks_n": len(self.book.asks),
                 "trades_n": len(self.trades.dq),
             },
+            "heat_meta": {
+                "mode": "resting_density_absolute_grid",
+                "window_sec": HEAT_WINDOW_SEC,
+                "col_ms": HEAT_COL_MS,
+                "cols": self.heat.cols,
+                "bin_usd": self.heat.bin_usd,
+                "range_usd": self.heat.range_usd,
+                "rows": self.heat.rows,
+                "anchor_min_price": self.heat.anchor_min_price,
+                "anchor_min_bin": self.heat.anchor_min_bin,
+                "head": self.heat.head,
+            },
+            "heat_patch": heat_patch,  # may be None
             "ui_defaults": {
                 "heat_window_sec": HEAT_WINDOW_SEC,
                 "heat_col_ms": HEAT_COL_MS,
-                "heat_bins": HEAT_BINS,
+                "heat_bins": self.heat.rows,
                 "default_price_span": DEFAULT_PRICE_SPAN,
-            }
+                "price_bin_usd": PRICE_BIN_USD,
+                "range_usd": RANGE_USD,
+            },
         }
 
         msg = json.dumps(payload)
@@ -172,14 +375,47 @@ class MexcFeed:
                 pass
             await asyncio.sleep(period)
 
+    async def _heat_loop(self) -> None:
+        """
+        Fixed-timestep heat writer:
+          - opens a new time column every HEAT_COL_MS
+          - samples CURRENT resting book and writes into that column
+        """
+        while not self._stop:
+            try:
+                t = now_ms()
+                self._update_bba_mid()
+                if self.mid_px is not None:
+                    self.heat.ensure_anchor(self.mid_px)
+
+                opened = self.heat.maybe_open_new_column(t)
+                if opened is not None:
+                    # Fill new column with current resting liquidity snapshot (side-neutral)
+                    # NOTE: This is the essential Bookmap-like behavior: persistent horizontal bands
+                    # emerge because the same price levels remain present across consecutive columns.
+                    # We iterate over full in-memory dicts (already bounded by exchange updates).
+                    for p, q in self.book.bids.items():
+                        if q > 0:
+                            self.heat.write_level(p, q)
+                    for p, q in self.book.asks.items():
+                        if q > 0:
+                            self.heat.write_level(p, q)
+            except Exception:
+                pass
+
+            # run at a modest cadence; columns open based on timestamps
+            await asyncio.sleep(0.05)
+
     async def run(self) -> None:
         asyncio.create_task(self._snapshot_loop())
+        asyncio.create_task(self._heat_loop())
+
         while not self._stop:
             try:
                 async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                     self.ws_ok = True
 
-                    # subscribe depth + deal (contract)
+                    # subscribe depth + deal
                     await ws.send(json.dumps({"method": "sub.depth", "param": {"symbol": SYMBOL_WS}}))
                     await ws.send(json.dumps({"method": "sub.deal", "param": {"symbol": SYMBOL_WS}}))
 
@@ -195,10 +431,10 @@ class MexcFeed:
                             data = msg.get("data", {}) or {}
                             bids = data.get("bids", []) or []
                             asks = data.get("asks", []) or []
-                            # IMPORTANT: partial updates; never wipe other side
                             self.book.apply_side_updates("bids", bids)
                             self.book.apply_side_updates("asks", asks)
                             self.last_depth_ms = now_ms()
+                            self._update_bba_mid()
 
                         if ch in ("push.deal", "rs.push.deal"):
                             data = msg.get("data", [])
@@ -206,16 +442,14 @@ class MexcFeed:
                                 for t in data:
                                     p = safe_float(t.get("p"))
                                     v = safe_float(t.get("v"))
-                                    try:
-                                        T = int(t.get("T", 0))
-                                    except Exception:
-                                        T = t.get("T", 0)
-                                    tm = int(t.get("t", now_ms()))
+                                    T = safe_int(t.get("T", 0))
+                                    tm = safe_int(t.get("t", now_ms()))
                                     tt = {"p": p, "v": v, "T": T, "t": tm}
                                     self.trades.append(tt)
                                     if p > 0:
                                         self.last_px = p
                                     self.last_trade_ms = now_ms()
+                            self._update_bba_mid()
 
             except Exception:
                 self.ws_ok = False
@@ -233,7 +467,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap UI (Time Zoom + True Heat)</title>
+  <title>QuantDesk Bookmap (Absolute Grid Heat)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
     #topbar {
@@ -250,7 +484,7 @@ HTML = r"""
     }
     #statusDot { width:10px; height:10px; border-radius:50%; display:inline-block; background:#ef4444; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:12px; color:#93c5fd; }
-    .btn {
+    button {
       padding:6px 10px;
       border:1px solid #1f2937;
       border-radius:10px;
@@ -265,18 +499,13 @@ HTML = r"""
 <body>
   <div id="topbar">
     <span id="statusDot"></span>
-    <span id="sym"></span>
+    <span class="mono" id="sym"></span>
     <span class="mono" id="health"></span>
-
-    <button class="btn" id="btnFollow">AutoFollow: ON</button>
-
-    <button class="btn" id="btnTimeOut">-T</button>
-    <button class="btn" id="btnTimeIn">+T</button>
-
-    <button class="btn" id="btnPriceOut">-P</button>
-    <button class="btn" id="btnPriceIn">+P</button>
-
-    <span class="mono" id="viewInfo"></span>
+    <button id="btnAF">AutoFollow: ON</button>
+    <button id="btnTm">-T</button>
+    <button id="btnTp">+T</button>
+    <button id="btnPm">-P</button>
+    <button id="btnPp">+P</button>
   </div>
   <div id="wrap">
     <canvas id="cv"></canvas>
@@ -289,13 +518,11 @@ HTML = r"""
   const symEl = document.getElementById("sym");
   const dot = document.getElementById("statusDot");
   const healthEl = document.getElementById("health");
-  const viewInfoEl = document.getElementById("viewInfo");
-
-  const btnFollow = document.getElementById("btnFollow");
-  const btnTimeOut = document.getElementById("btnTimeOut");
-  const btnTimeIn  = document.getElementById("btnTimeIn");
-  const btnPriceOut = document.getElementById("btnPriceOut");
-  const btnPriceIn  = document.getElementById("btnPriceIn");
+  const btnAF = document.getElementById("btnAF");
+  const btnTm = document.getElementById("btnTm");
+  const btnTp = document.getElementById("btnTp");
+  const btnPm = document.getElementById("btnPm");
+  const btnPp = document.getElementById("btnPp");
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -315,95 +542,63 @@ HTML = r"""
   let midPx = null;
 
   // -----------------------------
-  // View state (interactive)
+  // Time window (seconds) — interactive (-T/+T)
+  // -----------------------------
+  let timeSpanSec = 90;         // visible time window in seconds
+  const MIN_TSPAN = 30;
+  const MAX_TSPAN = 60 * 60;    // up to 60m
+
+  // -----------------------------
+  // Price view state (interactive)
   // -----------------------------
   let autoFollow = true;
-
-  // Price axis
   let viewMid = null;                 // center price
-  let viewSpan = 600;                 // visible price range (USD)
-  const MIN_SPAN = 40;
-  const MAX_SPAN = 20000;
-
-  // Time axis
-  let timeEndMs = null;               // right edge time (ms)
-  let timeSpanMs = 12 * 60 * 1000;    // visible window (ms)
-  const MIN_TIME_SPAN_MS = 15 * 1000;
-  const MAX_TIME_SPAN_MS = 8 * 60 * 60 * 1000;
+  let viewSpan = null;                // visible price span USD
+  const MIN_PSPAN = 40;
+  const MAX_PSPAN = 20000;
 
   // -----------------------------
-  // Heatmap state (TRUE time×price)
-  // Stored as ring buffer of columns.
+  // Heatmap ring on client (absolute price grid)
   // -----------------------------
-  let BINS = 360;
-  let HEAT_COL_MS = 1000;
-  let HEAT_WINDOW_MS = 60 * 60 * 1000;
+  let heat = {
+    ready: false,
+    mode: null,
+    windowSec: null,
+    colMs: null,
+    cols: null,
+    binUsd: null,
+    rangeUsd: null,
+    rows: null,
+    anchorMinPrice: null,
+    head: -1,
+    ring: [], // Array<Uint8Array|null> length cols
+  };
 
-  let heatCols = 3600;                  // derived
-  let heat = null;                      // Float32Array length = BINS * heatCols (row-major: [bin * heatCols + col])
-  let colTimes = null;                  // Int32Array length = heatCols (timestamps)
-  let colWrite = 0;
-  let lastColPushMs = null;
-
-  // Exposure control
-  let vmaxEwma = 1e-6;
+  function initHeat(meta) {
+    heat.mode = meta.mode;
+    heat.windowSec = meta.window_sec;
+    heat.colMs = meta.col_ms;
+    heat.cols = meta.cols;
+    heat.binUsd = meta.bin_usd;
+    heat.rangeUsd = meta.range_usd;
+    heat.rows = meta.rows;
+    heat.anchorMinPrice = meta.anchor_min_price;
+    heat.head = meta.head;
+    heat.ring = new Array(heat.cols).fill(null);
+    heat.ready = !!(heat.anchorMinPrice !== null && heat.rows && heat.cols);
+  }
 
   function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
 
-  function initHeatFromDefaults(defs) {
-    if (!defs) return;
-    BINS = defs.heat_bins ?? BINS;
-    HEAT_COL_MS = defs.heat_col_ms ?? HEAT_COL_MS;
-    const winSec = defs.heat_window_sec ?? (HEAT_WINDOW_MS / 1000);
-    HEAT_WINDOW_MS = Math.max(60*1000, winSec * 1000);
-
-    heatCols = Math.max(120, Math.floor(HEAT_WINDOW_MS / HEAT_COL_MS));
-    heat = new Float32Array(BINS * heatCols);
-    colTimes = new Int32Array(heatCols);
-    colWrite = 0;
-    lastColPushMs = null;
-    vmaxEwma = 1e-6;
-  }
-
-  function clearHeat() {
-    if (!heat) return;
-    heat.fill(0);
-    colTimes.fill(0);
-    colWrite = 0;
-    lastColPushMs = null;
-    vmaxEwma = 1e-6;
-  }
-
-  // -----------------------------
-  // UI buttons
-  // -----------------------------
-  function setFollow(on) {
-    autoFollow = !!on;
-    btnFollow.textContent = `AutoFollow: ${autoFollow ? "ON" : "OFF"}`;
-    if (autoFollow) {
-      // snap time to now
-      timeEndMs = Date.now();
-    }
-  }
-
-  btnFollow.onclick = () => setFollow(!autoFollow);
-
-  btnTimeOut.onclick = () => {
-    setFollow(false);
-    timeSpanMs = clamp(timeSpanMs * 1.25, MIN_TIME_SPAN_MS, MAX_TIME_SPAN_MS);
+  btnAF.onclick = () => {
+    autoFollow = !autoFollow;
+    btnAF.textContent = `AutoFollow: ${autoFollow ? "ON" : "OFF"}`;
   };
-  btnTimeIn.onclick = () => {
-    setFollow(false);
-    timeSpanMs = clamp(timeSpanMs / 1.25, MIN_TIME_SPAN_MS, MAX_TIME_SPAN_MS);
-  };
-  btnPriceOut.onclick = () => {
-    setFollow(false);
-    viewSpan = clamp(viewSpan * 1.25, MIN_SPAN, MAX_SPAN);
-  };
-  btnPriceIn.onclick = () => {
-    setFollow(false);
-    viewSpan = clamp(viewSpan / 1.25, MIN_SPAN, MAX_SPAN);
-  };
+
+  btnTm.onclick = () => { timeSpanSec = clamp(Math.floor(timeSpanSec / 1.5), MIN_TSPAN, MAX_TSPAN); };
+  btnTp.onclick = () => { timeSpanSec = clamp(Math.floor(timeSpanSec * 1.5), MIN_TSPAN, MAX_TSPAN); };
+  btnPm.onclick = () => { viewSpan = clamp(viewSpan * 0.75, MIN_PSPAN, MAX_PSPAN); };
+  btnPp.onclick = () => { viewSpan = clamp(viewSpan * 1.33, MIN_PSPAN, MAX_PSPAN); };
 
   // -----------------------------
   // WebSocket
@@ -414,151 +609,113 @@ HTML = r"""
   }
   const WS = new WebSocket(wsUrl());
 
+  function b64ToU8(b64) {
+    const bin = atob(b64);
+    const len = bin.length;
+    const out = new Uint8Array(len);
+    for (let i=0;i<len;i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
   WS.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     last = msg;
 
     dot.style.background = msg.ws_ok ? "#22c55e" : "#ef4444";
+    lastPx = (msg.last_px ?? lastPx);
+    midPx = (msg.mid_px ?? midPx);
 
-    lastPx = msg.last_px ?? lastPx;
-    midPx  = msg.mid_px ?? midPx;
-
-    // initialize heat defaults once
-    if (heat === null && msg.ui_defaults) {
-      initHeatFromDefaults(msg.ui_defaults);
-      if (msg.ui_defaults.default_price_span) viewSpan = msg.ui_defaults.default_price_span;
-    }
-
-    // Initialize view from lastPx once
-    if (viewMid === null && (lastPx || midPx)) {
-      viewMid = (lastPx ?? midPx);
-      viewSpan = viewSpan || 600;
-      timeEndMs = Date.now();
-      timeSpanMs = 12 * 60 * 1000;
-      clearHeat();
-    }
-
-    // show price audit
-    const lp = (lastPx != null) ? lastPx.toFixed(3) : "None";
-    const mp = (midPx  != null) ? midPx.toFixed(3)  : "None";
-    symEl.textContent = `${msg.symbol} | last_trade=${lp} | mid=${mp}`;
-
+    symEl.textContent = `${msg.symbol} | last_trade=${(lastPx ?? "None")} | mid=${(midPx ?? "None")}`;
     healthEl.textContent =
-      `book: bids=${msg.health.bids_n} asks=${msg.health.asks_n} ` +
-      `age: depth=${msg.health.depth_age_ms ?? "None"}ms trade=${msg.health.trade_age_ms ?? "None"}ms ` +
-      `WS=${(msg.ws_url || "").replace("wss://","")}`;
+      `book: bids=${msg.health.bids_n} asks=${msg.health.asks_n} age: depth=${msg.health.depth_age_ms ?? "None"}ms trade=${msg.health.trade_age_ms ?? "None"}ms WS=${msg.ws_url}`;
 
-    // Maintain rolling trade window for memory (we will render per current time view)
-    // We append trades from the server snapshot then de-dup roughly by timestamp+price+v+T.
+    // Init view once
+    if (viewMid === null && (midPx || lastPx)) {
+      viewMid = (midPx ?? lastPx);
+      viewSpan = (msg.ui_defaults?.default_price_span ?? 600.0);
+    }
+
+    // Initialize heat ring once meta exists
+    if (!heat.ready && msg.heat_meta && msg.heat_meta.anchor_min_price !== null) {
+      initHeat(msg.heat_meta);
+    } else if (heat.ready && msg.heat_meta) {
+      // Keep head updated
+      heat.head = msg.heat_meta.head;
+    }
+
+    // Apply incoming heat patch (one new column)
+    if (heat.ready && msg.heat_patch && msg.heat_patch.b64) {
+      const colIdx = msg.heat_patch.col_idx;
+      const u8 = b64ToU8(msg.heat_patch.b64);
+      if (u8.length === heat.rows) {
+        heat.ring[colIdx % heat.cols] = u8;
+      }
+    }
+
+    // Trades rolling window = min(history, but bounded for perf)
+    const now = Date.now();
+    const maxWindowMs = Math.min((heat.windowSec ?? 3600) * 1000, 60*60*1000);
     if (Array.isArray(msg.trades)) {
       for (const t of msg.trades) trades.push(t);
     }
-    // Keep a generous trade memory, tied to HEAT_WINDOW_MS (plus slack)
-    const now = Date.now();
-    const keepMs = Math.max(HEAT_WINDOW_MS, timeSpanMs) + 5 * 60 * 1000;
-    trades = trades.filter(t => (now - t.t) <= keepMs);
-
-    // If follow is on, keep timeEnd pinned to now
-    if (autoFollow) {
-      timeEndMs = now;
-    }
+    trades = trades.filter(t => (now - t.t) <= maxWindowMs);
   };
 
   WS.onclose = () => { dot.style.background = "#ef4444"; };
 
   // -----------------------------
   // Interaction (iPad + desktop)
-  // Gesture logic:
-  // - 1 finger drag vertical => price pan
-  // - 1 finger drag horizontal => time pan
-  // - 2 finger pinch: dominant axis decides zoom target:
-  //     mostly vertical => price zoom
-  //     mostly horizontal => time zoom
+  // - Drag: pan price
+  // - Pinch: zoom price
   // -----------------------------
   let pointers = new Map(); // pointerId -> {x,y}
   let pinchStartDist = null;
-  let pinchStartSpanPrice = null;
-  let pinchStartSpanTime = null;
-  let pinchAxisMode = null; // "price" | "time"
-
-  let dragStartX = null;
+  let pinchStartSpan = null;
   let dragStartY = null;
   let dragStartMid = null;
-  let dragStartTimeEnd = null;
-  let dragMode = null; // "price" | "time"
 
   cv.addEventListener("pointerdown", (e) => {
     cv.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
 
     if (pointers.size === 1) {
-      dragStartX = e.clientX;
       dragStartY = e.clientY;
       dragStartMid = viewMid;
-      dragStartTimeEnd = timeEndMs;
-      dragMode = null; // decide on first meaningful move
     }
     if (pointers.size === 2) {
       const pts = Array.from(pointers.values());
       const dx = pts[0].x - pts[1].x;
       const dy = pts[0].y - pts[1].y;
       pinchStartDist = Math.sqrt(dx*dx + dy*dy);
-      pinchStartSpanPrice = viewSpan;
-      pinchStartSpanTime = timeSpanMs;
-      pinchAxisMode = null; // decide based on dominant axis
+      pinchStartSpan = viewSpan;
     }
   });
 
   cv.addEventListener("pointermove", (e) => {
     if (!pointers.has(e.pointerId)) return;
     pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
-    if (viewMid === null || timeEndMs === null) return;
+    if (viewMid === null || viewSpan === null) return;
 
-    // One finger drag
-    if (pointers.size === 1 && dragStartY !== null && dragStartX !== null) {
-      setFollow(false);
-
-      const dx = e.clientX - dragStartX;
+    // One finger drag: pan price
+    if (pointers.size === 1 && dragStartY !== null) {
+      autoFollow = false;
+      btnAF.textContent = "AutoFollow: OFF";
       const dy = e.clientY - dragStartY;
-
-      if (dragMode === null) {
-        // decide mode: horizontal => time, vertical => price
-        dragMode = (Math.abs(dx) > Math.abs(dy)) ? "time" : "price";
-      }
-
-      if (dragMode === "price") {
-        const pxPerPrice = cv.clientHeight / Math.max(1e-6, viewSpan);
-        const dPrice = dy / Math.max(1, pxPerPrice);
-        viewMid = (dragStartMid ?? viewMid) + dPrice;
-      } else {
-        // time pan: dx pixels => ms shift
-        const msPerPx = timeSpanMs / Math.max(1, cv.clientWidth);
-        const dMs = dx * msPerPx;
-        timeEndMs = (dragStartTimeEnd ?? timeEndMs) - dMs; // drag right shows past
-        timeEndMs = clamp(timeEndMs, Date.now() - HEAT_WINDOW_MS, Date.now());
-      }
+      const pxPerPrice = cv.clientHeight / viewSpan;
+      const dPrice = dy / Math.max(1, pxPerPrice);
+      viewMid = (dragStartMid ?? viewMid) + dPrice;
     }
 
-    // Two finger pinch
-    if (pointers.size === 2 && pinchStartDist && pinchStartSpanPrice && pinchStartSpanTime) {
-      setFollow(false);
-
+    // Two finger pinch: zoom price
+    if (pointers.size === 2 && pinchStartDist && pinchStartSpan) {
+      autoFollow = false;
+      btnAF.textContent = "AutoFollow: OFF";
       const pts = Array.from(pointers.values());
       const dx = pts[0].x - pts[1].x;
       const dy = pts[0].y - pts[1].y;
       const dist = Math.sqrt(dx*dx + dy*dy);
-
-      if (pinchAxisMode === null) {
-        pinchAxisMode = (Math.abs(dx) > Math.abs(dy)) ? "time" : "price";
-      }
-
       const scale = pinchStartDist / Math.max(10, dist);
-
-      if (pinchAxisMode === "price") {
-        viewSpan = clamp(pinchStartSpanPrice * scale, MIN_SPAN, MAX_SPAN);
-      } else {
-        timeSpanMs = clamp(pinchStartSpanTime * scale, MIN_TIME_SPAN_MS, MAX_TIME_SPAN_MS);
-      }
+      viewSpan = clamp(pinchStartSpan * scale, MIN_PSPAN, MAX_PSPAN);
     }
   });
 
@@ -566,153 +723,75 @@ HTML = r"""
     pointers.delete(e.pointerId);
     if (pointers.size < 2) {
       pinchStartDist = null;
-      pinchStartSpanPrice = null;
-      pinchStartSpanTime = null;
-      pinchAxisMode = null;
+      pinchStartSpan = null;
     }
     if (pointers.size === 0) {
-      dragStartX = null;
       dragStartY = null;
       dragStartMid = null;
-      dragStartTimeEnd = null;
-      dragMode = null;
     }
   }
   cv.addEventListener("pointerup", endPointer);
   cv.addEventListener("pointercancel", endPointer);
   cv.addEventListener("pointerout", endPointer);
 
-  // Desktop wheel: zoom price. Shift+wheel: zoom time
+  // Desktop wheel zoom (optional)
   cv.addEventListener("wheel", (e) => {
-    if (viewMid === null || timeEndMs === null) return;
+    if (viewMid === null || viewSpan === null) return;
     e.preventDefault();
-    setFollow(false);
-
+    autoFollow = false;
+    btnAF.textContent = "AutoFollow: OFF";
     const factor = (e.deltaY > 0) ? 1.10 : 0.90;
-
-    if (e.shiftKey) {
-      timeSpanMs = clamp(timeSpanMs * factor, MIN_TIME_SPAN_MS, MAX_TIME_SPAN_MS);
-    } else {
-      viewSpan = clamp(viewSpan * factor, MIN_SPAN, MAX_SPAN);
-    }
+    viewSpan = clamp(viewSpan * factor, MIN_PSPAN, MAX_PSPAN);
   }, {passive:false});
 
   // -----------------------------
-  // Rendering utilities
+  // Rendering utils
   // -----------------------------
   function yOf(p, pMin, pMax, h) {
     const t = (p - pMin) / (pMax - pMin);
     return h - t*h;
   }
-
-  function heatIndex(p, pMin, pMax) {
-    const t = (p - pMin) / (pMax - pMin);
-    const idx = Math.floor((1 - t) * (BINS - 1)); // top=0
-    return idx;
+  function priceOfRow(row) {
+    return heat.anchorMinPrice + row * heat.binUsd;
+  }
+  function rowOfPrice(p) {
+    return Math.floor((p - heat.anchorMinPrice) / heat.binUsd);
   }
 
-  // Single-channel intensity colormap (Bookmap-like glow: dark->cyan/yellow->white)
+  // Bookmap-like intensity palette (side-neutral)
   function heatRGBA(a) {
-    // a in [0..1]
-    // We'll create a smooth gradient: low=transparent dark, mid=cyan, high=yellow/white
-    const t = clamp(a, 0, 1);
-    const g1 = Math.pow(t, 0.55);
+    // a in [0,1]
+    // dark-blue -> cyan -> yellow -> orange
+    const g = Math.pow(a, 0.75);
+    let r=0, gg=0, b=0, alpha=0;
 
-    let r, g, b, alpha;
-    alpha = 0.05 + 0.90 * g1;
-
-    if (t < 0.55) {
-      // dark -> cyan/blue
-      const u = t / 0.55;
-      r = 20 + 40*u;
-      g = 40 + 170*u;
-      b = 80 + 170*u;
+    if (g < 0.5) {
+      // blue/cyan
+      const t = g / 0.5;
+      r = 10 + 20*t;
+      gg = 40 + 160*t;
+      b = 80 + 140*t;
+      alpha = 0.05 + 0.55*g;
     } else {
-      // cyan -> yellow -> white
-      const u = (t - 0.55) / 0.45;
-      r = 60 + 195*u;
-      g = 210 + 45*u;
-      b = 250 - 170*u;
+      // yellow/orange
+      const t = (g - 0.5) / 0.5;
+      r = 80 + 170*t;
+      gg = 180 + 60*(1-t);
+      b = 80*(1-t);
+      alpha = 0.10 + 0.75*g;
     }
-    return `rgba(${Math.floor(r)},${Math.floor(g)},${Math.floor(b)},${alpha.toFixed(3)})`;
+    return [r|0, gg|0, b|0, clamp(alpha, 0, 1)];
   }
 
-  function heatGet(bin, col) {
-    return heat[bin * heatCols + col];
-  }
-  function heatSet(bin, col, v) {
-    heat[bin * heatCols + col] = v;
-  }
-
-  function pushHeatColumn(pMin, pMax) {
-    if (!last || !last.book || !heat) return;
-
-    const bids = last.book.bids || [];
-    const asks = last.book.asks || [];
-
-    // Slow decay across entire matrix once per column push (true persistence)
-    // Half-life ~ 90s (tunable)
-    const halfLife = 90.0;
-    const decay = Math.pow(0.5, (HEAT_COL_MS/1000.0) / halfLife);
-    for (let i=0; i<heat.length; i++) {
-      heat[i] *= decay;
-    }
-
-    // Build new column vector from RESTING book liquidity (both sides, intensity-based)
-    const col = colWrite;
-    // clear current column (after decay, set to 0 so it represents "new density added this second")
-    for (let b=0; b<BINS; b++) heatSet(b, col, 0);
-
-    // Intensity weight:
-    // Use log(1+notional) to reduce domination by huge levels.
-    function addLevels(levels) {
-      for (const pair of levels) {
-        const p = pair[0], q = pair[1];
-        if (!(q > 0) || !(p > 0)) continue;
-        const idx = heatIndex(p, pMin, pMax);
-        if (idx < 0 || idx >= BINS) continue;
-        const notional = p * q;
-        const w = Math.log(1 + notional);
-        heatSet(idx, col, heatGet(idx, col) + w);
-      }
-    }
-    addLevels(bids);
-    addLevels(asks);
-
-    // timestamp this column
-    colTimes[col] = Date.now();
-
-    // update exposure (EWMA of column max)
-    let cmax = 0;
-    for (let b=0; b<BINS; b++) cmax = Math.max(cmax, heatGet(b, col));
-    cmax = Math.max(1e-6, cmax);
-    const alpha = 0.08;
-    vmaxEwma = (1-alpha)*vmaxEwma + alpha*cmax;
-
-    colWrite = (colWrite + 1) % heatCols;
-  }
-
-  function orderedColIndex(oldestToNewestIdx) {
-    // Convert ordered index (0 oldest .. heatCols-1 newest) into ring physical index
-    // Newest column is at (colWrite-1), oldest at colWrite
-    // Our ring writes at colWrite then increments, so colWrite is the "oldest slot".
-    const phys = (colWrite + oldestToNewestIdx) % heatCols;
-    return phys;
-  }
-
-  // -----------------------------
-  // Main draw loop
-  // -----------------------------
   function draw() {
     const w = cv.clientWidth;
     const h = cv.clientHeight;
-    ctx.clearRect(0,0,w,h);
 
-    // background
+    ctx.clearRect(0,0,w,h);
     ctx.fillStyle = "#0b0f14";
     ctx.fillRect(0,0,w,h);
 
-    if (!last || !last.book || viewMid === null || timeEndMs === null || !heat) {
+    if (!last || viewMid === null || viewSpan === null) {
       ctx.fillStyle = "#94a3b8";
       ctx.font = "14px -apple-system, system-ui, Arial";
       ctx.fillText("Waiting for data...", 12, 24);
@@ -720,79 +799,94 @@ HTML = r"""
       return;
     }
 
-    // Auto-follow keeps center locked to last price AND time pinned to now
-    if (autoFollow) {
-      if (lastPx) viewMid = lastPx;
-      timeEndMs = Date.now();
+    // Auto-follow to mid (more stable than last trade)
+    if (autoFollow && (midPx || lastPx)) {
+      viewMid = (midPx ?? lastPx);
     }
 
     const pMin = viewMid - viewSpan/2;
     const pMax = viewMid + viewSpan/2;
 
-    // push heat columns on a fixed cadence
-    const now = Date.now();
-    if (lastColPushMs === null) lastColPushMs = now;
-    while ((now - lastColPushMs) >= HEAT_COL_MS) {
-      pushHeatColumn(pMin, pMax);
-      lastColPushMs += HEAT_COL_MS;
-    }
+    // -----------------------------
+    // Draw HEATMAP (absolute grid) as an image
+    // -----------------------------
+    if (heat.ready && heat.head >= 0 && heat.anchorMinPrice !== null) {
+      const colsVisible = clamp(Math.floor((timeSpanSec*1000) / heat.colMs), 10, heat.cols);
+      const head = heat.head;
+      const startCol = head - colsVisible + 1;
 
-    // Time visible range
-    const tEnd = timeEndMs;
-    const tStart = tEnd - timeSpanMs;
+      // Determine which rows are visible in the current price window
+      let r0 = rowOfPrice(pMax); // top
+      let r1 = rowOfPrice(pMin); // bottom
+      r0 = clamp(r0, 0, heat.rows-1);
+      r1 = clamp(r1, 0, heat.rows-1);
+      if (r1 < r0) { const tmp=r0; r0=r1; r1=tmp; }
+      const rowsVisible = clamp((r1 - r0 + 1), 50, heat.rows);
 
-    // Render TRUE heatmap: time×price
-    // We draw vertical strips per heat column within visible time.
-    // For each column, we draw bins with intensity.
-    const colsToDraw = Math.min(heatCols, Math.max(60, Math.floor(timeSpanMs / HEAT_COL_MS)));
-    // determine mapping from time -> ordered column indices by looking at colTimes
-    // We'll draw by scanning columns and selecting those in [tStart..tEnd]
-    // For speed, approximate by drawing all columns but skip those outside.
-    const stripW = w / Math.max(1, colsToDraw);
+      // Build ImageData at (colsVisible x rowsVisible), then scale to canvas
+      const img = ctx.createImageData(colsVisible, rowsVisible);
+      const data = img.data;
 
-    // Find columns in time window; build a list (oldest->newest)
-    const selected = [];
-    for (let k=0; k<heatCols; k++) {
-      const phys = orderedColIndex(k);
-      const ts = colTimes[phys] || 0;
-      if (ts >= tStart && ts <= tEnd) selected.push(phys);
-    }
-
-    // If not enough selected (startup), use the most recent tail
-    if (selected.length < 10) {
-      selected.length = 0;
-      for (let k=Math.max(0, heatCols - colsToDraw); k<heatCols; k++) {
-        selected.push(orderedColIndex(k));
+      // Exposure (simple robust): compute max over a small sample of recent data
+      // (fast, stable enough). This avoids "all bright" or "all dark".
+      let vmax = 1;
+      const sampleCols = Math.min(colsVisible, 60);
+      const sampleStep = Math.max(1, Math.floor(colsVisible / sampleCols));
+      for (let ci = startCol; ci <= head; ci += sampleStep) {
+        const col = heat.ring[ci % heat.cols];
+        if (!col) continue;
+        for (let rr = r0; rr <= r1; rr += 4) {
+          const v = col[rr] || 0;
+          if (v > vmax) vmax = v;
+        }
       }
-    }
+      vmax = Math.max(vmax, 16);
 
-    // Draw heat strips
-    const binH = h / BINS;
-    const vmax = Math.max(1e-6, vmaxEwma);
+      // Fill pixels (x=time, y=price)
+      // Note: y in ImageData goes top->bottom, which corresponds to high->low
+      for (let x = 0; x < colsVisible; x++) {
+        const colIdx = startCol + x;
+        const col = heat.ring[((colIdx % heat.cols) + heat.cols) % heat.cols];
+        if (!col) continue;
 
-    // Use mild gamma to increase low-intensity visibility
-    const gamma = 0.65;
+        for (let y = 0; y < rowsVisible; y++) {
+          const row = r0 + y;
+          const v = col[row] || 0;
+          if (v === 0) continue;
 
-    // selected is in chronological order by orderedColIndex scanning; good enough
-    const nSel = selected.length;
-    for (let i=0; i<nSel; i++) {
-      const col = selected[i];
-      const x = (i / Math.max(1, nSel)) * w;
-      // draw bins
-      // (This is BINS*nSel rectangles per frame; BINS=360, nSel~720 => heavy but acceptable on modern devices.
-      // If needed later, we optimize via ImageData/offscreen.)
-      for (let b=0; b<BINS; b++) {
-        const v = heatGet(b, col);
-        if (v <= 0) continue;
-        let a = clamp(v / vmax, 0, 1);
-        a = Math.pow(a, gamma);
-        if (a < 0.02) continue;
-        ctx.fillStyle = heatRGBA(a);
-        ctx.fillRect(x, b * binH, stripW + 1, binH + 1);
+          const a = clamp(v / vmax, 0, 1);
+          if (a < 0.02) continue;
+
+          const [rr, gg, bb, aa] = heatRGBA(a);
+          const i = (y*colsVisible + x) * 4;
+          data[i+0] = rr;
+          data[i+1] = gg;
+          data[i+2] = bb;
+          data[i+3] = Math.floor(255 * aa);
+        }
       }
+
+      // Draw scaled to full canvas
+      // Use nearest-neighbor for crisp "band" look
+      ctx.imageSmoothingEnabled = false;
+      ctx.putImageData(img, 0, 0);
+
+      // Scale to canvas: we render at native img size then stretch using drawImage
+      // To avoid allocating another canvas, we drawImage from the main canvas:
+      // 1) snapshot that region to an offscreen bitmap via createImageBitmap would be async.
+      // So we instead use a small trick: draw to an offscreen canvas.
+      const off = document.createElement("canvas");
+      off.width = colsVisible;
+      off.height = rowsVisible;
+      const octx = off.getContext("2d");
+      octx.putImageData(img, 0, 0);
+
+      // Draw to full area
+      ctx.imageSmoothingEnabled = true; // smoother scaling
+      ctx.drawImage(off, 0, 0, w, h);
     }
 
-    // Light grid (price)
+    // Light horizontal grid
     ctx.strokeStyle = "rgba(148,163,184,0.08)";
     ctx.lineWidth = 1;
     const gridN = 8;
@@ -804,57 +898,54 @@ HTML = r"""
       ctx.stroke();
     }
 
-    // Trade bubbles (time on X, price on Y) based on current time view
+    // -----------------------------
+    // Trade bubbles (time on X, price on Y)
+    // -----------------------------
+    const now = Date.now();
+    const windowMs = timeSpanSec * 1000;
     const xOf = (tms) => {
-      const frac = (tms - tStart) / Math.max(1, (tEnd - tStart));
+      const dtm = now - tms;
+      const frac = 1 - (dtm / windowMs);
       return clamp(frac, 0, 1) * w;
     };
 
     let vMax = 0;
-    for (const t of trades) {
-      if (t.t >= tStart && t.t <= tEnd) vMax = Math.max(vMax, t.v || 0);
-    }
+    for (const t of trades) vMax = Math.max(vMax, t.v || 0);
     vMax = Math.max(vMax, 1e-9);
 
     for (const t of trades) {
-      const tms = t.t;
-      if (!(tms >= tStart && tms <= tEnd)) continue;
-
       const p = t.p;
       if (!(p >= pMin && p <= pMax)) continue;
-
-      const x = xOf(tms);
+      const x = xOf(t.t);
       const y = yOf(p, pMin, pMax, h);
 
       const v = (t.v || 0);
       const r = 1.5 + 16 * Math.sqrt(v / vMax);
-
       const isBuy = (t.T === 1);
       ctx.beginPath();
-      ctx.fillStyle = isBuy ? "rgba(59,130,246,0.70)" : "rgba(245,158,11,0.70)";
+      ctx.fillStyle = isBuy ? "rgba(59,130,246,0.65)" : "rgba(245,158,11,0.65)";
       ctx.arc(x, y, r, 0, Math.PI*2);
       ctx.fill();
     }
 
-    // Last trade price line
+    // Last price line + labels
     if (lastPx) {
       const y = yOf(lastPx, pMin, pMax, h);
-      ctx.strokeStyle = "rgba(226,232,240,0.95)";
+      ctx.strokeStyle = "rgba(226,232,240,0.9)";
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(0,y);
       ctx.lineTo(w,y);
       ctx.stroke();
 
-      ctx.fillStyle = "rgba(226,232,240,0.95)";
+      ctx.fillStyle = "rgba(226,232,240,0.9)";
       ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      ctx.fillText(`LAST ${lastPx.toFixed(3)}`, 10, clamp(y-6, 14, h-8));
+      ctx.fillText(`LAST ${lastPx.toFixed(1)}`, 10, clamp(y-6, 14, h-8));
     }
 
-    // Mid price line (optional)
     if (midPx) {
       const y = yOf(midPx, pMin, pMax, h);
-      ctx.strokeStyle = "rgba(148,163,184,0.55)";
+      ctx.strokeStyle = "rgba(147,197,253,0.35)";
       ctx.lineWidth = 1;
       ctx.setLineDash([4,4]);
       ctx.beginPath();
@@ -863,15 +954,18 @@ HTML = r"""
       ctx.stroke();
       ctx.setLineDash([]);
 
-      ctx.fillStyle = "rgba(148,163,184,0.85)";
+      ctx.fillStyle = "rgba(147,197,253,0.85)";
       ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      ctx.fillText(`MID ${midPx.toFixed(3)}`, 10, clamp(y+14, 18, h-4));
+      ctx.fillText(`MID  ${midPx.toFixed(1)}`, 10, clamp(y-6, 14, h-8));
     }
 
-    // View info (topbar)
-    const spanSec = (timeSpanMs/1000).toFixed(1);
-    const ageMs = (last && last.health) ? (last.health.trade_age_ms ?? "None") : "None";
-    viewInfoEl.textContent = `Tspan=${spanSec}s | Pspan=${viewSpan.toFixed(1)} | trade_age=${ageMs}ms | history=${Math.floor(HEAT_WINDOW_MS/60000)}m`;
+    // Footer
+    ctx.fillStyle = "rgba(148,163,184,0.9)";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+    ctx.fillText(
+      `Tspan=${timeSpanSec.toFixed(0)}s | Pspan=${viewSpan.toFixed(1)} | trade_age=${(last?.health?.trade_age_ms ?? "None")}ms | history=${(heat?.windowSec ?? 3600)/60}m`,
+      10, h - 10
+    );
 
     requestAnimationFrame(draw);
   }
@@ -893,17 +987,16 @@ async def index():
 
 @app.get("/health")
 async def health():
-    bb, ba = feed.book.best_bid_ask()
-    mid = (bb + ba)/2.0 if (bb is not None and ba is not None and bb > 0 and ba > 0) else None
+    feed._update_bba_mid()
     return {
         "service": "quantdesk-bookmap-ui",
         "symbol": SYMBOL_WS,
         "ws_url": WS_URL,
         "ws_ok": feed.ws_ok,
         "last_px": feed.last_px,
-        "mid_px": mid,
-        "best_bid": bb,
-        "best_ask": ba,
+        "mid_px": feed.mid_px,
+        "best_bid": feed.best_bid,
+        "best_ask": feed.best_ask,
         "bids_n": len(feed.book.bids),
         "asks_n": len(feed.book.asks),
         "trades_n": len(feed.trades.dq),
@@ -912,9 +1005,11 @@ async def health():
         "ui_defaults": {
             "heat_window_sec": HEAT_WINDOW_SEC,
             "heat_col_ms": HEAT_COL_MS,
-            "heat_bins": HEAT_BINS,
+            "heat_bins": feed.heat.rows,
             "default_price_span": DEFAULT_PRICE_SPAN,
-        }
+            "price_bin_usd": PRICE_BIN_USD,
+            "range_usd": RANGE_USD,
+        },
     }
 
 @app.websocket("/ws")
@@ -931,5 +1026,5 @@ async def ws_endpoint(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    # Run directly without relying on filename/module import name
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    # Keep Procfile-compatible entry: uvicorn app:app --host 0.0.0.0 --port $PORT
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT)
