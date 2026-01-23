@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 # -----------------------------
 # Build
 # -----------------------------
-BUILD_TAG = "FIX11"
+BUILD_TAG = "FIX12"
 
 # -----------------------------
 # Config (env)
@@ -753,14 +753,22 @@ HTML = r"""
     }
 
     if (heat.ready && msg.heat_patch && msg.heat_patch.b64) {
-      const colIdx = msg.heat_patch.col_idx;
+      const colIdxRaw = msg.heat_patch.col_idx;
+      const colIdx = ((colIdxRaw % heat.cols) + heat.cols) % heat.cols;
       const u8 = b64ToU8(msg.heat_patch.b64);
       if (u8.length === heat.rows) {
         // Apply "burn" using latest trade movement on the same column: price eats liquidity.
         if (prevLastPx !== null && lastPx !== null && lastPx !== undefined) {
           burnBetweenPx(u8, prevLastPx, lastPx);
         }
+        // Store column into ring (this is required for heatmap rendering).
+        heat.ring[colIdx] = u8;
+        heat.head = colIdx;
+        heatDbg.patches = (heatDbg.patches || 0) + 1;
+      } else {
+        heatDbg.bad_patch = (heatDbg.bad_patch || 0) + 1;
       }
+    }
     }
 
     // track previous trade for next burn
