@@ -1,1173 +1,819 @@
-# QuantDesk Bookmap Service (Replit/GitHub) — FIX15
-# Goals:
-# 1) Smooth, stable Bookmap-like scroll/zoom (no "pressed to left" drift)
-# 2) Correct heat palette: weak=light blue, strong=red, none=black
-# 3) Heat dimmer acts like a "vmax/exposure" control (keeps dense bands visible, doesn't nuke everything)
-# 4) Reduce over-crowding: client uses server trade list as authoritative (no duplicate appends)
-# 5) Performance: reuse offscreen canvas + ImageData buffers; no per-frame canvas allocations
+# QuantDesk Bookmap UI — FOUNDATION_BUILD_1
+# Single-file service for GitHub -> Replit "Run" workflow.
+# Goal: stable Bookmap-like foundation on iPad/WebKit:
+# - Depth+Trades ingestion (MEXC contract WS)
+# - OrderBookState snapshot+delta correctness
+# - Fixed time window heat buffer (no drift/squeeze)
+# - Canvas renderer with NO pan/zoom/autofollow (Phase 1)
+# - On-canvas error panel (never silent blank)
 
 import os
 import json
 import time
-import gzip
-import zlib
-import asyncio
-import base64
 import math
+import base64
+import asyncio
+import traceback
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
-from collections import deque
+from typing import Dict, List, Tuple, Optional
 
-import websockets
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse
+import aiohttp
+from aiohttp import web
 
+# -------------------------
+# Build identity
+# -------------------------
+BUILD_TAG = "FOUNDATION_BUILD_1"
 
-# -----------------------------
-# Config (env)
-# -----------------------------
+# -------------------------
+# MEXC contract WS config
+# -------------------------
 WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
-SYMBOL_WS = os.environ.get("QD_SYMBOL_WS", "BTC_USDT")
-PORT = int(os.environ.get("PORT", "5000"))
+SYMBOL_WS = os.environ.get("QD_SYMBOL_WS", "BTC_USDT")  # contract WS symbol format
 
-MAX_TRADES = int(os.environ.get("QD_MAX_TRADES", "6000"))
+# -------------------------
+# Heatmap foundation params
+# -------------------------
+WINDOW_SEC = int(os.environ.get("QD_WINDOW_SEC", "900"))         # 15 minutes
+COL_DT_SEC = float(os.environ.get("QD_COL_DT_SEC", "1.0"))       # 1 second per column
+RANGE_USD = float(os.environ.get("QD_RANGE_USD", "400"))         # +/- range around mid
+BIN_USD = float(os.environ.get("QD_BIN_USD", "1.0"))             # price bin size (foundation)
+ROWS = int((2.0 * RANGE_USD) / BIN_USD)                           # fixed rows
+COLS = int(WINDOW_SEC / COL_DT_SEC)                               # fixed cols
 
-TOP_LEVELS = int(os.environ.get("QD_TOP_LEVELS", "250"))
-SNAPSHOT_HZ = float(os.environ.get("QD_SNAPSHOT_HZ", "6"))
+# Safety clamps (iPad)
+ROWS = max(128, min(1600, ROWS))
+COLS = max(240, min(1800, COLS))
 
-HEAT_WINDOW_SEC = int(os.environ.get("QD_HEAT_WINDOW_SEC", "3600"))
-HEAT_COL_MS = int(os.environ.get("QD_HEAT_COL_MS", "1000"))
-
-PRICE_BIN_USD = float(os.environ.get("QD_PRICE_BIN_USD", "1.0"))
-RANGE_USD = float(os.environ.get("QD_RANGE_USD", "4000"))
-DEFAULT_PRICE_SPAN = float(os.environ.get("QD_DEFAULT_PRICE_SPAN", "600.0"))
-
-HEAT_LOG_SCALE = float(os.environ.get("QD_HEAT_LOG_SCALE", "32.0"))
-HEAT_CONSUME_VOL_SCALE = float(os.environ.get("QD_HEAT_CONSUME_VOL_SCALE", "25.0"))
-HEAT_CELL_MAX = int(os.environ.get("QD_HEAT_CELL_MAX", "255"))
-
-# server-side optional decay (keeps very old resting levels from saturating to 255)
-HEAT_DECAY_PER_COL = float(os.environ.get("QD_HEAT_DECAY_PER_COL", "0.985"))  # 1.0 disables
-HEAT_BOOK_SAMPLE_LIMIT = int(os.environ.get("QD_HEAT_BOOK_SAMPLE_LIMIT", "0"))  # 0 => full book
-
-# -----------------------------
-# Helpers
-# -----------------------------
+# -------------------------
+# Utilities
+# -------------------------
 def now_ms() -> int:
     return int(time.time() * 1000)
 
-def try_decompress(payload: bytes) -> bytes:
-    try:
-        return gzip.decompress(payload)
-    except Exception:
-        pass
-    try:
-        return zlib.decompress(payload)
-    except Exception:
-        return payload
-
-def safe_float(x: Any, default: float = 0.0) -> float:
+def safe_float(x, default=None):
     try:
         return float(x)
     except Exception:
         return default
 
-def safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
 
-
-# -----------------------------
-# State
-# -----------------------------
+# -------------------------
+# Order book state
+# -------------------------
 @dataclass
-class OrderBook:
-    bids: Dict[float, float] = field(default_factory=dict)
+class OrderBookState:
+    bids: Dict[float, float] = field(default_factory=dict)  # price -> qty
     asks: Dict[float, float] = field(default_factory=dict)
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    last_mid: Optional[float] = None
+    last_px: Optional[float] = None
+    last_trade_ts: Optional[int] = None
+    last_depth_ts: Optional[int] = None
+    trades_n: int = 0
+    depth_updates_n: int = 0
 
-    def apply_side_updates(self, side: str, levels: List[List[Any]]) -> None:
-        # MEXC push.depth levels: [price, qty, count]; qty==0 => remove
+    # to support consumption heuristics
+    _prev_last_px: Optional[float] = None
+
+    def apply_depth_update(self, side: str, levels: List[List[float]]) -> None:
         book = self.bids if side == "bids" else self.asks
-        for lvl in levels:
-            if not lvl or len(lvl) < 2:
+        # MEXC depth levels are [price, qty, count] or [price, qty]
+        for lv in levels:
+            if not lv or len(lv) < 2:
                 continue
-            p = safe_float(lvl[0])
-            q = safe_float(lvl[1])
-            if p <= 0:
+            p = safe_float(lv[0], None)
+            q = safe_float(lv[1], None)
+            if p is None or q is None:
                 continue
             if q <= 0:
-                book.pop(p, None)
+                if p in book:
+                    del book[p]
             else:
                 book[p] = q
 
-    def best_bid_ask(self) -> Tuple[Optional[float], Optional[float]]:
-        bb = max(self.bids.keys()) if self.bids else None
-        ba = min(self.asks.keys()) if self.asks else None
-        return bb, ba
+        # refresh bests
+        if self.bids:
+            self.best_bid = max(self.bids.keys())
+        if self.asks:
+            self.best_ask = min(self.asks.keys())
+        if self.best_bid is not None and self.best_ask is not None:
+            self.last_mid = (self.best_bid + self.best_ask) / 2.0
 
-    def top_n(self, n: int) -> Dict[str, List[Tuple[float, float]]]:
-        bids_sorted = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:n]
-        asks_sorted = sorted(self.asks.items(), key=lambda x: x[0], reverse=False)[:n]
-        return {"bids": bids_sorted, "asks": asks_sorted}
+        self.last_depth_ts = now_ms()
+        self.depth_updates_n += 1
 
-    def iter_sampled(self) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-        """Optionally sample book (for CPU control). If limit==0, return full."""
-        lim = int(HEAT_BOOK_SAMPLE_LIMIT)
-        if lim <= 0:
-            return list(self.bids.items()), list(self.asks.items())
-        # sample by taking top lim by qty (roughly highlights dominant resting liquidity)
-        bids = sorted(self.bids.items(), key=lambda x: x[1], reverse=True)[:lim]
-        asks = sorted(self.asks.items(), key=lambda x: x[1], reverse=True)[:lim]
-        return bids, asks
-
-@dataclass
-class Trades:
-    dq: deque = field(default_factory=lambda: deque(maxlen=MAX_TRADES))
-
-    def append(self, t: Dict[str, Any]) -> None:
-        self.dq.append(t)
-
-
-class HeatmapRing:
-    """
-    Absolute price grid heat storage:
-      - rows = fixed price bins (anchor_min_price + i*bin_usd)
-      - cols = fixed time columns (every col_ms), stored in a ring
-    Server sends patches (one new column per head advance).
-    """
-    def __init__(self, bin_usd: float, range_usd: float, window_sec: int, col_ms: int) -> None:
-        self.bin_usd = float(bin_usd)
-        self.range_usd = float(range_usd)
-        self.window_sec = int(window_sec)
-        self.col_ms = int(col_ms)
-
-        self.cols = max(30, int((self.window_sec * 1000) // max(250, self.col_ms)))
-        half = max(50.0, self.range_usd / 2.0)
-        self.rows = max(200, int((2.0 * half) / max(0.25, self.bin_usd)))
-
-        self._anchor_min_price: Optional[float] = None
-        self._anchor_min_bin: Optional[int] = None
-        self._head_col_idx: int = -1
-        self._grid: List[Optional[bytearray]] = [None] * self.cols
-        self._last_col_open_ms: Optional[int] = None
-
-    @property
-    def anchor_min_price(self) -> Optional[float]:
-        return self._anchor_min_price
-
-    @property
-    def anchor_min_bin(self) -> Optional[int]:
-        return self._anchor_min_bin
-
-    @property
-    def head(self) -> int:
-        return self._head_col_idx
-
-    def _price_to_bin_index(self, p: float) -> int:
-        return int(math.floor(p / self.bin_usd))
-
-    def ensure_anchor(self, mid_px: float) -> None:
-        if self._anchor_min_price is not None:
+    def apply_trade(self, p: float, v: float, ts_ms: int) -> None:
+        if p is None:
             return
-        half = self.range_usd / 2.0
-        min_price = max(0.0, mid_px - half)
-        min_bin = self._price_to_bin_index(min_price)
-        self._anchor_min_bin = min_bin
-        self._anchor_min_price = float(min_bin) * self.bin_usd
+        self._prev_last_px = self.last_px
+        self.last_px = p
+        self.last_trade_ts = ts_ms or now_ms()
+        self.trades_n += 1
 
-    def _row_of_price(self, p: float) -> Optional[int]:
-        if self._anchor_min_bin is None:
+    @property
+    def bids_n(self) -> int:
+        return len(self.bids)
+
+    @property
+    def asks_n(self) -> int:
+        return len(self.asks)
+
+# -------------------------
+# Heat history (fixed window, fixed bins)
+# -------------------------
+class HeatHistory:
+    def __init__(self, cols: int, rows: int):
+        self.cols = cols
+        self.rows = rows
+        self.ring: List[Optional[bytearray]] = [None] * cols
+        self.head: int = -1
+        self.started_ms: int = now_ms()
+        self.last_col_ts_ms: int = 0
+
+        # exposure stats (EWMA)
+        self.vmax_ema: float = 30.0  # seed
+        self.vmax_alpha: float = 0.06
+
+        # stats
+        self.patches: int = 0
+
+    def advance(self, ts_ms: int) -> int:
+        """Advance to next column index and allocate a fresh column."""
+        self.head = (self.head + 1) % self.cols
+        self.last_col_ts_ms = ts_ms
+        self.ring[self.head] = bytearray(self.rows)  # zero-init
+        return self.head
+
+    def current_col(self) -> Optional[bytearray]:
+        if self.head < 0:
             return None
-        b = self._price_to_bin_index(p)
-        row = b - self._anchor_min_bin
-        if 0 <= row < self.rows:
-            return row
-        return None
+        return self.ring[self.head]
 
-    def maybe_open_new_column(self, t_ms: int) -> Optional[int]:
-        """
-        Opens new columns whenever col_ms boundary passes.
-        Returns new head col_idx if opened, else None.
-        """
-        if self._last_col_open_ms is None:
-            self._last_col_open_ms = t_ms
-            self._head_col_idx += 1
-            self._grid[self._head_col_idx % self.cols] = bytearray(self.rows)
-            return self._head_col_idx
+    def encode_col_b64(self, col: bytearray) -> str:
+        return base64.b64encode(col).decode("ascii")
 
-        if (t_ms - self._last_col_open_ms) >= self.col_ms:
-            steps = int((t_ms - self._last_col_open_ms) // self.col_ms)
-            for _ in range(steps):
-                self._last_col_open_ms += self.col_ms
-                self._head_col_idx += 1
-                self._grid[self._head_col_idx % self.cols] = bytearray(self.rows)
-            return self._head_col_idx
-        return None
-
-    def _apply_decay_to_current(self) -> None:
-        # Decay previous column into current one (so bands persist but don't hard-saturate)
-        if HEAT_DECAY_PER_COL >= 0.9999:
-            return
-        if self._head_col_idx <= 0:
-            return
-        prev = self._grid[(self._head_col_idx - 1) % self.cols]
-        cur = self._grid[self._head_col_idx % self.cols]
-        if prev is None or cur is None:
-            return
-        k = float(HEAT_DECAY_PER_COL)
-        # cur = prev * k (uint8)
-        for i in range(self.rows):
-            v = int(prev[i] * k)
-            cur[i] = v if v <= 255 else 255
-
-    def write_level(self, p: float, q: float) -> None:
-        if self._head_col_idx < 0:
-            return
-        row = self._row_of_price(p)
-        if row is None:
-            return
-        col = self._grid[self._head_col_idx % self.cols]
+    def apply_consumption_corridor(self, price0: float, price1: float, mid: float) -> None:
+        """Visual hint: reduce heat along the traded path in the latest column."""
+        col = self.current_col()
         if col is None:
-            col = bytearray(self.rows)
-            self._grid[self._head_col_idx % self.cols] = col
+            return
+        if price0 is None or price1 is None or mid is None:
+            return
+        pmin = mid - RANGE_USD
+        pmax = mid + RANGE_USD
+        if pmax <= pmin:
+            return
+        lo = min(price0, price1)
+        hi = max(price0, price1)
+        # widen corridor slightly
+        lo -= (2.0 * BIN_USD)
+        hi += (2.0 * BIN_USD)
 
-        inten = math.log1p(max(0.0, q)) * HEAT_LOG_SCALE
-        v = int(inten)
-        if v <= 0:
+        r_lo = int((lo - pmin) / BIN_USD)
+        r_hi = int((hi - pmin) / BIN_USD)
+        r_lo = clamp(r_lo, 0, self.rows - 1)
+        r_hi = clamp(r_hi, 0, self.rows - 1)
+        if r_hi < r_lo:
             return
-        if v > HEAT_CELL_MAX:
-            v = HEAT_CELL_MAX
-         # Use max/overwrite behavior to avoid runaway saturation
-        # Bands still persist due to decay copy on column advance.
-        if v > col[row]:
-            col[row] = v
+        # Burn (cap) so trail becomes "cool"
+        cap = 18  # small U8 cap (blue)
+        for r in range(r_lo, r_hi + 1):
+            v = col[r]
+            if v > cap:
+                col[r] = cap
 
-    def consume_price(self, p: float, strength: float) -> None:
-        """Reduce heat around a traded price to mimic liquidity being taken.
-        strength in [0,1], higher = more reduction.
-        Applies to current head column and a few recent columns.
-        """
-        if self._head_col_idx < 0 or self._anchor_min_bin is None:
-            return
-        row = self._row_of_price(p)
-        if row is None:
-            return
-        s = max(0.0, min(1.0, float(strength)))
-        if s <= 0.0:
-            return
-        # affect +/-1 rows
-        rows = [r for r in (row-1, row, row+1) if 0 <= r < self.rows]
-        # apply to last few columns (head, head-1, head-2)
-        for back in (0,1,2):
-            ci = self._head_col_idx - back
-            if ci < 0:
+# -------------------------
+# Rasterize book -> column
+# -------------------------
+def rasterize_book_to_col(book: OrderBookState, mid: float, col: bytearray) -> Tuple[float, float]:
+    """
+    Fill 'col' in-place with intensities based on current book.
+    Returns (vmax_used, floor_used).
+    """
+    # Collect values inside range, aggregate by bin.
+    pmin = mid - RANGE_USD
+    pmax = mid + RANGE_USD
+
+    # Quick return if no book
+    if not book.bids and not book.asks:
+        return (1.0, 0.0)
+
+    # temp accumulator (float) per row
+    acc = [0.0] * len(col)
+
+    def add_side(levels: Dict[float, float]):
+        for p, q in levels.items():
+            if p < pmin or p > pmax:
                 continue
-            col = self._grid[ci % self.cols]
-            if col is None:
-                continue
-            for r in rows:
-                col[r] = int(col[r] * (1.0 - 0.65*s))
+            r = int((p - pmin) / BIN_USD)
+            if 0 <= r < len(acc):
+                acc[r] += float(q)
 
+    add_side(book.bids)
+    add_side(book.asks)
 
-    def export_patch_b64(self, col_idx: int) -> Optional[str]:
-        col = self._grid[col_idx % self.cols] if col_idx >= 0 else None
-        if col is None:
-            return None
-        return base64.b64encode(bytes(col)).decode("ascii")
+    # Convert acc -> U8 with log compression and robust vmax
+    # Use percentile vmax from acc (non-zero), then EWMA outside.
+    nz = [v for v in acc if v > 0.0]
+    if not nz:
+        return (1.0, 0.0)
 
-    def get_col(self, col_idx: int) -> Optional[bytearray]:
-        return self._grid[col_idx % self.cols] if col_idx >= 0 else None
+    nz.sort()
+    # 99.5th percentile (robust)
+    idx = int(0.995 * (len(nz) - 1))
+    vmax = max(1e-9, nz[idx])
 
+    # Floor to suppress haze: 30th percentile of non-zero
+    floor_idx = int(0.30 * (len(nz) - 1))
+    floor_v = nz[floor_idx]
 
-class MexcFeed:
-    def __init__(self) -> None:
-        self.book = OrderBook()
-        self.trades = Trades()
+    # Map: log1p, normalized against log1p(vmax)
+    denom = math.log1p(vmax)
+    if denom <= 0:
+        denom = 1.0
 
-        self.ws_ok = False
-        self.last_px: Optional[float] = None
-        self.last_trade_ms: Optional[int] = None
-        self.last_depth_ms: Optional[int] = None
+    for i, v in enumerate(acc):
+        if v <= floor_v:
+            col[i] = 0
+            continue
+        x = math.log1p(v) / denom
+        x = clamp(x, 0.0, 1.0)
+        # gamma for contrast
+        x = x ** 0.60
+        col[i] = int(255.0 * x + 0.5)
 
-        self.best_bid: Optional[float] = None
-        self.best_ask: Optional[float] = None
-        self.mid_px: Optional[float] = None
+    return (vmax, floor_v)
 
-        self._stop = False
-        self._clients: List[WebSocket] = []
-        self._clients_lock = asyncio.Lock()
-
-        self.heat = HeatmapRing(
-            bin_usd=PRICE_BIN_USD,
-            range_usd=RANGE_USD,
-            window_sec=HEAT_WINDOW_SEC,
-            col_ms=HEAT_COL_MS,
-        )
-        self._last_patch_sent_head: int = -1
-
-    async def add_client(self, ws: WebSocket) -> None:
-        async with self._clients_lock:
-            self._clients.append(ws)
-
-    async def remove_client(self, ws: WebSocket) -> None:
-        async with self._clients_lock:
-            self._clients = [c for c in self._clients if c is not ws]
-
-    def _update_bba_mid(self) -> None:
-        bb, ba = self.book.best_bid_ask()
-        self.best_bid = bb
-        self.best_ask = ba
-        if bb is not None and ba is not None and bb > 0 and ba > 0:
-            self.mid_px = (bb + ba) / 2.0
-        elif self.last_px is not None:
-            self.mid_px = self.last_px
-
-    async def broadcast_snapshot(self) -> None:
-        self._update_bba_mid()
-        book = self.book.top_n(TOP_LEVELS)
-        trades = list(self.trades.dq)[-1500:]  # authoritative snapshot
-
-        if self.mid_px is not None:
-            self.heat.ensure_anchor(self.mid_px)
-
-        heat_patch = None
-        if self.heat.anchor_min_price is not None and self.heat.head >= 0:
-            if self.heat.head != self._last_patch_sent_head:
-                b64 = self.heat.export_patch_b64(self.heat.head)
-                if b64 is not None:
-                    heat_patch = {"col_idx": self.heat.head, "b64": b64}
-                self._last_patch_sent_head = self.heat.head
-
-        payload = {
-            "ts": now_ms(),
-            "symbol": SYMBOL_WS,
-            "ws_url": WS_URL,
-            "ws_ok": self.ws_ok,
-            "last_px": self.last_px,
-            "best_bid": self.best_bid,
-            "best_ask": self.best_ask,
-            "mid_px": self.mid_px,
-            "book": {"bids": book["bids"], "asks": book["asks"]},
-            "trades": trades,
-            "health": {
-                "depth_age_ms": (now_ms() - self.last_depth_ms) if self.last_depth_ms else None,
-                "trade_age_ms": (now_ms() - self.last_trade_ms) if self.last_trade_ms else None,
-                "bids_n": len(self.book.bids),
-                "asks_n": len(self.book.asks),
-                "trades_n": len(self.trades.dq),
-            },
-            "heat_meta": {
-                "mode": "resting_density_absolute_grid",
-                "window_sec": HEAT_WINDOW_SEC,
-                "col_ms": HEAT_COL_MS,
-                "cols": self.heat.cols,
-                "bin_usd": self.heat.bin_usd,
-                "range_usd": self.heat.range_usd,
-                "rows": self.heat.rows,
-                "anchor_min_price": self.heat.anchor_min_price,
-                "anchor_min_bin": self.heat.anchor_min_bin,
-                "head": self.heat.head,
-            },
-            "heat_patch": heat_patch,
-            "ui_defaults": {
-                "default_price_span": DEFAULT_PRICE_SPAN,
-            },
-        }
-
-        msg = json.dumps(payload)
-        async with self._clients_lock:
-            clients = list(self._clients)
-
-        dead: List[WebSocket] = []
-        for c in clients:
-            try:
-                await c.send_text(msg)
-            except Exception:
-                dead.append(c)
-
-        if dead:
-            async with self._clients_lock:
-                self._clients = [c for c in self._clients if c not in dead]
-
-    async def _snapshot_loop(self) -> None:
-        period = max(0.05, 1.0 / max(1.0, SNAPSHOT_HZ))
-        while not self._stop:
-            try:
-                await self.broadcast_snapshot()
-            except Exception:
-                pass
-            await asyncio.sleep(period)
-
-    async def _heat_loop(self) -> None:
-        while not self._stop:
-            try:
-                t = now_ms()
-                self._update_bba_mid()
-                if self.mid_px is not None:
-                    self.heat.ensure_anchor(self.mid_px)
-
-                new_head = self.heat.maybe_open_new_column(t)
-                if new_head is not None:
-                    # decay previous -> current (prevents hard saturation)
-                    self.heat._apply_decay_to_current()
-
-                    # sample current resting book and write into current column
-                    bids, asks = self.book.iter_sampled()
-                    for p, q in bids:
-                        if q > 0:
-                            self.heat.write_level(p, q)
-                    for p, q in asks:
-                        if q > 0:
-                            self.heat.write_level(p, q)
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
-
-    async def run(self) -> None:
-        asyncio.create_task(self._snapshot_loop())
-        asyncio.create_task(self._heat_loop())
-
-        while not self._stop:
-            try:
-                async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                    self.ws_ok = True
-                    await ws.send(json.dumps({"method": "sub.depth", "param": {"symbol": SYMBOL_WS}}))
-                    await ws.send(json.dumps({"method": "sub.deal", "param": {"symbol": SYMBOL_WS}}))
-
-                    while not self._stop:
-                        raw = await ws.recv()
-                        if isinstance(raw, bytes):
-                            raw = try_decompress(raw).decode("utf-8", errors="ignore")
-                        msg = json.loads(raw)
-
-                        ch = msg.get("channel") or msg.get("ch")
-
-                        if ch in ("push.depth", "rs.push.depth"):
-                            data = msg.get("data", {}) or {}
-                            self.book.apply_side_updates("bids", data.get("bids", []) or [])
-                            self.book.apply_side_updates("asks", data.get("asks", []) or [])
-                            self.last_depth_ms = now_ms()
-                            self._update_bba_mid()
-
-                        elif ch in ("push.deal", "rs.push.deal"):
-                            data = msg.get("data", [])
-                            if isinstance(data, list):
-                                for t in data:
-                                    p = safe_float(t.get("p"))
-                                    v = safe_float(t.get("v"))
-                                    T = safe_int(t.get("T", 0))
-                                    tm = safe_int(t.get("t", now_ms()))
-                                    self.trades.append({"p": p, "v": v, "T": T, "t": tm})
-                                    if p > 0:
-                                        self.last_px = p
-                                        # Consume/rest liquidity near traded price (approximate)
-                                        try:
-                                            strength = min(1.0, (v or 0.0) / max(1e-9, HEAT_CONSUME_VOL_SCALE))
-                                            self.heat.consume_price(p, strength)
-                                        except Exception:
-                                            pass
-                                    self.last_trade_ms = now_ms()
-                            self._update_bba_mid()
-
-            except Exception:
-                self.ws_ok = False
-                await asyncio.sleep(1.5)
-
-
-# -----------------------------
-# Web App
-# -----------------------------
-app = FastAPI()
-feed = MexcFeed()
-
-HTML = r"""
-<!doctype html>
+# -------------------------
+# Web UI (no interaction)
+# -------------------------
+HTML = f"""<!doctype html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap (FIX15)</title>
-  <style>
-    html, body { margin:0; padding:0; background:#0b0f14; color:#cbd5e1; height:100%; overflow:hidden; }
-    #topbar {
-      padding:10px 12px;
-      font-family: -apple-system, system-ui, Arial;
-      font-size:14px;
-      display:flex;
-      gap:10px;
-      align-items:center;
-      border-bottom:1px solid #111827;
-      user-select:none;
-      -webkit-user-select:none;
-      flex-wrap:wrap;
-    }
-    #statusDot { width:10px; height:10px; border-radius:50%; display:inline-block; background:#ef4444; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:12px; color:#93c5fd; }
-    button {
-      padding:6px 10px;
-      border:1px solid #1f2937;
-      border-radius:10px;
-      background:#0b1220;
-      color:#cbd5e1;
-      font-size:12px;
-    }
-    .ctl { display:flex; align-items:center; gap:8px; }
-    input[type="range"] { width: 160px; }
-    #wrap { height: calc(100% - 96px); display:flex; }
-    canvas { width: 100%; height: 100%; display:block; touch-action:none; }
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<title>QuantDesk Bookmap ({BUILD_TAG})</title>
+<style>
+  html, body {{
+    margin:0; padding:0; height:100%; width:100%;
+    background:#000; color:#cfd3da; font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    overflow:hidden;
+  }}
+  body {{ display:flex; flex-direction:column; }}
+  #topbar {{
+    padding: 8px 10px;
+    background: #0b0f14;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    font-size: 13px;
+    line-height: 1.25;
+    white-space: normal;
+  }}
+  #wrap {{ flex: 1 1 auto; position: relative; min-height: 0; }}
+  #cv {{
+    width: 100%;
+    height: 100%;
+    display:block;
+    background:#000;
+  }}
+  #statusDot {{
+    display:inline-block; width:10px; height:10px; border-radius:50%;
+    margin-right:6px; background:#444; vertical-align:middle;
+  }}
+  .muted {{ color:#8b93a1; }}
+</style>
 </head>
 <body>
   <div id="topbar">
     <span id="statusDot"></span>
-    <span class="mono" id="sym"></span>
-    <span class="mono" id="health"></span>
-    <button id="btnAF">AutoFollow: ON</button>
-    <button id="btnTm">-T</button>
-    <button id="btnTp">+T</button>
-    <button id="btnPm">-P</button>
-    <button id="btnPp">+P</button>
+    <span><b>QuantDesk Bookmap</b> <span class="muted">(build={BUILD_TAG})</span></span>
+    <span class="muted"> | symbol=</span><span id="sym"></span>
+    <span class="muted"> | PRIMARY(MID)=</span><span id="mid"></span>
+    <span class="muted"> TRADE=</span><span id="last"></span>
+    <span class="muted"> bid=</span><span id="bid"></span>
+    <span class="muted"> ask=</span><span id="ask"></span>
+    <span class="muted"> | depth_age=</span><span id="dAge"></span><span class="muted">ms</span>
+    <span class="muted"> trade_age=</span><span id="tAge"></span><span class="muted">ms</span>
+    <span class="muted"> bids/asks=</span><span id="na"></span>
+    <span class="muted"> trades=</span><span id="nt"></span>
   </div>
-
-  <div id="topbar" style="border-bottom:1px solid #111827;">
-    <button id="btnAutoExp">AutoExp: ON</button>
-
-    <div class="ctl"><span class="mono">Heat Dim</span>
-      <input id="slDim" type="range" min="0" max="100" value="20"/>
-    </div>
-    <div class="ctl"><span class="mono">Heat Thr</span>
-      <input id="slThr" type="range" min="0" max="100" value="6"/>
-    </div>
-    <div class="ctl"><span class="mono">Heat Ctr</span>
-      <input id="slCtr" type="range" min="0" max="100" value="50"/>
-    </div>
-
-    <div class="ctl"><span class="mono">Bub Op</span>
-      <input id="slBubOp" type="range" min="0" max="100" value="65"/>
-    </div>
-    <div class="ctl"><span class="mono">Bub Sz</span>
-      <input id="slBubSz" type="range" min="10" max="200" value="100"/>
-    </div>
-    <div class="ctl"><span class="mono">Bub Min</span>
-      <input id="slBubMin" type="range" min="0" max="100" value="2"/>
-    </div>
-  </div>
-
-  <div id="wrap">
-    <canvas id="cv"></canvas>
-  </div>
+  <div id="wrap"><canvas id="cv"></canvas></div>
 
 <script>
+(() => {{
+  const BUILD = "{BUILD_TAG}";
+  const SYMBOL = "{SYMBOL_WS}";
+  const WINDOW_SEC = {WINDOW_SEC};
+  const COL_DT = {COL_DT_SEC};
+  const RANGE_USD = {RANGE_USD};
+  const BIN_USD = {BIN_USD};
+  const ROWS = {ROWS};
+  const COLS = {COLS};
 
-    // --- FIX17 hardening (iPad/Brave): define helpers + never-silent render failures ---
-    const floorU8 = (x) => {
-      x = Math.floor(x);
-      if (x < 0) return 0;
-      if (x > 255) return 255;
-      return x;
-    };
-    // tick size is used for y-quantization; fall back to 0.1 if not provided.
-    let tickSize = 0.1;
-
-    function setJsErr(step, err){
-      const el = document.getElementById('js_err');
-      if(!el) return;
-      const msg = (err && (err.stack || err.message || String(err))) || String(err);
-      el.textContent = `JS ERROR (FIX17) step=${step}\n${msg}`;
-      el.style.display = 'block';
-    }
-    function clearJsErr(){
-      const el = document.getElementById('js_err');
-      if(!el) return;
-      el.textContent = '';
-      el.style.display = 'none';
-    }
-(() => {
-  const cv = document.getElementById("cv");
-  const ctx = cv.getContext("2d");
-
-  const symEl = document.getElementById("sym");
   const dot = document.getElementById("statusDot");
-  const healthEl = document.getElementById("health");
+  const elSym = document.getElementById("sym");
+  const elMid = document.getElementById("mid");
+  const elLast = document.getElementById("last");
+  const elBid = document.getElementById("bid");
+  const elAsk = document.getElementById("ask");
+  const elDAge = document.getElementById("dAge");
+  const elTAge = document.getElementById("tAge");
+  const elNA = document.getElementById("na");
+  const elNT = document.getElementById("nt");
 
-  const btnAF = document.getElementById("btnAF");
-  const btnTm = document.getElementById("btnTm");
-  const btnTp = document.getElementById("btnTp");
-  const btnPm = document.getElementById("btnPm");
-  const btnPp = document.getElementById("btnPp");
+  elSym.textContent = SYMBOL;
 
-  const btnAutoExp = document.getElementById("btnAutoExp");
-  const slDim = document.getElementById("slDim");
-  const slThr = document.getElementById("slThr");
-  const slCtr = document.getElementById("slCtr");
-  const slBubOp = document.getElementById("slBubOp");
-  const slBubSz = document.getElementById("slBubSz");
-  const slBubMin = document.getElementById("slBubMin");
+  const cv = document.getElementById("cv");
+  const ctx = cv.getContext("2d", {{ alpha:false }});
 
-  function resize() {
-    const dpr = window.devicePixelRatio || 1;
-    cv.width = Math.floor(cv.clientWidth * dpr);
-    cv.height = Math.floor(cv.clientHeight * dpr);
-    // draw in device pixels; no transform drift
-    ctx.setTransform(1,0,0,1,0,0);
-  }
-  window.addEventListener("resize", resize);
+  function resize() {{
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    const rect = cv.getBoundingClientRect();
+    const w = Math.max(1, Math.floor(rect.width));
+    const h = Math.max(1, Math.floor(rect.height));
+    cv.width = Math.floor(w * dpr);
+    cv.height = Math.floor(h * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }}
+  window.addEventListener("resize", resize, {{ passive:true }});
   resize();
 
-  // -------------- Data state --------------
-  let last = null;
-  let trades = [];
-  let lastPx = null;
-  let midPx = null;
-
-  // time window
-  let timeSpanSec = 90;
-  const MIN_TSPAN = 30;
-  const MAX_TSPAN = 60 * 60;
-
-  // price view
-  let autoFollow = true;
-  let viewMid = null;
-  let viewSpan = null;
-  const MIN_PSPAN = 40;
-  const MAX_PSPAN = 20000;
-
-  // heat ring
-  let heat = {
-    ready: false,
-    windowSec: null,
-    colMs: null,
-    cols: null,
-    binUsd: null,
-    rangeUsd: null,
-    rows: null,
-    anchorMinPrice: null,
+  // Heat ring on client: store last COLS columns of ROWS U8
+  const heat = {{
+    cols: COLS,
+    rows: ROWS,
+    ring: new Array(COLS).fill(null),
     head: -1,
-    ring: [],
-  };
+    head_ts: 0,
+    patches: 0,
+  }};
 
-  // UI controls
-  let autoExp = true;
-  let heatDim = 0.20;    // acts on vmax (lower -> brighter)
-  let heatThr = 0.06;    // per-pixel alpha threshold
-  let heatCtr = 0.50;    // gamma/contrast
-  let bubOp = 0.65;
-  let bubSz = 1.00;
-  let bubMin = 0.02;
+  // trades for bubbles (Phase 1: minimal)
+  const trades = []; // {p, v, ts, side}
+  const TRADES_MAX = 2000;
 
-  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+  // last state
+  let st = null;
 
-  function setFromSliders() {
-    heatDim = clamp(parseInt(slDim.value,10)/100, 0.0, 1.0);
-    heatThr = clamp(parseInt(slThr.value,10)/100, 0.0, 1.0);
-    heatCtr = clamp(parseInt(slCtr.value,10)/100, 0.0, 1.0);
-    bubOp = clamp(parseInt(slBubOp.value,10)/100, 0.0, 1.0);
-    bubSz = clamp(parseInt(slBubSz.value,10)/100, 0.1, 2.0);
-    bubMin = clamp(parseInt(slBubMin.value,10)/100, 0.0, 1.0);
-  }
-  slDim.oninput = setFromSliders;
-  slThr.oninput = setFromSliders;
-  slCtr.oninput = setFromSliders;
-  slBubOp.oninput = setFromSliders;
-  slBubSz.oninput = setFromSliders;
-  slBubMin.oninput = setFromSliders;
-  setFromSliders();
+  function fmt(x) {{
+    if (x === null || x === undefined || !isFinite(x)) return "-";
+    return Number(x).toFixed(2);
+  }}
 
-  btnAutoExp.onclick = () => {
-    autoExp = !autoExp;
-    btnAutoExp.textContent = `AutoExp: ${autoExp ? "ON" : "OFF"}`;
-  };
-
-  btnAF.onclick = () => {
-    autoFollow = !autoFollow;
-    btnAF.textContent = `AutoFollow: ${autoFollow ? "ON" : "OFF"}`;
-  };
-
-  btnTm.onclick = () => { timeSpanSec = clamp(Math.floor(timeSpanSec / 1.5), MIN_TSPAN, MAX_TSPAN); };
-  btnTp.onclick = () => { timeSpanSec = clamp(Math.floor(timeSpanSec * 1.5), MIN_TSPAN, MAX_TSPAN); };
-  btnPm.onclick = () => { viewSpan = clamp(viewSpan * 0.75, MIN_PSPAN, MAX_PSPAN); };
-  btnPp.onclick = () => { viewSpan = clamp(viewSpan * 1.33, MIN_PSPAN, MAX_PSPAN); };
-
-  // -------------- WebSocket --------------
-  function wsUrl() {
-    const proto = (location.protocol === "https:") ? "wss" : "ws";
-    return `${proto}://${location.host}/ws`;
-  }
-  const WS = new WebSocket(wsUrl());
-
-  function b64ToU8(b64) {
-    const bin = atob(b64);
-    const len = bin.length;
-    const out = new Uint8Array(len);
-    for (let i=0;i<len;i++) out[i] = bin.charCodeAt(i);
-    return out;
-  }
-
-  function initHeat(meta) {
-    heat.windowSec = meta.window_sec;
-    heat.colMs = meta.col_ms;
-    heat.cols = meta.cols;
-    heat.binUsd = meta.bin_usd;
-    heat.rangeUsd = meta.range_usd;
-    heat.rows = meta.rows;
-    heat.anchorMinPrice = meta.anchor_min_price;
-    heat.head = meta.head;
-    heat.ring = new Array(heat.cols).fill(null);
-    heat.ready = !!(heat.anchorMinPrice !== null && heat.rows && heat.cols);
-  }
-
-  WS.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    last = msg;
-
-    dot.style.background = msg.ws_ok ? "#22c55e" : "#ef4444";
-
-    lastPx = (msg.last_px ?? lastPx);
-    midPx = (msg.mid_px ?? midPx);
-
-    // show "actual" price sources: trade, mid, bid/ask
-    const bid = (msg.best_bid ?? null);
-    const ask = (msg.best_ask ?? null);
-    symEl.textContent = `${msg.symbol} | TRADE=${(lastPx ?? "None")} | MID=${(midPx ?? "None")} | bid=${(bid ?? "None")} ask=${(ask ?? "None")}`;
-
-    healthEl.textContent =
-      `book: bids=${msg.health.bids_n} asks=${msg.health.asks_n} age: depth=${msg.health.depth_age_ms ?? "None"}ms trade=${msg.health.trade_age_ms ?? "None"}ms`;
-
-    if (viewMid === null && (midPx || lastPx)) {
-      viewMid = (midPx ?? lastPx);
-      viewSpan = (msg.ui_defaults?.default_price_span ?? 600.0);
-    }
-
-    if (!heat.ready && msg.heat_meta && msg.heat_meta.anchor_min_price !== null) {
-      initHeat(msg.heat_meta);
-    } else if (heat.ready && msg.heat_meta) {
-      heat.head = msg.heat_meta.head;
-      heat.anchorMinPrice = msg.heat_meta.anchor_min_price ?? heat.anchorMinPrice;
-    }
-
-    if (heat.ready && msg.heat_patch && msg.heat_patch.b64) {
-      const colIdx = msg.heat_patch.col_idx;
-      const u8 = b64ToU8(msg.heat_patch.b64);
-      if (u8.length === heat.rows) {
-        heat.ring[colIdx % heat.cols] = u8;
-      }
-    }
-
-    // IMPORTANT: trades snapshot is authoritative; do NOT append (prevents drift/crowding)
-    if (Array.isArray(msg.trades)) {
-      trades = msg.trades;
-    }
-  };
-
-  WS.onclose = () => { dot.style.background = "#ef4444"; };
-
-  // -------------- Interaction (pointer) --------------
-  let pointers = new Map();
-  let pinchStartDist = null;
-  let pinchStartSpan = null;
-  let dragStartY = null;
-  let dragStartMid = null;
-
-  cv.addEventListener("pointerdown", (e) => {
-    cv.setPointerCapture(e.pointerId);
-    pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
-    if (pointers.size === 1) { dragStartY = e.clientY; dragStartMid = viewMid; }
-    if (pointers.size === 2) {
-      const pts = Array.from(pointers.values());
-      const dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
-      pinchStartDist = Math.sqrt(dx*dx + dy*dy);
-      pinchStartSpan = viewSpan;
-    }
-  });
-
-  cv.addEventListener("pointermove", (e) => {
-    if (!pointers.has(e.pointerId)) return;
-    pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
-    if (viewMid === null || viewSpan === null) return;
-
-    if (pointers.size === 1 && dragStartY !== null) {
-      autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
-      const dy = e.clientY - dragStartY;
-      const pxPerPrice = (cv.clientHeight) / viewSpan;
-      const dPrice = dy / Math.max(1, pxPerPrice);
-      viewMid = (dragStartMid ?? viewMid) + dPrice;
-    }
-
-    if (pointers.size === 2 && pinchStartDist && pinchStartSpan) {
-      autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
-      const pts = Array.from(pointers.values());
-      const dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
-      const dist = Math.sqrt(dx*dx + dy*dy);
-      const scale = pinchStartDist / Math.max(10, dist);
-      viewSpan = clamp(pinchStartSpan * scale, MIN_PSPAN, MAX_PSPAN);
-    }
-  });
-
-  function endPointer(e) {
-    pointers.delete(e.pointerId);
-    if (pointers.size < 2) { pinchStartDist = null; pinchStartSpan = null; }
-    if (pointers.size === 0) { dragStartY = null; dragStartMid = null; }
-  }
-  cv.addEventListener("pointerup", endPointer);
-  cv.addEventListener("pointercancel", endPointer);
-  cv.addEventListener("pointerout", endPointer);
-
-  cv.addEventListener("wheel", (e) => {
-    if (viewMid === null || viewSpan === null) return;
-    e.preventDefault();
-    autoFollow = false; btnAF.textContent = "AutoFollow: OFF";
-    const factor = (e.deltaY > 0) ? 1.10 : 0.90;
-    viewSpan = clamp(viewSpan * factor, MIN_PSPAN, MAX_PSPAN);
-  }, {passive:false});
-
-  // -------------- Rendering pipeline (reused buffers) --------------
-  const off = document.createElement("canvas");
-  const octx = off.getContext("2d");
-  let img = null; // ImageData
-  let imgW = 0, imgH = 0;
-
-  function ensureImg(w, h) {
-    if (!img || imgW !== w || imgH !== h) {
-      imgW = w; imgH = h;
-      off.width = w; off.height = h;
-      img = octx.createImageData(w, h);
-    }
-    // clear alpha quickly
-    img.data.fill(0);
-    return img;
-  }
-
-  function yOf(p, pMin, pMax, h) {
-    const t = (p - pMin) / (pMax - pMin);
-    return h - t*h;
-  }
-
-  function rowOfPrice(p) {
-    return Math.floor((p - heat.anchorMinPrice) / heat.binUsd);
-  }
-
-  // Bookmap-like palette: light blue -> cyan -> yellow -> orange -> red (strongest)
-  function heatRGBA(a) {
-    // apply contrast (gamma) around center
-    // heatCtr=0..1 => gamma range [0.6..2.2] (higher => more contrast)
-    const gamma = 0.6 + (2.2 - 0.6) * heatCtr;
-    const g = Math.pow(clamp(a,0,1), gamma);
-
-    // piecewise gradient
-    let r=0, gg=0, b=0, alpha=0;
-    if (g < 0.25) {
-      // very weak: light blue
-      const t = g / 0.25;
-      r = 30 + 20*t;      // 30 -> 50
-      gg = 120 + 80*t;    // 120 -> 200
-      b = 220 + 20*(1-t); // 220 -> 200
-      alpha = 0.10 + 0.30*t;
-    } else if (g < 0.50) {
-      // cyan -> yellow
-      const t = (g - 0.25) / 0.25;
-      r = 50 + 180*t;     // 50 -> 230
-      gg = 200 + 40*t;    // 200 -> 240
-      b = 200*(1-t);      // 200 -> 0
-      alpha = 0.25 + 0.35*t;
-    } else if (g < 0.75) {
-      // yellow -> orange
-      const t = (g - 0.50) / 0.25;
-      r = 230 + 20*t;     // 230 -> 250
-      gg = 240 - 80*t;    // 240 -> 160
-      b = 0;
-      alpha = 0.45 + 0.35*t;
-    } else {
-      // orange -> red (strongest)
-      const t = (g - 0.75) / 0.25;
-      r = 250;
-      gg = 160*(1-t);     // 160 -> 0
-      b = 0;
-      alpha = 0.70 + 0.30*t;
-    }
-    return [r|0, gg|0, b|0, clamp(alpha, 0, 1)];
-  }
-
-  function draw() {
-    try {
-const w = cv.width;
-    const h = cv.height;
-
-    ctx.clearRect(0,0,w,h);
-    ctx.fillStyle = "#0b0f14";
+  function drawError(msg) {{
+    const w = cv.width/(window.devicePixelRatio||1);
+    const h = cv.height/(window.devicePixelRatio||1);
+    ctx.save();
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle = "#120000";
     ctx.fillRect(0,0,w,h);
+    ctx.fillStyle = "#ff4d4d";
+    ctx.font = "14px -apple-system, system-ui, sans-serif";
+    const lines = (""+msg).split("\\n").slice(0, 10);
+    let y = 20;
+    for (const ln of lines) {{
+      ctx.fillText(ln, 10, y);
+      y += 18;
+    }}
+    ctx.restore();
+  }}
 
-    if (!last || viewMid === null || viewSpan === null) {
-      ctx.fillStyle = "#94a3b8";
-      ctx.font = "28px -apple-system, system-ui, Arial";
-      ctx.fillText("Waiting for data...", 24, 48);
-      requestAnimationFrame(draw);
-      return;
-    }
+  function draw() {{
+    try {{
+      const w = cv.width/(window.devicePixelRatio||1);
+      const h = cv.height/(window.devicePixelRatio||1);
 
-    if (autoFollow && (midPx || lastPx)) {
-      viewMid = (midPx ?? lastPx);
-    }
+      // Background
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, w, h);
 
-    const pMin = viewMid - viewSpan/2;
-    const pMax = viewMid + viewSpan/2;
+      // If no state yet, show waiting text
+      if (!st || !isFinite(st.mid_px)) {{
+        ctx.fillStyle = "#9aa3b2";
+        ctx.font = "14px -apple-system, system-ui, sans-serif";
+        ctx.fillText("Waiting for data…", 10, 24);
+        requestAnimationFrame(draw);
+        return;
+      }}
 
-    // ---- HEATMAP ----
-    if (heat.ready && heat.head >= 0 && heat.anchorMinPrice !== null) {
-      const colsVisible = clamp(Math.floor((timeSpanSec*1000) / heat.colMs), 10, heat.cols);
-      const head = heat.head;
-      const startCol = head - colsVisible + 1;
+      const mid = st.mid_px;
+      const pmin = mid - RANGE_USD;
+      const pmax = mid + RANGE_USD;
 
-      let rTop = rowOfPrice(pMax);
-      let rBot = rowOfPrice(pMin);
-      rTop = clamp(rTop, 0, heat.rows-1);
-      rBot = clamp(rBot, 0, heat.rows-1);
-      if (rBot < rTop) { const tmp=rTop; rTop=rBot; rBot=tmp; }
-      const rowsVisible = clamp((rBot - rTop + 1), 50, heat.rows);
+      // Heat render
+      // Map each column to x-range across canvas
+      const colW = w / heat.cols;
 
-      const img = ensureImg(colsVisible, rowsVisible);
-      const data = img.data;
+      // Bookmap-like palette: blue (weak) -> cyan -> yellow -> orange -> red (strong)
+      function colorFor(v) {{
+        // v in [0..255]
+        if (v <= 0) return null;
+        const t = v / 255.0;
+        // piecewise gradient
+        let r=0,g=0,b=0,a=1.0;
+        if (t < 0.25) {{
+          // dark->light blue
+          const u = t/0.25;
+          r = 10*u; g = 80*u; b = 255;
+          a = 0.70;
+        }} else if (t < 0.5) {{
+          const u = (t-0.25)/0.25;
+          r = 0; g = 255*u; b = 255;
+          a = 0.78;
+        }} else if (t < 0.75) {{
+          const u = (t-0.5)/0.25;
+          r = 255*u; g = 255; b = 255*(1-u);
+          a = 0.85;
+        }} else {{
+          const u = (t-0.75)/0.25;
+          r = 255; g = 255*(1-u); b = 0;
+          a = 0.92;
+        }}
+        return `rgba(${{r|0}},${{g|0}},${{b|0}},${{a}})`;
+      }}
 
-      // Exposure: compute robust vmax on recent sample; then apply "heatDim"
-      // heatDim low => brighter (reduce vmax), high => dimmer (increase vmax)
-      // Exposure / auto-exposure (robust percentiles; avoids "all red" haze)
-      let vmax = 255;
-      let floor = 0;
-      let sampleN = 0;
-
-      if (autoExp) {
-        const sample = [];
-        const cols = heat.cols, rows = heat.rows;
-        const x0 = Math.max(0, Math.floor((viewT0 - heat.t0) / heat.dt));
-        const x1 = Math.min(cols - 1, Math.floor(((viewT0 + viewSpan * 1000) - heat.t0) / heat.dt));
-
-        // sample every Nth row/col for speed
-        const stepX = Math.max(1, Math.floor((x1 - x0 + 1) / 180));
-        const stepY = Math.max(1, Math.floor(rows / 140));
-
-        for (let x = x0; x <= x1; x += stepX) {
-          const col = heat.ring[x];
-          if (!col) continue;
-          for (let y = 0; y < rows; y += stepY) {
-            const v = col[y] || 0;
-            if (v > 0) sample.push(v);
-          }
-        }
-
-        sampleN = sample.length;
-        if (sampleN > 0) {
-          sample.sort((a, b) => a - b);
-
-          // Heat Thr slider = percentile floor (0..1). A slightly higher floor when dimmer is desired.
-          const thrPct = clamp(100 * heatThr + 10 * heatDim, 0, 98.5);
-          floor = percentile(sample, thrPct);
-
-          // Robust vmax = high percentile (prevents a single spike from flattening contrast)
-          vmax = percentile(sample, 99.7);
-
-          // ensure ordering
-          vmax = Math.max(floor + 1, vmax);
-        }
-      } else {
-        floor = 0;
-        vmax = 255;
-      }
-
-      // Precompute a per-x "price path" from trades so we can locally attenuate heat near the traded path
-      // (gives a Bookmap-like "liquidity gets eaten" effect).
-      const colsVisible = w;
-      const pxAt = new Float32Array(colsVisible);
-      pxAt.fill(NaN);
-      for (const tr of trades) {
-        const tms = tr.t || tr.ts || tr.T || 0;
-        const p = tr.p;
-        if (!tms || !p) continue;
-        const frac = (tms - viewT0) / (viewSpan * 1000);
-        const x = Math.floor(frac * colsVisible);
-        if (x >= 0 && x < colsVisible) pxAt[x] = p;
-      }
-      // forward/back fill gaps for a continuous path
-      let last = NaN;
-      for (let x = 0; x < colsVisible; x++) {
-        if (!Number.isNaN(pxAt[x])) last = pxAt[x];
-        else if (!Number.isNaN(last)) pxAt[x] = last;
-      }
-      let next = NaN;
-      for (let x = colsVisible - 1; x >= 0; x--) {
-        if (!Number.isNaN(pxAt[x])) next = pxAt[x];
-        else if (!Number.isNaN(next)) pxAt[x] = next;
-      }
-
-      heatDebug = `vmax=${fmt(vmax)} floor=${fmt(floor)} drawn=${drawn} skip=${skip} sample=${sampleN}`;
-      // fill pixels
-      for (let x = 0; x < colsVisible; x++) {
-        const colIdx = startCol + x;
-        const col = heat.ring[((colIdx % heat.cols) + heat.cols) % heat.cols];
+      for (let k = 0; k < heat.cols; k++) {{
+        // oldest on left, newest on right
+        const idx = (heat.head + 1 + k) % heat.cols;
+        const col = heat.ring[idx];
         if (!col) continue;
+        const x0 = k * colW;
+        // draw as vertical strips of 1px-high rows (scaled)
+        for (let r = 0; r < heat.rows; r++) {{
+          const v = col[r];
+          if (!v) continue;
+          const y = h - (r+1) * (h / heat.rows);
+          const c = colorFor(v);
+          if (!c) continue;
+          ctx.fillStyle = c;
+          ctx.fillRect(x0, y, colW + 1, (h/heat.rows) + 1);
+        }}
+      }}
 
-        for (let y = 0; y < rowsVisible; y++) {
-          const row = rTop + y;
-          let v = col[row] || 0;
-          if (v <= 0) continue;
-
-          // Local "consumption" attenuation near the traded path
-          const px = pxAt[x] || NaN;
-          if (!Number.isNaN(px)) {
-            const rpx = rowOfPrice(px);
-            const d = Math.abs(row - rpx);
-            const consumeR = 4;            // rows
-            if (d <= consumeR) {
-              const k = 0.65 * (1 - (d / consumeR));
-              v = v * (1 - k);
-            }
-          }
-
-          // Threshold (floor) and robust log compression for Bookmap-like separation
-          const vv = v - floor;
-          if (vv <= 0) continue;
-
-          const denom = Math.max(1, vmax - floor);
-          const dimK = 10 + 80 * (1 - heatDim); // higher = more linear; lower = more compression
-          let a = Math.log1p(dimK * vv) / Math.log1p(dimK * denom);
-
-          // additional contrast control (Heat Ctr): shift mid-tones without changing saturation
-          a = clamp(Math.pow(a, 0.65 + 1.35 * (1 - heatCtr)), 0, 1);
-
-          const [rr, gg, bb, aa] = heatRGBA(a);
-          const i = (y*colsVisible + x) * 4;
-          data[i+0] = rr;
-          data[i+1] = gg;
-          data[i+2] = bb;
-          data[i+3] = Math.floor(255 * aa * (1 - 0.45 * heatDim));
-        }
-      }
-
-      octx.putImageData(img, 0, 0);
-      ctx.imageSmoothingEnabled = true;
-      ctx.drawImage(off, 0, 0, w, h);
-    }
-
-    // grid
-    ctx.strokeStyle = "rgba(148,163,184,0.08)";
-    ctx.lineWidth = 1;
-    for (let k=1;k<8;k++) {
-      const yy = (h/8)*k;
-      ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(w, yy); ctx.stroke();
-    }
-
-    // ---- Trade bubbles ----
-    const now = Date.now();
-    const windowMs = timeSpanSec * 1000;
-    const xOf = (tms) => {
-      const dtm = now - tms;
-      const frac = 1 - (dtm / windowMs);
-      return clamp(frac, 0, 1) * w;
-    };
-
-    let vMax = 0;
-    for (const t of trades) vMax = Math.max(vMax, t.v || 0);
-    vMax = Math.max(vMax, 1e-9);
-
-    for (const t of trades) {
-      const p = t.p;
-      if (!(p >= pMin && p <= pMax)) continue;
-      const vv = (t.v || 0);
-      const vFrac = Math.sqrt(vv / vMax);
-      if (vFrac < bubMin) continue;
-
-      const x = xOf(t.t);
-      const y = yOf(p, pMin, pMax, h);
-
-      const r = (1.5 + 16 * vFrac) * bubSz;
-      const isBuy = (t.T === 1);
+      // Price line (PRIMARY = mid)
+      const py = h - ((mid - pmin) / (pmax - pmin)) * h;
+      ctx.strokeStyle = "rgba(255,255,255,0.85)";
+      ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.fillStyle = isBuy ? `rgba(59,130,246,${bubOp})` : `rgba(245,158,11,${bubOp})`;
-      ctx.arc(x, y, r, 0, Math.PI*2);
-      ctx.fill();
-    }
+      ctx.moveTo(0, py);
+      ctx.lineTo(w, py);
+      ctx.stroke();
 
-    // price lines
-    if (lastPx) {
-      const y = yOf(lastPx, pMin, pMax, h);
-      ctx.strokeStyle = "rgba(226,232,240,0.9)";
-      ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
+      // Minimal bubbles (aggressive trades)
+      // Draw last ~300 trades inside visible range
+      const maxDraw = 300;
+      let drawn = 0;
+      for (let i = trades.length - 1; i >= 0 && drawn < maxDraw; i--) {{
+        const tr = trades[i];
+        const p = tr.p;
+        if (p < pmin || p > pmax) continue;
+        // x based on ts in window
+        const ts = tr.ts || Date.now();
+        const now = Date.now();
+        const x = ( (ts - (now - WINDOW_SEC*1000)) / (WINDOW_SEC*1000) ) * w;
+        const y = h - ((p - pmin) / (pmax - pmin)) * h;
+        const v = Math.max(0.05, Math.min(6.0, Math.log1p(tr.v || 1)));
+        ctx.fillStyle = (tr.side === "buy") ? "rgba(0,220,255,0.75)" : "rgba(255,90,90,0.75)";
+        ctx.beginPath();
+        ctx.arc(x, y, v, 0, Math.PI*2);
+        ctx.fill();
+        drawn++;
+      }}
 
-      ctx.fillStyle = "rgba(226,232,240,0.9)";
-      ctx.font = "24px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      ctx.fillText(`TRADE ${lastPx.toFixed(1)}`, 24, clamp(y-10, 28, h-16));
-    }
-    if (midPx) {
-      const y = yOf(midPx, pMin, pMax, h);
-      ctx.strokeStyle = "rgba(147,197,253,0.45)";
-      ctx.lineWidth = 2;
-      ctx.setLineDash([10,10]);
-      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
-      ctx.setLineDash([]);
+      requestAnimationFrame(draw);
+    }} catch (e) {{
+      drawError(`JS ERROR (${BUILD})\\n${{e && e.name ? e.name : "Error"}}: ${{e && e.message ? e.message : e}}\\n${{(e && e.stack) ? e.stack : ""}}`);
+      requestAnimationFrame(draw);
+    }}
+  }}
 
-      ctx.fillStyle = "rgba(147,197,253,0.9)";
-      ctx.font = "24px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      ctx.fillText(`MID   ${midPx.toFixed(1)}`, 24, clamp(y-10, 28, h-16));
-    }
+  // WS connect to UI stream
+  function wsUrl() {{
+    const proto = (location.protocol === "https:") ? "wss:" : "ws:";
+    return proto + "//" + location.host + "/uiws";
+  }}
 
-    // footer
-    ctx.fillStyle = "rgba(148,163,184,0.95)";
-    ctx.font = "22px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-    ctx.fillText(
-      `Tspan=${timeSpanSec.toFixed(0)}s | Pspan=${viewSpan.toFixed(1)} | AutoExp=${autoExp?"ON":"OFF"} | Dim=${heatDim.toFixed(2)} Thr=${heatThr.toFixed(2)} Ctr=${heatCtr.toFixed(2)}`,
-      24, h - 20
-    );
+  function connect() {{
+    const ws = new WebSocket(wsUrl());
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {{ dot.style.background = "#2ecc71"; }};
+    ws.onclose = () => {{ dot.style.background = "#e74c3c"; setTimeout(connect, 700); }};
+    ws.onerror = () => {{ dot.style.background = "#e67e22"; }};
+    ws.onmessage = (ev) => {{
+      try {{
+        const msg = JSON.parse(ev.data);
+        if (msg.type === "state") {{
+          st = msg.state;
+          elMid.textContent = fmt(st.mid_px);
+          elLast.textContent = fmt(st.last_px);
+          elBid.textContent = fmt(st.best_bid);
+          elAsk.textContent = fmt(st.best_ask);
+          elDAge.textContent = (st.depth_age_ms ?? "-");
+          elTAge.textContent = (st.trade_age_ms ?? "-");
+          elNA.textContent = `${{st.bids_n}}/${{st.asks_n}}`;
+          elNT.textContent = `${{st.trades_n}}`;
+        }} else if (msg.type === "heat_col") {{
+          const colIdx = msg.col_idx|0;
+          const u8 = new Uint8Array(atob(msg.b64).split("").map(c => c.charCodeAt(0)));
+          heat.ring[colIdx] = u8;
+          heat.head = colIdx;
+          heat.head_ts = msg.ts_ms|0;
+          heat.patches += 1;
+        }} else if (msg.type === "trade") {{
+          const tr = msg.trade;
+          if (tr && isFinite(tr.p)) {{
+            trades.push(tr);
+            if (trades.length > TRADES_MAX) trades.splice(0, trades.length - TRADES_MAX);
+          }}
+        }}
+      }} catch (e) {{
+        // show in canvas
+        drawError(`WS MSG ERROR (${BUILD})\\n${{e && e.name ? e.name : "Error"}}: ${{e && e.message ? e.message : e}}\\nraw=${{String(ev.data).slice(0,200)}}`);
+      }}
+    }};
+  }}
 
-    requestAnimationFrame(draw);
-  }
-
+  connect();
   requestAnimationFrame(draw);
-})();
+}})();
 </script>
 </body>
 </html>
 """
 
-@app.on_event("startup")
-async def startup() -> None:
-    asyncio.create_task(feed.run())
+# -------------------------
+# MEXC WS ingestion task
+# -------------------------
+async def mexc_ws_task(app: web.Application) -> None:
+    ob: OrderBookState = app["ob"]
+    heat: HeatHistory = app["heat"]
+    clients: set = app["clients"]
 
-@app.get("/")
-async def index():
-    return HTMLResponse(HTML)
+    # subscribe payloads
+    sub_depth = {"method":"sub.depth", "param":{"symbol":SYMBOL_WS}}
+    sub_deal  = {"method":"sub.deal",  "param":{"symbol":SYMBOL_WS}}
 
-@app.get("/health")
-async def health():
-    feed._update_bba_mid()
-    return {
-        "service": "quantdesk-bookmap-ui",
+    backoff = 0.5
+    while True:
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.ws_connect(WS_URL, heartbeat=20, autoping=True, compress=0) as ws:
+                    await ws.send_str(json.dumps(sub_depth))
+                    await ws.send_str(json.dumps(sub_deal))
+
+                    app["ws_ok"] = True
+                    app["ws_since_ms"] = now_ms()
+                    backoff = 0.5
+
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                            except Exception:
+                                continue
+                            ch = data.get("channel") or data.get("c") or ""
+                            if ch == "push.depth":
+                                payload = data.get("data") or {}
+                                bids = payload.get("bids") or []
+                                asks = payload.get("asks") or []
+                                if bids:
+                                    ob.apply_depth_update("bids", bids)
+                                if asks:
+                                    ob.apply_depth_update("asks", asks)
+                            elif ch == "push.deal":
+                                payload = data.get("data") or []
+                                # MEXC can send list of deals
+                                for d in payload:
+                                    p = safe_float(d.get("p"), None)
+                                    v = safe_float(d.get("v"), 0.0)
+                                    T = d.get("T")  # 1 buy, 2 sell
+                                    ts = d.get("t") or d.get("ts") or now_ms()
+                                    if p is None:
+                                        continue
+                                    side = "buy" if str(T) == "1" or T == 1 else "sell"
+                                    ob.apply_trade(p, v, int(ts))
+                                    # broadcast trade to clients
+                                    if clients:
+                                        out = {"type":"trade","trade":{"p":p,"v":v,"ts":int(ts),"side":side}}
+                                        dead = []
+                                        for c in list(clients):
+                                            try:
+                                                await c.send_str(json.dumps(out))
+                                            except Exception:
+                                                dead.append(c)
+                                        for c in dead:
+                                            clients.discard(c)
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            raise msg.data
+        except Exception:
+            app["ws_ok"] = False
+            # small backoff loop
+            await asyncio.sleep(backoff)
+            backoff = min(10.0, backoff * 1.7)
+
+# -------------------------
+# Heat writer task (fixed cadence)
+# -------------------------
+async def heat_writer_task(app: web.Application) -> None:
+    ob: OrderBookState = app["ob"]
+    heat: HeatHistory = app["heat"]
+    clients: set = app["clients"]
+
+    next_ts = time.time()
+    prev_px = None
+
+    while True:
+        try:
+            now = time.time()
+            if now < next_ts:
+                await asyncio.sleep(next_ts - now)
+            next_ts += COL_DT_SEC
+
+            # Need mid to center range
+            mid = ob.last_mid
+            if mid is None:
+                continue
+
+            # Advance column and rasterize book
+            ts_ms = now_ms()
+            col_idx = heat.advance(ts_ms)
+            col = heat.current_col()
+            if col is None:
+                continue
+
+            vmax, floor_v = rasterize_book_to_col(ob, mid, col)
+
+            # Consumption hint: cap along path of last traded move
+            if ob._prev_last_px is not None and ob.last_px is not None:
+                heat.apply_consumption_corridor(ob._prev_last_px, ob.last_px, mid)
+
+            # Broadcast heat column
+            if clients:
+                out = {"type":"heat_col","col_idx":col_idx,"ts_ms":ts_ms,"b64":heat.encode_col_b64(col)}
+                dead = []
+                payload = json.dumps(out)
+                for c in list(clients):
+                    try:
+                        await c.send_str(payload)
+                    except Exception:
+                        dead.append(c)
+                for c in dead:
+                    clients.discard(c)
+
+            heat.patches += 1
+        except Exception:
+            await asyncio.sleep(0.25)
+
+# -------------------------
+# State broadcaster task
+# -------------------------
+async def state_broadcast_task(app: web.Application) -> None:
+    ob: OrderBookState = app["ob"]
+    clients: set = app["clients"]
+    while True:
+        await asyncio.sleep(0.25)
+        if not clients:
+            continue
+        d_age = (now_ms() - ob.last_depth_ts) if ob.last_depth_ts else None
+        t_age = (now_ms() - ob.last_trade_ts) if ob.last_trade_ts else None
+        st = {
+            "service":"quantdesk-bookmap-ui",
+            "build": BUILD_TAG,
+            "symbol": SYMBOL_WS,
+            "ws_url": WS_URL,
+            "ws_ok": bool(app.get("ws_ok", False)),
+            "last_px": ob.last_px,
+            "mid_px": ob.last_mid,
+            "best_bid": ob.best_bid,
+            "best_ask": ob.best_ask,
+            "bids_n": ob.bids_n,
+            "asks_n": ob.asks_n,
+            "trades_n": ob.trades_n,
+            "depth_age_ms": d_age,
+            "trade_age_ms": t_age,
+            "cols": COLS,
+            "rows": ROWS,
+            "range_usd": RANGE_USD,
+            "bin_usd": BIN_USD,
+        }
+        out = {"type":"state","state":st}
+        dead = []
+        payload = json.dumps(out)
+        for c in list(clients):
+            try:
+                await c.send_str(payload)
+            except Exception:
+                dead.append(c)
+        for c in dead:
+            clients.discard(c)
+
+# -------------------------
+# HTTP handlers
+# -------------------------
+async def handle_root(request: web.Request) -> web.Response:
+    return web.Response(text=HTML, content_type="text/html")
+
+async def handle_health(request: web.Request) -> web.Response:
+    app = request.app
+    ob: OrderBookState = app["ob"]
+    d_age = (now_ms() - ob.last_depth_ts) if ob.last_depth_ts else None
+    t_age = (now_ms() - ob.last_trade_ts) if ob.last_trade_ts else None
+    return web.json_response({
+        "service":"quantdesk-bookmap-ui",
+        "build": BUILD_TAG,
         "symbol": SYMBOL_WS,
         "ws_url": WS_URL,
-        "ws_ok": feed.ws_ok,
-        "last_px": feed.last_px,
-        "mid_px": feed.mid_px,
-        "best_bid": feed.best_bid,
-        "best_ask": feed.best_ask,
-        "bids_n": len(feed.book.bids),
-        "asks_n": len(feed.book.asks),
-        "trades_n": len(feed.trades.dq),
-        "depth_age_ms": (now_ms() - feed.last_depth_ms) if feed.last_depth_ms else None,
-        "trade_age_ms": (now_ms() - feed.last_trade_ms) if feed.last_trade_ms else None,
-    }
+        "ws_ok": bool(app.get("ws_ok", False)),
+        "last_px": ob.last_px,
+        "mid_px": ob.last_mid,
+        "best_bid": ob.best_bid,
+        "best_ask": ob.best_ask,
+        "bids_n": ob.bids_n,
+        "asks_n": ob.asks_n,
+        "trades_n": ob.trades_n,
+        "depth_age_ms": d_age,
+        "trade_age_ms": t_age,
+        "window_sec": WINDOW_SEC,
+        "col_dt_sec": COL_DT_SEC,
+        "cols": COLS,
+        "rows": ROWS,
+        "range_usd": RANGE_USD,
+        "bin_usd": BIN_USD,
+    })
 
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-    await ws.accept()
-    await feed.add_client(ws)
+async def handle_uiws(request: web.Request) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse(heartbeat=20)
+    await ws.prepare(request)
+    request.app["clients"].add(ws)
+
+    # Send an immediate state snapshot
+    ob: OrderBookState = request.app["ob"]
+    d_age = (now_ms() - ob.last_depth_ts) if ob.last_depth_ts else None
+    t_age = (now_ms() - ob.last_trade_ts) if ob.last_trade_ts else None
+    st = {
+        "service":"quantdesk-bookmap-ui",
+        "build": BUILD_TAG,
+        "symbol": SYMBOL_WS,
+        "ws_url": WS_URL,
+        "ws_ok": bool(request.app.get("ws_ok", False)),
+        "last_px": ob.last_px,
+        "mid_px": ob.last_mid,
+        "best_bid": ob.best_bid,
+        "best_ask": ob.best_ask,
+        "bids_n": ob.bids_n,
+        "asks_n": ob.asks_n,
+        "trades_n": ob.trades_n,
+        "depth_age_ms": d_age,
+        "trade_age_ms": t_age,
+        "cols": COLS,
+        "rows": ROWS,
+        "range_usd": RANGE_USD,
+        "bin_usd": BIN_USD,
+    }
+    await ws.send_str(json.dumps({"type":"state","state":st}))
+
+    # Keep connection open
     try:
-        while True:
-            await asyncio.sleep(10)
-    except Exception:
-        pass
+        async for _ in ws:
+            pass
     finally:
-        await feed.remove_client(ws)
+        request.app["clients"].discard(ws)
+    return ws
+
+# -------------------------
+# App bootstrap
+# -------------------------
+async def on_startup(app: web.Application) -> None:
+    app["ws_ok"] = False
+    app["ws_since_ms"] = None
+    app["ob"] = OrderBookState()
+    app["heat"] = HeatHistory(COLS, ROWS)
+    app["clients"] = set()
+
+    app["tasks"] = [
+        asyncio.create_task(mexc_ws_task(app)),
+        asyncio.create_task(heat_writer_task(app)),
+        asyncio.create_task(state_broadcast_task(app)),
+    ]
+
+async def on_cleanup(app: web.Application) -> None:
+    for t in app.get("tasks", []):
+        t.cancel()
+    await asyncio.gather(*app.get("tasks", []), return_exceptions=True)
+
+def make_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/uiws", handle_uiws)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=PORT)
+    port = int(os.environ.get("PORT", os.environ.get("QD_PORT", "8000")))
+    host = os.environ.get("QD_HOST", "0.0.0.0")
+    web.run_app(make_app(), host=host, port=port, access_log=None)
