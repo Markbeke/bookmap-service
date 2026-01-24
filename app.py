@@ -73,7 +73,7 @@ MEM_ACTIVATION_MODE = (os.getenv("MEM_ACTIVATION_MODE", "rational") or "rational
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX4"
+BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX4_1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -1179,6 +1179,18 @@ async def index() -> str:
     if (bucketBins && bucketBins.length) {
       bins = bins.concat(bucketBins);
       maxv = Math.max(maxv, bucketMax || 0);
+    }
+
+    // Global ladder memory overlay (persistent levels) — FIX4_1
+    let memBins = (snap && snap.mem_bins) ? snap.mem_bins : [];
+    let memMax = (snap && snap.mem_max) ? snap.mem_max : 0;
+    if (wideMode && snap && snap.wide_mem_bins && snap.wide_mem_bins.length) {
+      memBins = snap.wide_mem_bins;
+      memMax = (snap.wide_mem_max) ? snap.wide_mem_max : memMax;
+    }
+    if (memBins && memBins.length) {
+      bins = bins.concat(memBins);
+      maxv = Math.max(maxv, memMax || 0);
     }
 
     const { lo, hi } = viewBounds(snap);
