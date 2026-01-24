@@ -57,11 +57,20 @@ BUCKETS_ENABLED = int(os.getenv("QD_BUCKETS", "1")) == 1
 BUCKET_SCALE_MODE_DEFAULT = os.getenv("QD_BUCKET_SCALE_MODE", "auto").strip().lower()
 BUCKET_CAP_PER_SCALE = int(os.getenv("QD_BUCKET_CAP_PER_SCALE", "1200"))
 
+# --- Global Ladder Memory Engine (FIX13) ---
+# Purpose: retain a decaying memory of depth levels beyond current top-N view,
+# so "bands" persist visually across time and across viewport changes.
+MEM_ENABLE = os.getenv("MEM_ENABLE", "1").strip() not in ("0", "false", "False")
+MEM_BIN_USD = float(os.getenv("MEM_BIN_USD", str(BIN_USD)))  # binning for memory; defaults to BIN_USD
+MEM_HALFLIFE_SEC = float(os.getenv("MEM_HALFLIFE_SEC", "1800"))  # 30m half-life
+MEM_CAP_BINS = int(os.getenv("MEM_CAP_BINS", "50000"))  # hard cap to prevent unbounded growth
+MEM_MIN_QTY = float(os.getenv("MEM_MIN_QTY", "0"))  # ignore memory updates below this qty
+
 # Fixed coarse layers used for persistence; we pick nearest based on viewport.
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX12_BUCKETS_FIX8_NEWTAB_STABILITY"
+BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -228,6 +237,73 @@ def _prune_depth() -> None:
 BUCKETS: Dict[float, Dict[float, float]] = {s: {} for s in BUCKET_SCALES_USD}
 BUCKETS_LAST_MS: Dict[float, int] = {s: 0 for s in BUCKET_SCALES_USD}
 
+
+
+# Global ladder memory: price_bin -> strength (qty); decays over time.
+LADDER_MEM: Dict[float, float] = {}
+LADDER_MEM_LAST_MS: int = 0
+
+def _mem_bin(px: float) -> float:
+    # bin to MEM_BIN_USD while keeping nice decimal (avoid float noise)
+    if MEM_BIN_USD <= 0:
+        return float(px)
+    b = round(px / MEM_BIN_USD) * MEM_BIN_USD
+    return float(f"{b:.2f}")
+
+def _ladder_mem_decay(now_ms: int) -> None:
+    global LADDER_MEM_LAST_MS, LADDER_MEM
+    if not MEM_ENABLE:
+        return
+    if LADDER_MEM_LAST_MS <= 0:
+        LADDER_MEM_LAST_MS = now_ms
+        return
+    dt = max(0.0, (now_ms - LADDER_MEM_LAST_MS) / 1000.0)
+    if dt <= 0:
+        return
+    # Exponential decay with half-life
+    hl = max(1.0, MEM_HALFLIFE_SEC)
+    decay = 0.5 ** (dt / hl)
+    if decay >= 0.999:
+        LADDER_MEM_LAST_MS = now_ms
+        return
+    if LADDER_MEM:
+        # In-place decay; prune near-zero
+        to_del = []
+        for k, v in LADDER_MEM.items():
+            nv = v * decay
+            if nv <= 1e-9:
+                to_del.append(k)
+            else:
+                LADDER_MEM[k] = nv
+        for k in to_del:
+            LADDER_MEM.pop(k, None)
+    LADDER_MEM_LAST_MS = now_ms
+
+def ladder_mem_update_from_book(now_ms: int) -> None:
+    # Called after applying a depth update; adds current book levels to memory.
+    if not MEM_ENABLE:
+        return
+    _ladder_mem_decay(now_ms)
+    # merge bids/asks into memory
+    for px, qty in BIDS.items():
+        if qty <= MEM_MIN_QTY:
+            continue
+        b = _mem_bin(px)
+        prev = LADDER_MEM.get(b, 0.0)
+        if qty > prev:
+            LADDER_MEM[b] = float(qty)
+    for px, qty in ASKS.items():
+        if qty <= MEM_MIN_QTY:
+            continue
+        b = _mem_bin(px)
+        prev = LADDER_MEM.get(b, 0.0)
+        if qty > prev:
+            LADDER_MEM[b] = float(qty)
+    # cap size (keep strongest bins)
+    if len(LADDER_MEM) > MEM_CAP_BINS:
+        # keep top MEM_CAP_BINS by strength
+        items = sorted(LADDER_MEM.items(), key=lambda kv: kv[1], reverse=True)[:MEM_CAP_BINS]
+        LADDER_MEM = {k: v for k, v in items}
 
 def _bucket_decay_factor(scale_usd: float, now_ms: int) -> float:
     last = int(BUCKETS_LAST_MS.get(scale_usd) or 0)
@@ -475,6 +551,7 @@ async def mexc_consumer_loop() -> None:
                         LAST_DEPTH_MS = now_ms
                         _prune_depth()
                         _update_buckets_from_book(now_ms)
+                        ladder_mem_update_from_book(now_ms)
 
                         async with STATE_LOCK:
                             _recompute_tob()
@@ -638,6 +715,7 @@ async def index() -> str:
   const MAX_EMA_ALPHA = 0.08;
 
   let emaMax = 0.0;
+    let heatPrimed = false;
   const MAXV_WIN = 240;
   const maxvHist = new Array(MAXV_WIN);
   let maxvIdx = 0;
@@ -740,6 +818,18 @@ async def index() -> str:
       if (bucketBins && bucketBins.length) {
         bins = bins.concat(bucketBins);
         maxv = Math.max(maxv, bucketMax || 0);
+      }
+
+      // include ladder memory bins too (global decayed memory)
+      let memBins = (snap && snap.mem_bins) ? snap.mem_bins : [];
+      let memMax = (snap && snap.mem_max) ? snap.mem_max : 0;
+      if (wideMode && snap && snap.wide_mem_bins && snap.wide_mem_bins.length) {
+        memBins = snap.wide_mem_bins;
+        memMax = (snap.wide_mem_max) ? snap.wide_mem_max : memMax;
+      }
+      if (memBins && memBins.length) {
+        bins = bins.concat(memBins);
+        maxv = Math.max(maxv, memMax || 0);
       }
       if (!bins || bins.length === 0 || !isFinite(maxv) || maxv <= 0) return;
 
@@ -854,18 +944,24 @@ async def index() -> str:
 
     // shift existing heat left (time) WITHOUT allocating a temp canvas each tick
     // This is critical for iPad/Safari stability in a standalone tab.
-    hctx.save();
-    hctx.globalCompositeOperation = 'copy';
-    hctx.drawImage(heat, -COL_PX, 0);
-    hctx.restore();
+    if (heatPrimed) {
+      hctx.save();
+      hctx.globalCompositeOperation = 'copy';
+      hctx.drawImage(heat, -COL_PX, 0);
+      hctx.restore();
 
-    // fade old heat (time-decay)
-    hctx.fillStyle = `rgba(0,0,0,${DECAY_ALPHA})`;
-    hctx.fillRect(0, 0, W, H);
+      // fade old heat (time-decay)
+      hctx.fillStyle = `rgba(0,0,0,${DECAY_ALPHA})`;
+      hctx.fillRect(0, 0, W, H);
 
-    // clear newest column region (right edge)
-    hctx.fillStyle = '#000';
-    hctx.fillRect(W - COL_PX, 0, COL_PX, H);
+      // clear newest column region (right edge)
+      hctx.fillStyle = '#000';
+      hctx.fillRect(W - COL_PX, 0, COL_PX, H);
+    } else {
+      // first frame: clean slate so we can prefill the full width
+      hctx.fillStyle = '#000';
+      hctx.fillRect(0, 0, W, H);
+    }
 
     let bins = (snap && snap.heat_bins) ? snap.heat_bins : [];
     let maxv = (snap && snap.heat_max) ? snap.heat_max : 0;
@@ -1035,6 +1131,17 @@ async def index() -> str:
         }
       }
       hctx.globalAlpha = 1.0;
+      if (!heatPrimed) {
+        try {
+          const col = hctx.getImageData(W - COL_PX, 0, COL_PX, H);
+          for (let x = 0; x <= W - COL_PX; x += COL_PX) {
+            hctx.putImageData(col, x, 0);
+          }
+        } catch (e) {
+          // ignore (some browsers may restrict in rare cases)
+        }
+        heatPrimed = true;
+      }
     }
   }
 
@@ -1361,6 +1468,30 @@ async def snapshot(request: Request) -> JSONResponse:
                     wide_bucket_bins, wide_bucket_max, wide_bucket_usd_val = _build_bucket_bins(float(center_px), float(WIDE_RANGE_USD), bucket_mode)
                     wide_bucket_usd = wide_bucket_usd_val
 
+
+        # Global ladder memory bins (decayed)
+        mem_bins: List[List[float]] = []
+        mem_max = 0.0
+        wide_mem_bins: List[List[float]] = []
+        wide_mem_max = 0.0
+        wide_mem_usd: Optional[float] = None
+        if MEM_ENABLE:
+            _ladder_mem_decay(now_ms)
+            # current view memory
+            for px, val in LADDER_MEM.items():
+                if lo <= px <= hi:
+                    mem_bins.append([float(px), float(val)])
+                    if val > mem_max:
+                        mem_max = float(val)
+            if center_px is not None:
+                wlo = center_px - float(wide_range_usd)
+                whi = center_px + float(wide_range_usd)
+                for px, val in LADDER_MEM.items():
+                    if wlo <= px <= whi:
+                        wide_mem_bins.append([float(px), float(val)])
+                        if val > wide_mem_max:
+                            wide_mem_max = float(val)
+                wide_mem_usd = float(wide_range_usd)
             payload = {
                 "ok": True,
                 "build": BUILD,
@@ -1393,6 +1524,11 @@ async def snapshot(request: Request) -> JSONResponse:
                 "wide_bucket_usd": (float(wide_bucket_usd) if wide_bucket_usd is not None else None),
                 "wide_bucket_bins": wide_bucket_bins,
                 "wide_bucket_max": float(wide_bucket_max),
+                "mem_bins": mem_bins,
+                "mem_max": float(mem_max),
+                "wide_mem_usd": (float(wide_mem_usd) if wide_mem_usd is not None else None),
+                "wide_mem_bins": wide_mem_bins,
+                "wide_mem_max": float(wide_mem_max),
                 "error": STATE.get("last_error"),
             }
             return JSONResponse(payload)
