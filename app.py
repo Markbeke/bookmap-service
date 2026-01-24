@@ -340,25 +340,48 @@ def _choose_bucket_scale(half_range: float) -> float:
     return 250.0
 
 
-def _build_bucket_bins(center: float, half_range: float) -> tuple[list[list[float]], float, float]:
-    """Return (bins, max_qty, scale). bins = [[price, qty], ...] within viewport."""
-    scale = _choose_bucket_scale(half_range)
+def _build_bucket_bins(center: float, half_range: float, bucket_scale=None):
+    """Return (bins, max_qty) for a selected bucket scale.
+
+    bins = [[price, qty], ...] within viewport around center±half_range.
+    bucket_scale: if provided (>0), uses that scale; otherwise chooses from half_range.
+    """
+    # decide scale
+    scale = None
+    try:
+        if bucket_scale is not None:
+            bs = float(bucket_scale)
+            if math.isfinite(bs) and bs > 0:
+                scale = bs
+    except Exception:
+        scale = None
+    if scale is None:
+        scale = choose_bucket_scale(half_range)
+
     d = BUCKETS.get(scale, {})
-    if not d or center is None:
-        return [], 0.0, scale
-    lo = center - half_range
-    hi = center + half_range
+    if not d:
+        return [], 1e-9
+
+    c = float(center)
+    hr = float(half_range)
+    lo = c - hr
+    hi = c + hr
+
     out = []
-    maxq = 0.0
+    maxq = 1e-9
     for px, qty in d.items():
-        if px < lo or px > hi:
+        try:
+            p = float(px)
+            q = float(qty)
+        except Exception:
             continue
-        q = float(qty)
+        if p < lo or p > hi:
+            continue
         if q > maxq:
             maxq = q
-        out.append([float(px), q])
+        out.append([p, q])
     out.sort(key=lambda x: x[0])
-    return out, maxq, scale
+    return out, maxq
 
 
 def _bin_price(px: float, bin_usd: float) -> float:
@@ -1501,16 +1524,4 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=PORT, log_level="info")
 
-# --- FIX12_BUCKETS_FIX2 PATCH START ---
-# Backward-compatible wrapper to tolerate legacy call sites passing 3 args
-try:
-    _orig_build_bucket_bins = _build_bucket_bins  # type: ignore
-    def _build_bucket_bins(*args, **kwargs):
-        # Accept (prices, values) or (prices, values, viewport) signatures
-        if len(args) == 3:
-            prices, values, _viewport = args
-            return _orig_build_bucket_bins(prices, values)
-        return _orig_build_bucket_bins(*args, **kwargs)
-except Exception:
-    pass
-# --- FIX12_BUCKETS_FIX2 PATCH END ---
+# ---  ---
