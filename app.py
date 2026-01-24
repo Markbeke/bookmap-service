@@ -73,7 +73,7 @@ MEM_ACTIVATION_MODE = (os.getenv("MEM_ACTIVATION_MODE", "rational") or "rational
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX2"
+BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX3"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -899,6 +899,52 @@ async def index() -> str:
     return idxs.slice(0, topN);
   }
 
+
+  // Peak-based selector to avoid "slab" bands:
+  //  - keeps only strong local peaks (relative threshold)
+  //  - enforces minimum separation between peaks (in bins)
+  //  - optional expansion around peaks to form stable band thickness
+  function topNPeaksByValue(a, topN, minSepBins, relThresh) {
+    let mx = 0.0;
+    for (let i=0;i<a.length;i++) { const v=a[i]; if (v && isFinite(v) && v>mx) mx=v; }
+    if (!(mx>0)) return [];
+    const thr = mx * Math.max(0.0, Math.min(1.0, relThresh || 0.0));
+    const idxs = [];
+    for (let i=0;i<a.length;i++) {
+      const v = a[i];
+      if (v && isFinite(v) && v>0 && v >= thr) idxs.push(i);
+    }
+    if (!idxs.length) return [];
+    idxs.sort((i,j)=>a[j]-a[i]);
+    const picked = [];
+    const sep = Math.max(0, Math.floor(minSepBins||0));
+    outer:
+    for (let k=0;k<idxs.length;k++) {
+      const i = idxs[k];
+      for (let t=0;t<picked.length;t++) {
+        if (Math.abs(picked[t]-i) <= sep) continue outer;
+      }
+      picked.push(i);
+      if (picked.length >= topN) break;
+    }
+    return picked;
+  }
+
+  function expandIdxs(peaks, n, radius) {
+    const r = Math.max(0, Math.floor(radius||0));
+    if (!peaks || !peaks.length || r===0) return peaks || [];
+    const keep = new Uint8Array(n);
+    for (let k=0;k<peaks.length;k++) {
+      const p = peaks[k];
+      const a = Math.max(0, p-r);
+      const b = Math.min(n-1, p+r);
+      for (let i=a;i<=b;i++) keep[i]=1;
+    }
+    const out = [];
+    for (let i=0;i<n;i++) if (keep[i]) out.push(i);
+    return out;
+  }
+
   function computeBandRuns(arr, keepIdxs, gapBins, minBins) {
     const keep = new Uint8Array(arr.length);
     for (let k=0;k<keepIdxs.length;k++) keep[keepIdxs[k]] = 1;
@@ -1044,7 +1090,10 @@ async def index() -> str:
       }
 
       if (smoothBands) smoothArrayInPlace(arr);
-      const keepIdxs = topNIndicesByValue(arr, Math.max(1, Math.floor(topNLevels)));
+      const relThr = Math.max(floorVal || 0.0, 0.10); // ensure slabs don't dominate
+      const sepBins = Math.max(1, Math.floor(bandGapBins) * 2 + 1);
+      const peaks = topNPeaksByValue(arr, Math.max(1, Math.floor(topNLevels)), sepBins, relThr);
+      const keepIdxs = expandIdxs(peaks, arr.length, Math.max(0, Math.floor(bandMinBins) - 1));
       hctx.globalAlpha = 0.95;
 
       if (bandify) {
