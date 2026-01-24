@@ -73,7 +73,7 @@ MEM_ACTIVATION_MODE = (os.getenv("MEM_ACTIVATION_MODE", "rational") or "rational
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = 'FIX14_UI_HYGIENE_PASS_1_PRICE_AUTHORITY_LOCK'
+BUILD = 'FIX15_PRICE_PARITY_DIAGNOSTIC'
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -145,6 +145,21 @@ def _recompute_tob() -> None:
     mid = None
     if best_bid is not None and best_ask is not None:
         mid = (best_bid + best_ask) / 2.0
+    # --- Price parity diagnostics ---
+    spread_px = None
+    spread_bps = None
+    last_minus_mid_px = None
+    last_minus_mid_bps = None
+    inside_spread = None
+    if best_bid is not None and best_ask is not None:
+        spread_px = (best_ask - best_bid)
+        if mid and mid > 0:
+            spread_bps = (spread_px / mid) * 10000.0
+    if last_px is not None and mid is not None and mid > 0:
+        last_minus_mid_px = (last_px - mid)
+        last_minus_mid_bps = (last_minus_mid_px / mid) * 10000.0
+    if last_px is not None and best_bid is not None and best_ask is not None:
+        inside_spread = (best_bid <= last_px <= best_ask)
 
     STATE["best_bid"] = best_bid
     STATE["best_ask"] = best_ask
@@ -787,6 +802,12 @@ async def index() -> str:
       <span class="k">Bid:</span> <span class="v" id="bestBid">—</span>
       <span class="k">Ask:</span> <span class="v" id="bestAsk">—</span>
       <span class="k">Mid:</span> <span class="v" id="midPx">—</span></div>
+    <div class="row"><span class="k">Spread:</span> <span class="v" id="sprPx">—</span>
+      <span class="k">Spr(bps):</span> <span class="v" id="sprBps">—</span>
+      <span class="k">Last-Mid(bps):</span> <span class="v" id="lmBps">—</span>
+      <span class="k">InSpread:</span> <span class="v" id="inSpr">—</span></div>
+    <div class="row"><span class="k">Price authority:</span> <span class="v" id="pxAuth">Trade=Last(prints); TOB=Bid/Ask; Mid=(Bid+Ask)/2</span></div>
+
     <div class="row"><span class="k">Ages:</span> <span class="v" id="ages">—</span></div>
     <div class="row"><span class="k">Book:</span> <span class="v" id="bookInfo">—</span>
       <span class="k">Prints(60s):</span> <span class="v" id="prints60">—</span></div>
@@ -828,6 +849,11 @@ async def index() -> str:
   const elBid = document.getElementById('bestBid');
   const elAsk = document.getElementById('bestAsk');
   const elMid = document.getElementById('midPx');
+  const elSpr = document.getElementById('sprPx');
+  const elSprBps = document.getElementById('sprBps');
+  const elLmBps = document.getElementById('lmBps');
+  const elInSpr = document.getElementById('inSpr');
+  const elPxAuth = document.getElementById('pxAuth');
   const elAges = document.getElementById('ages');
   const elBook = document.getElementById('bookInfo');
   const elPrints = document.getElementById('prints60');
@@ -1464,6 +1490,22 @@ async def index() -> str:
     elAsk.textContent = fmt(snap.best_ask);
     elMid.textContent = fmt(snap.mid);
 
+    // --- Price parity diagnostics (client-side, authoritative from snapshot) ---
+    const sprPx = (snap.spread_px === null || snap.spread_px === undefined) ? null : snap.spread_px;
+    const sprBps = (snap.spread_bps === null || snap.spread_bps === undefined) ? null : snap.spread_bps;
+    const lmBps = (snap.last_minus_mid_bps === null || snap.last_minus_mid_bps === undefined) ? null : snap.last_minus_mid_bps;
+    const inSpr = (snap.inside_spread === null || snap.inside_spread === undefined) ? null : snap.inside_spread;
+
+    if (elSpr) elSpr.textContent = (sprPx === null) ? '—' : sprPx.toFixed(2);
+    if (elSprBps) elSprBps.textContent = (sprBps === null) ? '—' : sprBps.toFixed(1);
+    if (elLmBps) elLmBps.textContent = (lmBps === null) ? '—' : lmBps.toFixed(1);
+    if (elInSpr) elInSpr.textContent = (inSpr === null) ? '—' : (inSpr ? 'YES' : 'NO');
+
+    // Simple visual cue: if last trade prints outside current top-of-book spread, color the "InSpread" field red.
+    if (elInSpr) {
+      elInSpr.style.color = (inSpr === false) ? '#ff6b6b' : '';
+    }
+
     const da = (depthAge === null || depthAge === undefined) ? '—' : `${Math.round(depthAge)}ms`;
     const ta = (snap.trade_age_ms === null || snap.trade_age_ms === undefined) ? '—' : `${Math.round(snap.trade_age_ms)}ms`;
     const wa = (age === null) ? '—' : `${Math.round(age)}ms`;
@@ -1822,6 +1864,11 @@ async def snapshot(request: Request) -> JSONResponse:
                 "best_bid": best_bid,
                 "best_ask": best_ask,
                 "mid": mid,
+                "spread_px": spread_px,
+                "spread_bps": spread_bps,
+                "last_minus_mid_px": last_minus_mid_px,
+                "last_minus_mid_bps": last_minus_mid_bps,
+                "inside_spread": inside_spread,
                 "book_bids_n": int(STATE.get("bids_n") or 0),
                 "book_asks_n": int(STATE.get("asks_n") or 0),
                 "center_px": center_px,
