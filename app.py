@@ -56,7 +56,7 @@ MAX_LEVELS_PER_SIDE = int(os.getenv("QD_MAX_LEVELS_PER_SIDE", "4000"))
 
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX11_ADAPTIVE_VIEWPORT_MULTISCALE_FIX1"
+BUILD = "FIX12_BUCKETS_FIX1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -89,6 +89,21 @@ STATE_LOCK = asyncio.Lock()
 # ---------------------------
 BIDS: Dict[float, float] = {}
 ASKS: Dict[float, float] = {}
+
+# --- Multi-scale liquidity buckets (historic aggregation) ---
+# We only receive top-of-book depth (e.g., 200 levels/side).
+# Bookmap still shows "distant" liquidity because it retains
+# historical levels as price migrates. We emulate that by storing
+# time-decayed, aggregated liquidity in coarse price buckets.
+#
+# Each scale aggregates levels into bins (e.g., $25 / $100 / $250).
+# We keep a decayed "max-like" value per bin so strong bands persist
+# even after they leave the current top-N ladder.
+BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
+BUCKET_HALF_LIFE_SEC = {25.0: 6*60.0, 100.0: 18*60.0, 250.0: 60*60.0}
+BUCKET_MAX_BINS = {25.0: 1200, 100.0: 800, 250.0: 600}
+BUCKETS: Dict[float, Dict[float, float]] = {s: {} for s in BUCKET_SCALES_USD}  # scale -> {bin_px: strength}
+BUCKETS_LAST_MS: Dict[float, int] = {s: 0 for s in BUCKET_SCALES_USD}
 LAST_DEPTH_MS: Optional[int] = None
 LAST_TRADE_MS: Optional[int] = None
 
@@ -242,6 +257,110 @@ def _prune_topn() -> None:
         for px in sorted(ASKS.keys())[TOPN_LEVELS:]:
             ASKS.pop(px, None)
 
+# --- Buckets engine ---
+
+def _bucket_decay_factor(scale_usd: float, now_ms: int) -> float:
+    """Return exp-decay factor for bucket values since last update.
+
+    We use a half-life per scale so distant liquidity fades slower, similar to Bookmap's
+    resting-liquidity persistence.
+    """
+    last = BUCKET_LAST_MS.get(scale_usd)
+    if last is None:
+        BUCKET_LAST_MS[scale_usd] = now_ms
+        return 1.0
+    dt = max(0, now_ms - int(last))
+    BUCKET_LAST_MS[scale_usd] = now_ms
+    if dt == 0:
+        return 1.0
+    hl = float(BUCKET_HALF_LIFE_MS.get(scale_usd, 300_000))
+    # exp(-ln2 * dt/hl)
+    return float(pow(2.0, -dt / hl))
+
+
+def _update_buckets_from_book(now_ms: int) -> None:
+    """Aggregate current retained depth into multi-scale buckets.
+
+    IMPORTANT: Buckets are *not* a substitute for missing depth levels from the exchange.
+    They allow us to retain *discovered* liquidity bands across time as the market moves,
+    so the wider ladder can show previously observed levels.
+    """
+    if not BUCKETS_ENABLED:
+        return
+
+    # Snapshot current book (already pruned/capped)
+    levels = []
+    if BIDS:
+        levels.extend(BIDS.items())
+    if ASKS:
+        levels.extend(ASKS.items())
+    if not levels:
+        return
+
+    for scale in BUCKET_SCALES_USD:
+        decay = _bucket_decay_factor(scale, now_ms)
+        d = BUCKETS.setdefault(scale, {})
+
+        # Decay existing buckets
+        if decay < 0.9999 and d:
+            for k in list(d.keys()):
+                v = d[k] * decay
+                if v <= 1e-12:
+                    d.pop(k, None)
+                else:
+                    d[k] = v
+
+        # Aggregate this tick
+        tmp = {}
+        for px, qty in levels:
+            b = round(px / scale) * scale
+            tmp[b] = tmp.get(b, 0.0) + float(qty)
+
+        # Merge: use max to keep the strongest recently-seen wall, rather than summing forever
+        for b, q in tmp.items():
+            prev = d.get(b, 0.0)
+            d[b] = max(prev, q)
+
+        # Hard cap per scale: keep only the strongest buckets
+        cap = int(BUCKET_CAP_PER_SCALE)
+        if len(d) > cap:
+            # keep top cap by qty
+            keep = set(sorted(d, key=lambda k: d[k], reverse=True)[:cap])
+            for k in list(d.keys()):
+                if k not in keep:
+                    d.pop(k, None)
+
+
+def _choose_bucket_scale(half_range: float) -> float:
+    # Choose a coarser scale when viewing a wider ladder range
+    if half_range <= 600:
+        return 25.0
+    if half_range <= 2000:
+        return 100.0
+    return 250.0
+
+
+def _build_bucket_bins(center: float, half_range: float) -> tuple[list[list[float]], float, float]:
+    """Return (bins, max_qty, scale). bins = [[price, qty], ...] within viewport."""
+    scale = _choose_bucket_scale(half_range)
+    d = BUCKETS.get(scale, {})
+    if not d or center is None:
+        return [], 0.0, scale
+    lo = center - half_range
+    hi = center + half_range
+    out = []
+    maxq = 0.0
+    for px, qty in d.items():
+        if px < lo or px > hi:
+            continue
+        q = float(qty)
+        if q > maxq:
+            maxq = q
+        out.append([float(px), q])
+    out.sort(key=lambda x: x[0])
+    return out, maxq, scale
+
+
 def _bin_price(px: float, bin_usd: float) -> float:
     if bin_usd <= 0:
         return px
@@ -371,6 +490,7 @@ async def mexc_consumer_loop() -> None:
 
                         LAST_DEPTH_MS = now_ms
                         _prune_topn()
+                        _update_buckets_from_book(now_ms)
                         async with STATE_LOCK:
                             _recompute_tob()
                             _update_ladder_bounds()
@@ -746,6 +866,21 @@ async def index() -> str:
       bins = snap.wide_heat_bins;
       maxv = (snap.wide_heat_max) ? snap.wide_heat_max : maxv;
       if (snap.wide_bin_usd) binUsd = snap.wide_bin_usd;
+    }
+
+    // Bucket overlay: aggregate historical resting liquidity at coarser scales.
+    // We merge these bins into the same rendering pipeline so band-quality and
+    // coalescing operate consistently.
+    let bucketBins = (snap && snap.bucket_bins) ? snap.bucket_bins : [];
+    let bucketMax = (snap && snap.bucket_max) ? snap.bucket_max : 0;
+    if (wideMode && snap && snap.wide_bucket_bins && snap.wide_bucket_bins.length) {
+      bucketBins = snap.wide_bucket_bins;
+      bucketMax = (snap.wide_bucket_max) ? snap.wide_bucket_max : bucketMax;
+    }
+    if (bucketBins && bucketBins.length) {
+      // Append; downstream quantization will combine overlapping rows.
+      bins = bins.concat(bucketBins);
+      maxv = Math.max(maxv, bucketMax || 0);
     }
 
     const { lo, hi } = viewBounds(snap);
@@ -1283,6 +1418,21 @@ async def snapshot() -> JSONResponse:
                 wide_range = span / 2.0
                 wide_heat_bins, wide_heat_max = _build_heat_bins(wide_center, wide_range, wide_bin)
 
+            # --- Bucket-projected heat (historic, multi-scale) ---
+            bucket_bins: List[List[float]] = []
+            bucket_max = 0.0
+            bucket_scale = None
+            if center_px is not None:
+                bucket_scale = _choose_bucket_scale(float(RANGE_USD))
+                bucket_bins, bucket_max = _build_bucket_bins(float(center_px), float(RANGE_USD), float(bucket_scale))
+
+            wide_bucket_bins: List[List[float]] = []
+            wide_bucket_max = 0.0
+            wide_bucket_scale = None
+            if ladder_min is not None and ladder_max is not None and ladder_max > ladder_min:
+                wide_bucket_scale = _choose_bucket_scale(float(wide_range))
+                wide_bucket_bins, wide_bucket_max = _build_bucket_bins(float(wide_center), float(wide_range), float(wide_bucket_scale))
+
             payload = {
                 "ok": True,
                 "build": BUILD,
@@ -1303,11 +1453,17 @@ async def snapshot() -> JSONResponse:
                 "bin_usd": float(BIN_USD),
                 "heat_bins": heat_bins,
                 "heat_max": float(heat_max),
+                "bucket_scale": (float(bucket_scale) if bucket_scale is not None else None),
+                "bucket_bins": bucket_bins,
+                "bucket_max": float(bucket_max),
                 "ladder_min_px": (float(ladder_min) if ladder_min is not None else None),
                 "ladder_max_px": (float(ladder_max) if ladder_max is not None else None),
                 "wide_bin_usd": (float(wide_bin_usd) if wide_bin_usd is not None else None),
                 "wide_heat_bins": wide_heat_bins,
                 "wide_heat_max": float(wide_heat_max),
+                "wide_bucket_scale": (float(wide_bucket_scale) if wide_bucket_scale is not None else None),
+                "wide_bucket_bins": wide_bucket_bins,
+                "wide_bucket_max": float(wide_bucket_max),
                 "error": STATE.get("last_error"),
             }
             return JSONResponse(payload)
