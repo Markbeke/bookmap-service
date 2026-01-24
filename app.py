@@ -61,7 +61,7 @@ BUCKET_CAP_PER_SCALE = int(os.getenv("QD_BUCKET_CAP_PER_SCALE", "1200"))
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX12_BUCKETS_FIX7_NEWTAB_BOOTSTRAP"
+BUILD = "FIX12_BUCKETS_FIX8_NEWTAB_STABILITY"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -852,19 +852,18 @@ async def index() -> str:
     const W = heat.width, H = heat.height;
     if (W<=0 || H<=0) return;
 
-    // fade old heat
+    // shift existing heat left (time) WITHOUT allocating a temp canvas each tick
+    // This is critical for iPad/Safari stability in a standalone tab.
+    hctx.save();
+    hctx.globalCompositeOperation = 'copy';
+    hctx.drawImage(heat, -COL_PX, 0);
+    hctx.restore();
+
+    // fade old heat (time-decay)
     hctx.fillStyle = `rgba(0,0,0,${DECAY_ALPHA})`;
     hctx.fillRect(0, 0, W, H);
 
-    // shift left (time)
-    const tmp = document.createElement('canvas');
-    tmp.width = W; tmp.height = H;
-    const tctx = tmp.getContext('2d');
-    tctx.drawImage(heat, 0, 0);
-    hctx.clearRect(0, 0, W, H);
-    hctx.drawImage(tmp, -COL_PX, 0);
-
-    // clear newest columns
+    // clear newest column region (right edge)
     hctx.fillStyle = '#000';
     hctx.fillRect(W - COL_PX, 0, COL_PX, H);
 
@@ -1258,9 +1257,30 @@ async def index() -> str:
     zoom = Math.max(0.25, Math.min(6.0, zoom * factor));
   }, { passive: false });
 
+  // Tick cadence (visibility-aware): avoids iOS background-throttle stalls and reduces CPU.
   const intervalMs = Math.max(250, Math.floor(1000 / Math.max(0.2, __SNAPSHOT_HZ__)));
-  setInterval(tick, intervalMs);
-  tick();
+  let tickTimer = null;
+
+  async function scheduleLoop() {
+    if (tickTimer) return;
+    const loop = async () => {
+      tickTimer = null;
+      if (!document.hidden) {
+        await tick();
+      }
+      tickTimer = setTimeout(loop, intervalMs);
+    };
+    tickTimer = setTimeout(loop, 0);
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    // When returning to the tab, force an immediate refresh.
+    if (!document.hidden) {
+      try { tick(); } catch (_) {}
+    }
+  });
+
+  scheduleLoop();
 })();
 </script>
 </body>
