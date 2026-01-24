@@ -26,6 +26,7 @@ import os
 import json
 import time
 import asyncio
+import heapq
 from typing import Any, Dict, List, Tuple, Optional
 
 from fastapi import FastAPI
@@ -48,9 +49,14 @@ PORT = int(os.getenv("PORT", os.getenv("QD_PORT", "5000")))
 RANGE_USD = float(os.getenv("QD_RANGE_USD", "400"))      # half-range around mid for y mapping
 BIN_USD = float(os.getenv("QD_BIN_USD", "5"))            # price bin size for snapshot ladder
 TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))    # levels retained per side
+# --- Wide ladder (show distant liquidity) ---
+WIDE_LADDER = int(os.getenv("QD_WIDE_LADDER", "1")) == 1
+WIDE_RANGE_USD = float(os.getenv("QD_WIDE_RANGE_USD", "2000"))  # +/- USD around mid/last for retention
+MAX_LEVELS_PER_SIDE = int(os.getenv("QD_MAX_LEVELS_PER_SIDE", "4000"))
+
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX10_WIDE_LADDER_ENGINE_FIX1"
+BUILD = "FIX10_REARCH_WIDE_LADDER_FIX1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -86,6 +92,10 @@ ASKS: Dict[float, float] = {}
 LAST_DEPTH_MS: Optional[int] = None
 LAST_TRADE_MS: Optional[int] = None
 
+
+# Ladder bounds used by /snapshot and frontend (derived from book).
+LADDER_MIN_PX: Optional[float] = None
+LADDER_MAX_PX: Optional[float] = None
 _PRINT_TS: List[float] = []  # timestamps (seconds) of prints, rolling 60s
 
 
@@ -166,16 +176,52 @@ def _update_ladder_bounds() -> None:
 
 
 def _prune_topn() -> None:
-    # Keep only TOPN_LEVELS per side to cap memory and snapshot size
+    """Prune retained depth.
+
+    FIX10 goal: allow a much wider ladder (distant resting liquidity) without unbounded memory.
+    - If WIDE_LADDER: keep levels within +/- WIDE_RANGE_USD around current center (mid/last),
+      and cap each side to MAX_LEVELS_PER_SIDE by *size* (largest qty), to preserve meaningful distant walls.
+    - Else: legacy TOPN_LEVELS closest-to-market.
+    """
+    # Determine center from current best bid/ask
+    center = None
+    if BIDS and ASKS:
+        center = (max(BIDS.keys()) + min(ASKS.keys())) * 0.5
+    elif BIDS:
+        center = max(BIDS.keys())
+    elif ASKS:
+        center = min(ASKS.keys())
+
+    if WIDE_LADDER and center is not None:
+        lo = center - float(WIDE_RANGE_USD)
+        hi = center + float(WIDE_RANGE_USD)
+
+        # Drop levels outside range
+        for px in [p for p in BIDS.keys() if p < lo or p > hi]:
+            BIDS.pop(px, None)
+        for px in [p for p in ASKS.keys() if p < lo or p > hi]:
+            ASKS.pop(px, None)
+
+        # Cap by size (largest qty) to avoid runaway
+        if len(BIDS) > MAX_LEVELS_PER_SIDE:
+            keep = set(px for px, _ in heapq.nlargest(MAX_LEVELS_PER_SIDE, BIDS.items(), key=lambda kv: kv[1]))
+            for px in list(BIDS.keys()):
+                if px not in keep:
+                    BIDS.pop(px, None)
+        if len(ASKS) > MAX_LEVELS_PER_SIDE:
+            keep = set(px for px, _ in heapq.nlargest(MAX_LEVELS_PER_SIDE, ASKS.items(), key=lambda kv: kv[1]))
+            for px in list(ASKS.keys()):
+                if px not in keep:
+                    ASKS.pop(px, None)
+        return
+
+    # Legacy TOPN: closest-to-market
     if len(BIDS) > TOPN_LEVELS:
-        # keep highest bids
         for px in sorted(BIDS.keys())[:-TOPN_LEVELS]:
             BIDS.pop(px, None)
     if len(ASKS) > TOPN_LEVELS:
-        # keep lowest asks
         for px in sorted(ASKS.keys())[TOPN_LEVELS:]:
             ASKS.pop(px, None)
-
 
 def _bin_price(px: float, bin_usd: float) -> float:
     if bin_usd <= 0:
