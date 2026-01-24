@@ -73,7 +73,7 @@ MEM_ACTIVATION_MODE = (os.getenv("MEM_ACTIVATION_MODE", "rational") or "rational
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX4_2"
+BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX4_3"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -1247,7 +1247,7 @@ async def index() -> str:
       const topN = Math.max(1, Math.floor(topNLevels));
 
       // Start conservative (dominant nodes), then relax toward secondary nodes if needed.
-      let thr = Math.max(floorVal || 0.0, 0.10);
+      let thr = Math.max(heatFloor || 0.0, 0.10);
       const minPeakCount = Math.min(40, Math.max(10, Math.floor(arr.length / 30))); // ~10–40 peaks depending on zoom
       let peaks = topNPeaksByValue(arr, topN, sepBins, thr);
 
