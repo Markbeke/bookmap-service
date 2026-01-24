@@ -73,7 +73,7 @@ MEM_ACTIVATION_MODE = (os.getenv("MEM_ACTIVATION_MODE", "rational") or "rational
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX3_1"
+BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX4"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -245,6 +245,133 @@ BUCKETS_LAST_MS: Dict[float, int] = {s: 0 for s in BUCKET_SCALES_USD}
 # Global ladder memory: price_bin -> strength (qty); decays over time.
 LADDER_MEM: Dict[float, float] = {}
 LADDER_MEM_LAST_MS: int = 0
+
+
+# ---------------------------
+# Persistence (FIX13_FIX4): Global ladder + bucket layers survive restarts
+# ---------------------------
+PERSIST_ENABLE = int(os.getenv("QD_PERSIST_ENABLE", "1")) == 1
+PERSIST_DIR = os.getenv("QD_PERSIST_DIR", os.path.join(os.getcwd(), "state")).strip() or os.path.join(os.getcwd(), "state")
+PERSIST_FILE = os.getenv("QD_PERSIST_FILE", "bookmap_state.json").strip() or "bookmap_state.json"
+PERSIST_EVERY_SEC = float(os.getenv("QD_PERSIST_EVERY_SEC", "5.0"))
+PERSIST_MIN_INTERVAL_SEC = max(1.0, PERSIST_EVERY_SEC)
+
+_PERSIST_LOCK = asyncio.Lock()
+
+def _persist_path() -> str:
+    try:
+        os.makedirs(PERSIST_DIR, exist_ok=True)
+    except Exception:
+        # If directory creation fails, fall back to CWD.
+        return os.path.join(os.getcwd(), PERSIST_FILE)
+    return os.path.join(PERSIST_DIR, PERSIST_FILE)
+
+def _atomic_write_json(path: str, obj: Dict[str, Any]) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+    os.replace(tmp, path)
+
+def _serialize_float_map(d: Dict[float, float]) -> List[List[float]]:
+    # JSON-safe list of [price_bin, strength]
+    out: List[List[float]] = []
+    for k, v in d.items():
+        try:
+            out.append([float(k), float(v)])
+        except Exception:
+            continue
+    return out
+
+def _deserialize_float_map(items: Any) -> Dict[float, float]:
+    out: Dict[float, float] = {}
+    if not isinstance(items, list):
+        return out
+    for it in items:
+        try:
+            if isinstance(it, (list, tuple)) and len(it) >= 2:
+                out[float(it[0])] = float(it[1])
+        except Exception:
+            continue
+    return out
+
+def _persist_snapshot(now_ms: int) -> Dict[str, Any]:
+    # Keep payload minimal and robust; never raise.
+    payload: Dict[str, Any] = {
+        "schema": 1,
+        "saved_ms": int(now_ms),
+        "build": BUILD,
+        "symbol": SYMBOL,
+        "mem_bin_usd": float(MEM_BIN_USD),
+        "bucket_scales_usd": [float(x) for x in BUCKET_SCALES_USD],
+        "ladder_min_px": float(LADDER_MIN_PX) if LADDER_MIN_PX is not None else None,
+        "ladder_max_px": float(LADDER_MAX_PX) if LADDER_MAX_PX is not None else None,
+        "ladder_mem": _serialize_float_map(LADDER_MEM),
+        "buckets": {str(s): _serialize_float_map(BUCKETS.get(s, {})) for s in BUCKET_SCALES_USD},
+    }
+    return payload
+
+async def persist_state_once(now_ms: int) -> None:
+    if not PERSIST_ENABLE:
+        return
+    async with _PERSIST_LOCK:
+        try:
+            path = _persist_path()
+            payload = _persist_snapshot(now_ms)
+            _atomic_write_json(path, payload)
+        except Exception as e:
+            # Never crash; surface in UI error slot.
+            _set_err(f"persist_exception: {type(e).__name__}: {e}")
+
+async def load_persisted_state() -> None:
+    if not PERSIST_ENABLE:
+        return
+    async with _PERSIST_LOCK:
+        try:
+            path = _persist_path()
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if not isinstance(obj, dict):
+                return
+            # Only load if symbol matches; otherwise ignore.
+            if str(obj.get("symbol") or "").strip() != SYMBOL:
+                return
+
+            # Restore ladder bounds
+            global LADDER_MIN_PX, LADDER_MAX_PX, LADDER_MEM
+            vmin = obj.get("ladder_min_px")
+            vmax = obj.get("ladder_max_px")
+            LADDER_MIN_PX = float(vmin) if isinstance(vmin, (int, float)) else LADDER_MIN_PX
+            LADDER_MAX_PX = float(vmax) if isinstance(vmax, (int, float)) else LADDER_MAX_PX
+
+            # Restore ladder memory
+            LADDER_MEM = _deserialize_float_map(obj.get("ladder_mem"))
+
+            # Restore bucket layers
+            b = obj.get("buckets")
+            if isinstance(b, dict):
+                for s in BUCKET_SCALES_USD:
+                    items = b.get(str(s))
+                    if items is None:
+                        continue
+                    BUCKETS[s] = _deserialize_float_map(items)
+
+        except Exception as e:
+            _set_err(f"rehydrate_exception: {type(e).__name__}: {e}")
+
+async def _persistence_loop() -> None:
+    # Periodic checkpointing; extremely defensive.
+    last_save_ms = 0
+    while True:
+        await asyncio.sleep(PERSIST_MIN_INTERVAL_SEC)
+        now_ms = _now_ms()
+        # avoid too-frequent writes if clock jitter
+        if now_ms - last_save_ms < int(PERSIST_MIN_INTERVAL_SEC * 1000):
+            continue
+        last_save_ms = now_ms
+        await persist_state_once(now_ms)
+
 
 def _mem_bin(px: float) -> float:
     # bin to MEM_BIN_USD while keeping nice decimal (avoid float noise)
@@ -610,6 +737,8 @@ async def mexc_consumer_loop() -> None:
 # ---------------------------
 @app.on_event("startup")
 async def _startup() -> None:
+    await load_persisted_state()
+    asyncio.create_task(_persistence_loop())
     asyncio.create_task(mexc_consumer_loop())
 
 
