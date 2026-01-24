@@ -73,7 +73,7 @@ MEM_ACTIVATION_MODE = (os.getenv("MEM_ACTIVATION_MODE", "rational") or "rational
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX3"
+BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX3_1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -1090,9 +1090,38 @@ async def index() -> str:
       }
 
       if (smoothBands) smoothArrayInPlace(arr);
-      const relThr = Math.max(floorVal || 0.0, 0.10); // ensure slabs don't dominate
+
+      // FIX3_1: Adaptive peak threshold so the viewport never looks "empty".
+      // We keep the peak-based structure (prevents slabs), but relax threshold until we have
+      // enough secondary bands to resemble Bookmap layering.
       const sepBins = Math.max(1, Math.floor(bandGapBins) * 2 + 1);
-      const peaks = topNPeaksByValue(arr, Math.max(1, Math.floor(topNLevels)), sepBins, relThr);
+      const topN = Math.max(1, Math.floor(topNLevels));
+
+      // Start conservative (dominant nodes), then relax toward secondary nodes if needed.
+      let thr = Math.max(floorVal || 0.0, 0.10);
+      const minPeakCount = Math.min(40, Math.max(10, Math.floor(arr.length / 30))); // ~10–40 peaks depending on zoom
+      let peaks = topNPeaksByValue(arr, topN, sepBins, thr);
+
+      // Relax threshold progressively to populate secondary liquidity while preserving separation.
+      while (peaks.length < minPeakCount && thr > 0.015) {
+        thr = thr * 0.75;
+        peaks = topNPeaksByValue(arr, topN, sepBins, thr);
+      }
+
+      // Final fallback: if still too sparse (rare), seed a few more by raw value but still obey separation.
+      if (peaks.length < Math.max(6, Math.floor(minPeakCount * 0.6))) {
+        const byVal = topNIdxsByValue(arr, Math.min(topN, minPeakCount * 2));
+        outer2:
+        for (let k=0; k<byVal.length; k++) {
+          const i = byVal[k];
+          for (let t=0; t<peaks.length; t++) {
+            if (Math.abs(peaks[t] - i) <= sepBins) continue outer2;
+          }
+          peaks.push(i);
+          if (peaks.length >= minPeakCount) break;
+        }
+      }
+
       const keepIdxs = expandIdxs(peaks, arr.length, Math.max(0, Math.floor(bandMinBins) - 1));
       hctx.globalAlpha = 0.95;
 
