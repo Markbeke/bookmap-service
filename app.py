@@ -1500,3 +1500,17 @@ async def snapshot() -> JSONResponse:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=PORT, log_level="info")
+
+# --- FIX12_BUCKETS_FIX2 PATCH START ---
+# Backward-compatible wrapper to tolerate legacy call sites passing 3 args
+try:
+    _orig_build_bucket_bins = _build_bucket_bins  # type: ignore
+    def _build_bucket_bins(*args, **kwargs):
+        # Accept (prices, values) or (prices, values, viewport) signatures
+        if len(args) == 3:
+            prices, values, _viewport = args
+            return _orig_build_bucket_bins(prices, values)
+        return _orig_build_bucket_bins(*args, **kwargs)
+except Exception:
+    pass
+# --- FIX12_BUCKETS_FIX2 PATCH END ---
