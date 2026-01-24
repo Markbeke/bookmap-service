@@ -70,7 +70,7 @@ MEM_MIN_QTY = float(os.getenv("MEM_MIN_QTY", "0"))  # ignore memory updates belo
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE"
+BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -1484,14 +1484,14 @@ async def snapshot(request: Request) -> JSONResponse:
                     if val > mem_max:
                         mem_max = float(val)
             if center_px is not None:
-                wlo = center_px - float(wide_range_usd)
-                whi = center_px + float(wide_range_usd)
+                wlo = center_px - float(WIDE_RANGE_USD)
+                whi = center_px + float(WIDE_RANGE_USD)
                 for px, val in LADDER_MEM.items():
                     if wlo <= px <= whi:
                         wide_mem_bins.append([float(px), float(val)])
                         if val > wide_mem_max:
                             wide_mem_max = float(val)
-                wide_mem_usd = float(wide_range_usd)
+                wide_mem_usd = float(WIDE_RANGE_USD)
             payload = {
                 "ok": True,
                 "build": BUILD,
