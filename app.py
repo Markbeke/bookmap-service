@@ -73,7 +73,7 @@ MEM_ACTIVATION_MODE = (os.getenv("MEM_ACTIVATION_MODE", "rational") or "rational
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX4_3"
+BUILD = 'FIX14_UI_HYGIENE_PASS_1_PRICE_AUTHORITY_LOCK'
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -783,7 +783,7 @@ async def index() -> str:
   <div id="hud">
     <div class="row"><span id="statusDot"></span><span class="k">Build:</span> <span class="v">__BUILD__</span></div>
     <div class="row"><span class="k">Status:</span> <span class="v" id="statusTxt">…</span></div>
-    <div class="row"><span class="k">Last:</span> <span class="v" id="lastPx">—</span>
+    <div class="row"><span class="k">Last (Trade):</span> <span class="v" id="lastPx">—</span>
       <span class="k">Bid:</span> <span class="v" id="bestBid">—</span>
       <span class="k">Ask:</span> <span class="v" id="bestAsk">—</span>
       <span class="k">Mid:</span> <span class="v" id="midPx">—</span></div>
@@ -795,6 +795,7 @@ async def index() -> str:
       <button id="followBtn">Autofollow: ON</button>
       <button id="resetBtn">Reset view</button>
       <button id="testBtn">Test pattern: OFF</button>
+      <button id="debugBtn">Debug: OFF</button>
       <button id="wideBtn">Wide ladder: ON</button>
       <button id="bucketScaleBtn">Scale: AUTO</button>
       <button id="gainBtn">Gain: 1.00</button>
@@ -835,6 +836,7 @@ async def index() -> str:
   const followBtn = document.getElementById('followBtn');
   const resetBtn = document.getElementById('resetBtn');
   const testBtn = document.getElementById('testBtn');
+  const debugBtn = document.getElementById('debugBtn');
   const wideBtn = document.getElementById('wideBtn');
   const bucketScaleBtn = document.getElementById('bucketScaleBtn');
   const gainBtn = document.getElementById('gainBtn');
@@ -851,6 +853,7 @@ async def index() -> str:
 
   let autofollow = true;
   let testPattern = false;
+  let debugMode = false;
   let wideMode = true;
   let bucketScaleMode = "auto";
 
@@ -1480,30 +1483,34 @@ async def index() -> str:
         return;
       }
       setHudFromSnap(snap);
+      let hadErr = false;
 
       // Run heat update and frame draw in separate guards so a single JS error
       // never blanks the entire chart without a readable message.
       try {
         updateHeat(snap);
       } catch (e1) {
+        hadErr = true;
         const msg = (e1 && (e1.message || e1.toString)) ? (e1.message || e1.toString()) : String(e1);
         const stk = (e1 && e1.stack) ? String(e1.stack) : '';
-        elErr.textContent = `updateHeat error: ${msg}
-${stk}`;
+        elErr.textContent = debugMode ? `updateHeat error: ${msg}\n${stk}` : `updateHeat error: ${msg}`;
       }
       try {
         drawFrame(snap);
       } catch (e2) {
+        hadErr = true;
         const msg = (e2 && (e2.message || e2.toString)) ? (e2.message || e2.toString()) : String(e2);
         const stk = (e2 && e2.stack) ? String(e2.stack) : '';
-        elErr.textContent = `drawFrame error: ${msg}
-${stk}`;
+        elErr.textContent = debugMode ? `drawFrame error: ${msg}\n${stk}` : `drawFrame error: ${msg}`;
+      }
+
+      if (!hadErr && !debugMode) {
+        elErr.textContent = '';
       }
     } catch (e) {
       const msg = (e && (e.message || e.toString)) ? (e.message || e.toString()) : String(e);
       const stk = (e && e.stack) ? String(e.stack) : '';
-      elErr.textContent = `tick error: ${msg}
-${stk}`;
+      elErr.textContent = debugMode ? `tick error: ${msg}\n${stk}` : `tick error: ${msg}`;
     }
   }
 
@@ -1520,6 +1527,16 @@ ${stk}`;
   testBtn.addEventListener('click', () => {
     testPattern = !testPattern;
     testBtn.textContent = `Test pattern: ${testPattern ? 'ON' : 'OFF'}`;
+  });
+  debugBtn.addEventListener('click', () => {
+    debugMode = !debugMode;
+    debugBtn.textContent = `Debug: ${debugMode ? 'ON' : 'OFF'}`;
+    if (!debugMode) {
+      // Hide noisy stack traces when debug is OFF
+      if (String(elErr.textContent || '').includes('http')) {
+        elErr.textContent = '';
+      }
+    }
   });
   wideBtn.addEventListener('click', () => {
     wideMode = !wideMode;
