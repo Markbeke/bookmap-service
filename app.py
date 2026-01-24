@@ -73,7 +73,7 @@ MEM_ACTIVATION_MODE = (os.getenv("MEM_ACTIVATION_MODE", "rational") or "rational
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = 'FIX15_PRICE_PARITY_DIAGNOSTIC'
+BUILD = 'FIX15_PRICE_PARITY_DIAGNOSTIC_FIX1'
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -1746,6 +1746,35 @@ async def snapshot(request: Request) -> JSONResponse:
             best_ask = STATE.get("best_ask")
             mid = STATE.get("mid")
             last_px = STATE.get("last_trade_px")
+
+            # --- Price parity diagnostics (snapshot-local; MUST be defined even if WS loop didn't compute) ---
+            spread_px = None
+            spread_bps = None
+            last_minus_mid_px = None
+            last_minus_mid_bps = None
+            inside_spread = None
+            if best_bid is not None and best_ask is not None:
+                try:
+                    spread_px = float(best_ask) - float(best_bid)
+                    if mid is not None and float(mid) > 0:
+                        spread_bps = (spread_px / float(mid)) * 10000.0
+                except Exception:
+                    spread_px = None
+                    spread_bps = None
+            if last_px is not None and mid is not None:
+                try:
+                    if float(mid) > 0:
+                        last_minus_mid_px = float(last_px) - float(mid)
+                        last_minus_mid_bps = (last_minus_mid_px / float(mid)) * 10000.0
+                except Exception:
+                    last_minus_mid_px = None
+                    last_minus_mid_bps = None
+            if last_px is not None and best_bid is not None and best_ask is not None:
+                try:
+                    inside_spread = (float(best_bid) <= float(last_px) <= float(best_ask))
+                except Exception:
+                    inside_spread = None
+
 
             center_px = mid
             if center_px is None:
