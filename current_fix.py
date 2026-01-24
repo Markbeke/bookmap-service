@@ -1,19 +1,21 @@
 # QuantDesk Bookmap Service - current_fix.py
-# Build: FIX08/P01
-# Subsystem: FOUNDATION+STREAM+GLOBAL_LADDER_STATE_ENGINE
+# Build: FIX09/P01
+# Subsystem: FOUNDATION+STREAM+INCREMENTAL_LADDER_MERGE_ENGINE
 # Venue: MEXC Futures (BTC_USDT Perpetuals)
 # Date: 2026-01-25
 #
-# FIX08 objective:
-# - Keep CONTRACT WS connectivity proven in FIX07.
-# - Upgrade state engine from top-of-book to a global ladder (full depth view as delivered by push.depth).
-# - Maintain deterministic, single-writer book state (replace-on-snapshot model per push.depth message).
-# - Expose ladder state and invariants via JSON endpoints.
+# FIX09 objective:
+# - Correct depth semantics for MEXC Futures: push.depth messages may be partial (one-sided / incremental-like).
+# - Replace FIX08 "replace-on-snapshot" with "merge" semantics:
+#     * Update only sides present in the message
+#     * Do NOT wipe the opposite side when missing
+#     * Remove price levels when qty <= 0
+# - Maintain deterministic single-writer state; keep invariants; expose book + telemetry.
 #
 # Notes (truth/limits):
-# - This build treats each push.depth as a snapshot replacement of current depth view.
-# - If MEXC requires incremental maintenance (diffs), that will be a later FIX based on observed payloads.
-# - This build does not implement heatmap/visualization yet.
+# - We still subscribe via sub.depth / sub.deal on wss://contract.mexc.com/edge.
+# - If MEXC provides an explicit full snapshot flag/type, we will incorporate it once observed in raw frames.
+# - No visualization/heatmap yet.
 
 import asyncio
 import json
@@ -29,8 +31,8 @@ import websockets
 import uvicorn
 
 SERVICE = "qd-bookmap"
-BUILD = "FIX08/P01"
-SUBSYSTEM = "FOUNDATION+STREAM+GLOBAL_LADDER_STATE_ENGINE"
+BUILD = "FIX09/P01"
+SUBSYSTEM = "FOUNDATION+STREAM+INCREMENTAL_LADDER_MERGE_ENGINE"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 5000))
@@ -40,7 +42,7 @@ SYMBOL = os.environ.get("QD_SYMBOL", "BTC_USDT").strip().upper()
 
 PING_SECS = float(os.environ.get("QD_WS_PING_SECS", "15"))
 TOP_N = int(os.environ.get("QD_BOOK_TOP_N", "25"))
-RAW_RING_MAX = int(os.environ.get("QD_RAW_RING_MAX", "40"))
+RAW_RING_MAX = int(os.environ.get("QD_RAW_RING_MAX", "60"))
 FRESH_SECS_GREEN = float(os.environ.get("QD_FRESH_SECS_GREEN", "5.0"))
 
 DEAL_COMPRESS = os.environ.get("QD_DEAL_COMPRESS", "false").strip().lower() in ("1", "true", "yes", "y", "on")
@@ -73,24 +75,16 @@ class Ring:
 
 RAW_RING = Ring(RAW_RING_MAX)
 START_TS = _now()
-
 LOCK = threading.Lock()
 
-# -----------------------------
-# Canonical global ladder book
-# -----------------------------
+
 class GlobalLadderBook:
     def __init__(self) -> None:
         self.bids: Dict[Decimal, Decimal] = {}
         self.asks: Dict[Decimal, Decimal] = {}
         self.version: Optional[int] = None
         self.last_update_ts: float = 0.0
-
-    def clear(self) -> None:
-        self.bids.clear()
-        self.asks.clear()
-        self.version = None
-        self.last_update_ts = 0.0
+        self.last_side_update_ts: Dict[str, float] = {"bids": 0.0, "asks": 0.0}
 
     def best_bid(self) -> Optional[Tuple[Decimal, Decimal]]:
         if not self.bids:
@@ -147,6 +141,8 @@ def _parse_depth_side(side: Any) -> Optional[List[Tuple[Decimal, Decimal]]]:
     MEXC futures push.depth format: [[price, orderCount, qty], ...]
     Use price (index 0) and qty (index 2). If only [price, qty] exists, accept (index 1).
     """
+    if side is None:
+        return None
     if not isinstance(side, list):
         return None
     out: List[Tuple[Decimal, Decimal]] = []
@@ -169,11 +165,8 @@ def _check_invariants() -> Tuple[bool, str]:
     return True, ""
 
 
-# -----------------------------
-# Runtime state / telemetry
-# -----------------------------
 state: Dict[str, Any] = {
-    "status": "DISCONNECTED",  # DISCONNECTED | CONNECTED | ERROR
+    "status": "DISCONNECTED",
     "frames": 0,
     "reconnects": 0,
     "last_error": "",
@@ -181,8 +174,9 @@ state: Dict[str, Any] = {
     "last_close_reason": "",
     "last_connect_ts": 0.0,
     "last_event_ts": 0.0,
-    "engine": "WARMING",  # WARMING | ACTIVE | ERROR
-    "snapshots_applied": 0,
+    "engine": "WARMING",
+    "depth_msgs": 0,
+    "merge_applied": 0,
     "parse_hits": 0,
     "parse_misses": 0,
     "invariants_ok": True,
@@ -192,11 +186,11 @@ state: Dict[str, Any] = {
     "last_trade_qty": None,
     "last_trade_ts": 0.0,
     "trades_seen": 0,
+    "sides_seen": {"bids": 0, "asks": 0},
 }
 
 
 def _health() -> str:
-    # GREEN: ACTIVE + fresh + non-empty bid/ask
     with LOCK:
         fresh = (_now() - BOOK.last_update_ts) <= FRESH_SECS_GREEN
         bb = BOOK.best_bid()
@@ -228,20 +222,40 @@ async def _ping_loop(ws) -> None:
         await asyncio.sleep(PING_SECS)
 
 
-def _apply_depth_snapshot(depth_data: Dict[str, Any]) -> None:
-    asks_lv = _parse_depth_side(depth_data.get("asks"))
-    bids_lv = _parse_depth_side(depth_data.get("bids"))
-    ver = depth_data.get("version")
+def _merge_side(side_name: str, levels: List[Tuple[Decimal, Decimal]]) -> None:
+    book_side = BOOK.bids if side_name == "bids" else BOOK.asks
+    for p, q in levels:
+        if q <= 0:
+            if p in book_side:
+                del book_side[p]
+        else:
+            book_side[p] = q
+    BOOK.last_side_update_ts[side_name] = _now()
 
-    if asks_lv is None or bids_lv is None:
+
+def _apply_depth_merge(depth_data: Dict[str, Any]) -> None:
+    raw_asks = depth_data.get("asks", None)
+    raw_bids = depth_data.get("bids", None)
+    ver = depth_data.get("version", None)
+
+    asks_lv = _parse_depth_side(raw_asks) if raw_asks is not None else None
+    bids_lv = _parse_depth_side(raw_bids) if raw_bids is not None else None
+
+    if asks_lv is None and bids_lv is None:
         state["parse_misses"] += 1
         return
 
-    # Replace-on-snapshot global ladder
-    BOOK.asks = {p: q for p, q in asks_lv if q > 0}
-    BOOK.bids = {p: q for p, q in bids_lv if q > 0}
+    if asks_lv is not None:
+        _merge_side("asks", asks_lv)
+        state["sides_seen"]["asks"] += 1
+
+    if bids_lv is not None:
+        _merge_side("bids", bids_lv)
+        state["sides_seen"]["bids"] += 1
+
     if isinstance(ver, int):
         BOOK.version = ver
+
     BOOK.last_update_ts = _now()
 
     ok, viol = _check_invariants()
@@ -253,8 +267,8 @@ def _apply_depth_snapshot(depth_data: Dict[str, Any]) -> None:
     else:
         state["engine"] = "ACTIVE"
         state["last_error"] = ""
-    state["snapshots_applied"] += 1
-    state["parse_hits"] += 1
+
+    state["merge_applied"] += 1
 
 
 async def _ws_once() -> None:
@@ -310,9 +324,11 @@ async def _ws_once() -> None:
 
             with LOCK:
                 if ch == "push.depth":
+                    state["depth_msgs"] += 1
                     data = j.get("data")
                     if isinstance(data, dict):
-                        _apply_depth_snapshot(data)
+                        _apply_depth_merge(data)
+                        state["parse_hits"] += 1
                     else:
                         state["parse_misses"] += 1
 
@@ -323,7 +339,7 @@ async def _ws_once() -> None:
                         if isinstance(first, dict):
                             px = first.get("p")
                             qty = first.get("v")
-                            side = first.get("T")  # 1 buy, 2 sell (per docs)
+                            side = first.get("T")
                             side_s = "BUY" if str(side) == "1" else ("SELL" if str(side) == "2" else None)
                             state["trades_seen"] += len(data)
                             state["last_trade_px"] = str(px) if px is not None else state["last_trade_px"]
@@ -335,7 +351,6 @@ async def _ws_once() -> None:
                 elif ch == "pong":
                     pass
                 else:
-                    # ignore other channels
                     pass
 
         ptask.cancel()
@@ -355,7 +370,7 @@ async def _ws_forever() -> None:
                 state["status"] = "ERROR"
                 state["last_error"] = _safe_str(e)
                 state["reconnects"] += 1
-            await asyncio.sleep(backoff + (0.2 * (os.getpid() % 5)))
+            await asyncio.sleep(backoff)
             backoff = min(backoff * 1.7, backoff_max)
 
 
@@ -371,9 +386,6 @@ def _start_ws_thread() -> None:
     threading.Thread(target=runner, name="qd_ws", daemon=True).start()
 
 
-# -----------------------------
-# FastAPI app
-# -----------------------------
 app = FastAPI(title="QuantDesk Bookmap", version=BUILD)
 
 
@@ -384,24 +396,28 @@ def startup() -> None:
 
 @app.get("/")
 def root() -> HTMLResponse:
-    payload = {
-        "service": SERVICE,
-        "build": BUILD,
-        "subsystem": SUBSYSTEM,
-        "health": _health(),
-        "uptime_s": round(_now() - START_TS, 3),
-        "ws_url": WS_URL,
-        "symbol": SYMBOL,
-        "state": state,
-        "book": {
-            "best_bid": [str(BOOK.best_bid()[0]), str(BOOK.best_bid()[1])] if BOOK.best_bid() else None,
-            "best_ask": [str(BOOK.best_ask()[0]), str(BOOK.best_ask()[1])] if BOOK.best_ask() else None,
-            "depth_counts": BOOK.depth_counts(),
-            "totals": BOOK.totals(),
-            "version": BOOK.version,
-            "last_update_ts": BOOK.last_update_ts,
-        },
-    }
+    with LOCK:
+        bb = BOOK.best_bid()
+        ba = BOOK.best_ask()
+        payload = {
+            "service": SERVICE,
+            "build": BUILD,
+            "subsystem": SUBSYSTEM,
+            "health": _health(),
+            "uptime_s": round(_now() - START_TS, 3),
+            "ws_url": WS_URL,
+            "symbol": SYMBOL,
+            "state": state,
+            "book": {
+                "best_bid": [str(bb[0]), str(bb[1])] if bb else None,
+                "best_ask": [str(ba[0]), str(ba[1])] if ba else None,
+                "depth_counts": BOOK.depth_counts(),
+                "totals": BOOK.totals(),
+                "version": BOOK.version,
+                "last_update_ts": BOOK.last_update_ts,
+                "last_side_update_ts": BOOK.last_side_update_ts,
+            },
+        }
     return HTMLResponse("<pre>" + json.dumps(payload, indent=2) + "</pre>")
 
 
@@ -442,11 +458,13 @@ def telemetry_json() -> JSONResponse:
                 },
                 "engine": {
                     "status": state["engine"],
-                    "snapshots_applied": state["snapshots_applied"],
+                    "depth_msgs": state["depth_msgs"],
+                    "merge_applied": state["merge_applied"],
                     "parse_hits": state["parse_hits"],
                     "parse_misses": state["parse_misses"],
                     "invariants_ok": state["invariants_ok"],
                     "last_invariant_violation": state["last_invariant_violation"],
+                    "sides_seen": state["sides_seen"],
                     "book_version": BOOK.version,
                     "book_last_update_ts": BOOK.last_update_ts,
                     "best_bid": [str(bb[0]), str(bb[1])] if bb else None,
@@ -467,25 +485,26 @@ def telemetry_json() -> JSONResponse:
 
 @app.get("/book.json")
 def book_json() -> JSONResponse:
-    bb = BOOK.best_bid()
-    ba = BOOK.best_ask()
-    return JSONResponse(
-        {
-            "service": SERVICE,
-            "build": BUILD,
-            "symbol": SYMBOL,
-            "health": _health(),
-            "book": {
-                "best_bid": [str(bb[0]), str(bb[1])] if bb else None,
-                "best_ask": [str(ba[0]), str(ba[1])] if ba else None,
-                "depth_counts": BOOK.depth_counts(),
-                "totals": BOOK.totals(),
-                "version": BOOK.version,
-                "last_update_ts": BOOK.last_update_ts,
-                "top": BOOK.top_n(TOP_N),
-            },
-        }
-    )
+    with LOCK:
+        bb = BOOK.best_bid()
+        ba = BOOK.best_ask()
+        return JSONResponse(
+            {
+                "service": SERVICE,
+                "build": BUILD,
+                "symbol": SYMBOL,
+                "health": _health(),
+                "book": {
+                    "best_bid": [str(bb[0]), str(bb[1])] if bb else None,
+                    "best_ask": [str(ba[0]), str(ba[1])] if ba else None,
+                    "depth_counts": BOOK.depth_counts(),
+                    "totals": BOOK.totals(),
+                    "version": BOOK.version,
+                    "last_update_ts": BOOK.last_update_ts,
+                    "top": BOOK.top_n(TOP_N),
+                },
+            }
+        )
 
 
 @app.get("/raw.json")
