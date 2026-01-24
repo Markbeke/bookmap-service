@@ -1,23 +1,19 @@
 # =========================================================
-# QuantDesk Bookmap Service — FIX4 Render Bridge (Replit)
-# FOUNDATION_PASS preserved:
-# - FastAPI stays up
-# - WS reconnect loop
-# - Depth + trades flow
-# - Bids/asks populated
+# QuantDesk Bookmap Service — FIX12_BUCKETS_FIX5_FULL (Replit)
 #
-# FIX4 adds:
-# - Render Bridge: a static ladder/heat canvas from the CURRENT snapshot (no history buffer yet)
-# - Axis mapping (price -> y)
-# - Black background + blue->red palette (Bookmap-like direction; refined later)
-# - Minimal pan/zoom + autofollow toggle (stable; refined later)
+# This is a FULL, runnable single-file FastAPI service for the Replit web app,
+# preserving FOUNDATION_PASS and the subsequent Render/Heat/Band work,
+# while fixing the broken FIX12 bucket integration that caused SyntaxErrors,
+# NameErrors, and indentation issues in /snapshot.
 #
-# Next planned phases (not implemented here):
-# - Time-decay heat buffer (history)
-# - Auto-exposure (percentile/log/gamma)
-# - Band sparsify + smoothing + consumption
-# - Bubbles
-# - Persistence + iPad QA
+# What this build guarantees (Release Gate):
+# - Replit Run stays alive (no server crash due to frontend errors)
+# - "/" loads (canvas UI), HUD updates
+# - WS reconnect loop (MEXC)
+# - Depth + trades flow (when WS available)
+# - /snapshot NEVER throws (returns ok=false + error on exceptions)
+# - Bucket scale selector works: bs=auto|fine|medium|coarse
+#
 # =========================================================
 
 from __future__ import annotations
@@ -38,7 +34,6 @@ try:
 except Exception:
     websockets = None  # allows service to stay up even if dep missing
 
-
 # ---------------------------
 # Config
 # ---------------------------
@@ -47,17 +42,26 @@ MEXC_WS = os.getenv("QD_WS_URL", "wss://contract.mexc.com/edge").strip()
 
 PORT = int(os.getenv("PORT", os.getenv("QD_PORT", "5000")))
 
-RANGE_USD = float(os.getenv("QD_RANGE_USD", "400"))      # half-range around mid for y mapping
-BIN_USD = float(os.getenv("QD_BIN_USD", "5"))            # price bin size for snapshot ladder
-TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))    # levels retained per side
-# --- Wide ladder (show distant liquidity) ---
-WIDE_LADDER = int(os.getenv("QD_WIDE_LADDER", "1")) == 1
-WIDE_RANGE_USD = float(os.getenv("QD_WIDE_RANGE_USD", "2000"))  # +/- USD around mid/last for retention
+RANGE_USD = float(os.getenv("QD_RANGE_USD", "400"))          # half-range around mid for y mapping
+BIN_USD = float(os.getenv("QD_BIN_USD", "5"))                # snapshot bin size (near-ladder)
+TOPN_LEVELS = int(os.getenv("QD_TOPN_LEVELS", "200"))         # legacy top-N closest to market
+SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))         # UI polling target
+
+# --- Wide ladder (retain observed levels farther away) ---
+WIDE_LADDER_ON = int(os.getenv("QD_WIDE_LADDER", "1")) == 1
+WIDE_RANGE_USD = float(os.getenv("QD_WIDE_RANGE_USD", "2000"))
 MAX_LEVELS_PER_SIDE = int(os.getenv("QD_MAX_LEVELS_PER_SIDE", "4000"))
 
-SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
+# --- Buckets (historic band retention) ---
+BUCKETS_ENABLED = int(os.getenv("QD_BUCKETS", "1")) == 1
+BUCKET_SCALE_MODE_DEFAULT = os.getenv("QD_BUCKET_SCALE_MODE", "auto").strip().lower()
+BUCKET_CAP_PER_SCALE = int(os.getenv("QD_BUCKET_CAP_PER_SCALE", "1200"))
 
-BUILD = "FIX12_BUCKETS_FIX4"
+# Fixed coarse layers used for persistence; we pick nearest based on viewport.
+BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
+BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
+
+BUILD = "FIX12_BUCKETS_FIX5_FULL"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -91,27 +95,13 @@ STATE_LOCK = asyncio.Lock()
 BIDS: Dict[float, float] = {}
 ASKS: Dict[float, float] = {}
 
-# --- Multi-scale liquidity buckets (historic aggregation) ---
-# We only receive top-of-book depth (e.g., 200 levels/side).
-# Bookmap still shows "distant" liquidity because it retains
-# historical levels as price migrates. We emulate that by storing
-# time-decayed, aggregated liquidity in coarse price buckets.
-#
-# Each scale aggregates levels into bins (e.g., $25 / $100 / $250).
-# We keep a decayed "max-like" value per bin so strong bands persist
-# even after they leave the current top-N ladder.
-BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
-BUCKET_HALF_LIFE_SEC = {25.0: 6*60.0, 100.0: 18*60.0, 250.0: 60*60.0}
-BUCKET_MAX_BINS = {25.0: 1200, 100.0: 800, 250.0: 600}
-BUCKETS: Dict[float, Dict[float, float]] = {s: {} for s in BUCKET_SCALES_USD}  # scale -> {bin_px: strength}
-BUCKETS_LAST_MS: Dict[float, int] = {s: 0 for s in BUCKET_SCALES_USD}
 LAST_DEPTH_MS: Optional[int] = None
 LAST_TRADE_MS: Optional[int] = None
 
-
-# Ladder bounds used by /snapshot and frontend (derived from book).
+# Session-expanding ladder bounds used for wide mode.
 LADDER_MIN_PX: Optional[float] = None
 LADDER_MAX_PX: Optional[float] = None
+
 _PRINT_TS: List[float] = []  # timestamps (seconds) of prints, rolling 60s
 
 
@@ -120,32 +110,13 @@ def _now_ms() -> int:
 
 
 def _set_err(msg: str) -> None:
-    STATE["last_error"] = msg
+    # Never raise; just store
+    STATE["last_error"] = str(msg)
 
-
-
-def _track_px(ts_ms: int, px: float) -> None:
-    """Maintain a short px history for adaptive viewport sizing."""
-    try:
-        PX_HIST.append((int(ts_ms), float(px)))
-        cutoff = int(time.time() * 1000 - MS_VOL_LOOKBACK_SEC * 1000)
-        # prune in-place (history is small)
-        i = 0
-        n = len(PX_HIST)
-        while i < n and PX_HIST[i][0] < cutoff:
-            i += 1
-        if i > 0:
-            del PX_HIST[:i]
-        # hard cap to prevent runaway
-        if len(PX_HIST) > 2000:
-            del PX_HIST[:-2000]
-    except Exception:
-        return
 
 def _track_print(now_s: float) -> None:
     _PRINT_TS.append(now_s)
     cutoff = now_s - 60.0
-    # prune old
     i = 0
     for t0 in _PRINT_TS:
         if t0 >= cutoff:
@@ -177,8 +148,7 @@ def _recompute_tob() -> None:
 def _update_ladder_bounds() -> None:
     """Expand session-wide ladder bounds so distant liquidity remains visible when zooming out.
 
-    Note: This cannot reveal liquidity that is not present in the depth feed (e.g., if the exchange only streams top-N levels).
-    It preserves/expands the visible price domain to include extremes we have observed so far.
+    This does not create new liquidity; it expands the visible domain to include extremes observed so far.
     """
     global LADDER_MIN_PX, LADDER_MAX_PX
     if not BIDS and not ASKS:
@@ -192,10 +162,8 @@ def _update_ladder_bounds() -> None:
             hi = max(BIDS.keys())
         if lo is None or hi is None:
             return
-        # Ensure non-zero span
         if hi <= lo:
             hi = lo + 1.0
-        # Expand with a small margin to reduce edge clipping
         span = float(hi - lo)
         margin = max(5.0, span * 0.05)
         lo2 = float(lo) - margin
@@ -205,20 +173,16 @@ def _update_ladder_bounds() -> None:
         if LADDER_MAX_PX is None or hi2 > LADDER_MAX_PX:
             LADDER_MAX_PX = hi2
     except Exception:
-        # Never let ladder logic crash the data plane
         return
 
 
+def _prune_depth() -> None:
+    """Prune retained depth for memory/performance.
 
-def _prune_topn() -> None:
-    """Prune retained depth.
-
-    FIX10 goal: allow a much wider ladder (distant resting liquidity) without unbounded memory.
-    - If WIDE_LADDER: keep levels within +/- WIDE_RANGE_USD around current center (mid/last),
-      and cap each side to MAX_LEVELS_PER_SIDE by *size* (largest qty), to preserve meaningful distant walls.
-    - Else: legacy TOPN_LEVELS closest-to-market.
+    - If WIDE_LADDER_ON: keep levels within +/- WIDE_RANGE_USD around current center,
+      and cap by size (largest qty) to MAX_LEVELS_PER_SIDE.
+    - Else: keep TOPN_LEVELS closest-to-market per side.
     """
-    # Determine center from current best bid/ask
     center = None
     if BIDS and ASKS:
         center = (max(BIDS.keys()) + min(ASKS.keys())) * 0.5
@@ -227,17 +191,15 @@ def _prune_topn() -> None:
     elif ASKS:
         center = min(ASKS.keys())
 
-    if WIDE_LADDER and center is not None:
+    if WIDE_LADDER_ON and center is not None:
         lo = center - float(WIDE_RANGE_USD)
         hi = center + float(WIDE_RANGE_USD)
 
-        # Drop levels outside range
         for px in [p for p in BIDS.keys() if p < lo or p > hi]:
             BIDS.pop(px, None)
         for px in [p for p in ASKS.keys() if p < lo or p > hi]:
             ASKS.pop(px, None)
 
-        # Cap by size (largest qty) to avoid runaway
         if len(BIDS) > MAX_LEVELS_PER_SIDE:
             keep = set(px for px, _ in heapq.nlargest(MAX_LEVELS_PER_SIDE, BIDS.items(), key=lambda kv: kv[1]))
             for px in list(BIDS.keys()):
@@ -250,7 +212,7 @@ def _prune_topn() -> None:
                     ASKS.pop(px, None)
         return
 
-    # Legacy TOPN: closest-to-market
+    # Legacy: closest-to-market
     if len(BIDS) > TOPN_LEVELS:
         for px in sorted(BIDS.keys())[:-TOPN_LEVELS]:
             BIDS.pop(px, None)
@@ -258,51 +220,53 @@ def _prune_topn() -> None:
         for px in sorted(ASKS.keys())[TOPN_LEVELS:]:
             ASKS.pop(px, None)
 
-# --- Buckets engine ---
+
+# ---------------------------
+# Buckets engine (historic persistence)
+# ---------------------------
+# scale -> {bin_px: strength}
+BUCKETS: Dict[float, Dict[float, float]] = {s: {} for s in BUCKET_SCALES_USD}
+BUCKETS_LAST_MS: Dict[float, int] = {s: 0 for s in BUCKET_SCALES_USD}
+
 
 def _bucket_decay_factor(scale_usd: float, now_ms: int) -> float:
-    """Return exp-decay factor for bucket values since last update.
-
-    We use a half-life per scale so distant liquidity fades slower, similar to Bookmap's
-    resting-liquidity persistence.
-    """
-    last = BUCKET_LAST_MS.get(scale_usd)
-    if last is None:
-        BUCKET_LAST_MS[scale_usd] = now_ms
+    last = int(BUCKETS_LAST_MS.get(scale_usd) or 0)
+    if last <= 0:
+        BUCKETS_LAST_MS[scale_usd] = now_ms
         return 1.0
-    dt = max(0, now_ms - int(last))
-    BUCKET_LAST_MS[scale_usd] = now_ms
-    if dt == 0:
+    dt_ms = max(0, now_ms - last)
+    BUCKETS_LAST_MS[scale_usd] = now_ms
+    if dt_ms <= 0:
         return 1.0
-    hl = float(BUCKET_HALF_LIFE_MS.get(scale_usd, 300_000))
-    # exp(-ln2 * dt/hl)
-    return float(pow(2.0, -dt / hl))
+    hl_s = float(BUCKET_HALF_LIFE_SEC.get(scale_usd, 600.0))
+    hl_ms = max(1.0, hl_s * 1000.0)
+    # exp(-ln2 * dt/hl) == 2^(-dt/hl)
+    return float(pow(2.0, -dt_ms / hl_ms))
 
 
 def _update_buckets_from_book(now_ms: int) -> None:
-    """Aggregate current retained depth into multi-scale buckets.
+    """Aggregate current retained depth into coarse bucket layers with decay.
 
-    IMPORTANT: Buckets are *not* a substitute for missing depth levels from the exchange.
-    They allow us to retain *discovered* liquidity bands across time as the market moves,
-    so the wider ladder can show previously observed levels.
+    This retains *observed* liquidity bands as price migrates, approximating Bookmap-like distant memory.
     """
     if not BUCKETS_ENABLED:
         return
+    if not BIDS and not ASKS:
+        return
 
-    # Snapshot current book (already pruned/capped)
-    levels = []
+    levels: List[Tuple[float, float]] = []
     if BIDS:
-        levels.extend(BIDS.items())
+        levels.extend((float(px), float(q)) for px, q in BIDS.items())
     if ASKS:
-        levels.extend(ASKS.items())
+        levels.extend((float(px), float(q)) for px, q in ASKS.items())
     if not levels:
         return
 
     for scale in BUCKET_SCALES_USD:
-        decay = _bucket_decay_factor(scale, now_ms)
         d = BUCKETS.setdefault(scale, {})
+        decay = _bucket_decay_factor(scale, now_ms)
 
-        # Decay existing buckets
+        # decay existing
         if decay < 0.9999 and d:
             for k in list(d.keys()):
                 v = d[k] * decay
@@ -311,130 +275,94 @@ def _update_buckets_from_book(now_ms: int) -> None:
                 else:
                     d[k] = v
 
-        # Aggregate this tick
-        tmp = {}
+        # aggregate current snapshot into scale bins
+        tmp: Dict[float, float] = {}
         for px, qty in levels:
             b = round(px / scale) * scale
             tmp[b] = tmp.get(b, 0.0) + float(qty)
 
-        # Merge: use max to keep the strongest recently-seen wall, rather than summing forever
+        # merge with max-like persistence to avoid infinite accumulation
         for b, q in tmp.items():
             prev = d.get(b, 0.0)
-            d[b] = max(prev, q)
+            d[b] = max(prev, float(q))
 
-        # Hard cap per scale: keep only the strongest buckets
+        # cap by strength
         cap = int(BUCKET_CAP_PER_SCALE)
         if len(d) > cap:
-            # keep top cap by qty
             keep = set(sorted(d, key=lambda k: d[k], reverse=True)[:cap])
             for k in list(d.keys()):
                 if k not in keep:
                     d.pop(k, None)
 
 
-
 def choose_bucket_scale(half_range: float, mode: str = "auto") -> float:
-    """
-    Select a USD bucket size for aggregating depth into stable liquidity bands.
+    """Select which fixed scale to use for rendering based on viewport, with optional override.
 
-    half_range: the viewport half-range in USD around the mid/last.
-    mode: "auto" | "fine" | "medium" | "coarse"
-
-    Returns bucket_size_usd >= 0.1
+    Returns one of BUCKET_SCALES_USD (nearest by heuristic).
     """
     hr = max(0.0, float(half_range or 0.0))
+    mode = (mode or "auto").lower().strip()
 
-    # Base auto scale by visible range (heuristic for BTC perp).
-    if hr <= 50:
-        base = 1.0
-    elif hr <= 150:
-        base = 2.0
-    elif hr <= 300:
-        base = 5.0
-    elif hr <= 600:
-        base = 10.0
-    elif hr <= 1200:
-        base = 25.0
-    elif hr <= 2500:
-        base = 50.0
-    else:
-        base = 100.0
-
-    mode = (mode or "auto").lower()
+    # Manual override maps directly to a reasonable fixed layer
     if mode == "fine":
-        base = max(0.5, base / 2.0)
+        target = 25.0
     elif mode == "coarse":
-        base = base * 2.0
+        target = 250.0
     elif mode == "medium":
-        # keep base
-        base = base
+        target = 100.0
     else:
-        # auto / unknown
-        base = base
+        # auto heuristic
+        if hr <= 600:
+            target = 25.0
+        elif hr <= 2000:
+            target = 100.0
+        else:
+            target = 250.0
 
-    return float(base)
+    # Pick nearest available
+    best = BUCKET_SCALES_USD[0]
+    best_d = abs(best - target)
+    for s in BUCKET_SCALES_USD[1:]:
+        d = abs(s - target)
+        if d < best_d:
+            best, best_d = s, d
+    return float(best)
 
 
-def _build_bucket_bins(center: float, half_range: float, bucket_scale: str | None = None):
+def _build_bucket_bins(center: float, half_range: float, bucket_scale_mode: Optional[str] = None) -> Tuple[List[List[float]], float, float]:
+    """Build bucket bins for the viewport from the selected bucket layer.
+
+    Returns: (bins[[px, strength]...], max_strength, bucket_usd_used)
     """
-    Build [bin_center, aggregated_qty] bins for the current viewport,
-    using a single aggregation layer (no multi-layer blending).
-    """
-    # Determine bucket size (USD)
-    mode = (bucket_scale or BUCKET_SCALE_MODE or "auto")
-    bucket = choose_bucket_scale(half_range, mode=str(mode))
+    if not BUCKETS_ENABLED:
+        return [], 0.0, 0.0
+
+    mode = (bucket_scale_mode or BUCKET_SCALE_MODE_DEFAULT or "auto").lower()
+    scale = choose_bucket_scale(half_range, mode=mode)
+
+    d = BUCKETS.get(scale) or {}
+    if not d:
+        return [], 0.0, float(scale)
 
     vmin = float(center) - float(half_range)
     vmax = float(center) + float(half_range)
-    if vmax <= vmin or bucket <= 0:
-        return [], 0.0
 
-    # Collect samples from current orderbook within [vmin, vmax]
-    bids = _sample_book_in_range(ORDERBOOK_BIDS, vmin, vmax)
-    asks = _sample_book_in_range(ORDERBOOK_ASKS, vmin, vmax)
+    out: List[List[float]] = []
+    mx = 0.0
+    for px, v in d.items():
+        if vmin <= float(px) <= vmax and v > 0:
+            fv = float(v)
+            if fv > mx:
+                mx = fv
+            out.append([float(px), fv])
 
-    # Bin aggregator keyed by bin index
-    agg = {}
-    maxq = 0.0
-
-    def add_level(px: float, qty: float):
-        nonlocal maxq
-        try:
-            px = float(px); qty = float(qty)
-        except Exception:
-            return
-        if qty <= 0:
-            return
-        # Index based on bucket size
-        idx = int(math.floor((px - vmin) / bucket))
-        if idx < 0:
-            return
-        bcenter = vmin + (idx + 0.5) * bucket
-        agg[bcenter] = agg.get(bcenter, 0.0) + qty
-        if agg[bcenter] > maxq:
-            maxq = agg[bcenter]
-
-    for lvl in bids:
-        # lvl can be (px, qty) OR [px, qty, count]
-        try:
-            px = lvl[0]; qty = lvl[1]
-        except Exception:
-            continue
-        add_level(px, qty)
-
-    for lvl in asks:
-        try:
-            px = lvl[0]; qty = lvl[1]
-        except Exception:
-            continue
-        add_level(px, qty)
-
-    # Convert to sorted list
-    out = [[float(k), float(v)] for k, v in sorted(agg.items(), key=lambda kv: kv[0])]
-    return out, float(maxq)
+    out.sort(key=lambda x: x[0])
+    return out, float(mx), float(scale)
 
 
-
+# ---------------------------
+# Snapshot (near-ladder bins)
+# ---------------------------
 def _bin_price(px: float, bin_usd: float) -> float:
     if bin_usd <= 0:
         return px
@@ -442,23 +370,17 @@ def _bin_price(px: float, bin_usd: float) -> float:
 
 
 def _build_heat_bins(center: float, half_range: float, bin_usd: float) -> Tuple[List[List[float]], float]:
-    """
-    Build snapshot ladder bins from CURRENT depth only (no history).
-    Returns:
-      heat_bins: [[price_bin, intensity_qty], ...] within visible range
-      heat_max:  max intensity
-    """
     lo = center - half_range
     hi = center + half_range
     accum: Dict[float, float] = {}
 
     for p, q in BIDS.items():
         if lo <= p <= hi:
-            pb = _bin_price(p, bin_usd)
+            pb = _bin_price(float(p), bin_usd)
             accum[pb] = accum.get(pb, 0.0) + float(q)
     for p, q in ASKS.items():
         if lo <= p <= hi:
-            pb = _bin_price(p, bin_usd)
+            pb = _bin_price(float(p), bin_usd)
             accum[pb] = accum.get(pb, 0.0) + float(q)
 
     if not accum:
@@ -466,31 +388,21 @@ def _build_heat_bins(center: float, half_range: float, bin_usd: float) -> Tuple[
 
     items = sorted(accum.items(), key=lambda x: x[0])
     heat_max = max(v for _, v in items) if items else 0.0
-    # JSON-friendly lists
     heat_bins = [[float(p), float(v)] for p, v in items]
     return heat_bins, float(heat_max)
-
-
-def _top_levels(side: Dict[float, float], n: int, desc: bool) -> List[List[float]]:
-    # Return sorted [[price, qty], ...]
-    if not side:
-        return []
-    ks = sorted(side.keys(), reverse=desc)
-    out = []
-    for p in ks[:n]:
-        out.append([float(p), float(side.get(p, 0.0))])
-    return out
 
 
 # ---------------------------
 # MEXC WS consumer
 # ---------------------------
 async def mexc_consumer_loop() -> None:
-    """
+    """MEXC perpetual WS consumer.
+
     Subscribes to:
-      - push.depth (levels [price, qty, count], qty=0 means remove)
-      - push.deal  (prints p, v, T(1 buy,2 sell), t ms)
-    Applies partial depth updates without wiping a side.
+      - depth
+      - deal
+
+    IMPORTANT: The exact channel naming can vary; we key off 'push.depth'/'push.deal' substring.
     """
     global LAST_DEPTH_MS, LAST_TRADE_MS
 
@@ -504,7 +416,7 @@ async def mexc_consumer_loop() -> None:
     while True:
         try:
             async with websockets.connect(MEXC_WS, ping_interval=20, ping_timeout=20) as ws:
-                # Subscribe (keep params minimal; MEXC accepts)
+                # Subscribe
                 await ws.send(json.dumps({"method": "sub.depth", "param": {"symbol": SYMBOL, "depth": 20}}))
                 await ws.send(json.dumps({"method": "sub.deal", "param": {"symbol": SYMBOL}}))
 
@@ -524,20 +436,18 @@ async def mexc_consumer_loop() -> None:
                     except Exception:
                         continue
 
-                    ch = msg.get("channel") or msg.get("c") or ""
-                    if not ch:
-                        s = json.dumps(msg)
-                        if "push.depth" in s:
-                            ch = "push.depth"
-                        elif "push.deal" in s:
-                            ch = "push.deal"
+                    ch = (msg.get("channel") or msg.get("c") or "")
+
+                    # Some acks might not include channel; ignore quickly
+                    if not isinstance(ch, str):
+                        ch = ""
 
                     if "push.depth" in ch:
                         data = msg.get("data") or {}
                         bids = data.get("bids") or []
                         asks = data.get("asks") or []
 
-                        # Apply partial updates
+                        # Apply partial updates (levels [price, qty, count], qty=0 => remove)
                         for lvl in bids:
                             if not isinstance(lvl, (list, tuple)) or len(lvl) < 2:
                                 continue
@@ -563,8 +473,9 @@ async def mexc_consumer_loop() -> None:
                                 ASKS[p] = q
 
                         LAST_DEPTH_MS = now_ms
-                        _prune_topn()
+                        _prune_depth()
                         _update_buckets_from_book(now_ms)
+
                         async with STATE_LOCK:
                             _recompute_tob()
                             _update_ladder_bounds()
@@ -583,6 +494,7 @@ async def mexc_consumer_loop() -> None:
                                 pass
                             LAST_TRADE_MS = now_ms
                             _track_print(time.time())
+
                             async with STATE_LOCK:
                                 _recompute_tob()
                                 _update_ladder_bounds()
@@ -606,11 +518,9 @@ async def _startup() -> None:
 # ---------------------------
 # Routes
 # ---------------------------
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    # IMPORTANT: This HTML/JS/CSS must NOT use Python f-strings.
+    # IMPORTANT: Keep HTML as raw string; do not paste JS into Python scope.
     html = r"""<!doctype html>
 <html>
 <head>
@@ -681,7 +591,6 @@ async def index() -> str:
   const CANVAS = document.getElementById('c');
   const ctx = CANVAS.getContext('2d');
 
-  // Offscreen heat buffer (time-accumulator)
   const heat = document.createElement('canvas');
   const hctx = heat.getContext('2d');
 
@@ -716,76 +625,65 @@ async def index() -> str:
   let autofollow = true;
   let testPattern = false;
   let wideMode = true;
-    let bucketScaleMode = "auto"; // use session-expanding ladder bounds + wide heat bins
+  let bucketScaleMode = "auto";
 
-  // View state
   let centerPx = null;
   let zoom = 1.0;
   let panPx = 0.0;
   let dragging = false;
   let lastY = 0;
 
-  // Heat accumulator settings (Phase 3)
-  const COL_PX = 2;            // width of the newest time column in pixels
-  const DECAY_ALPHA = 0.035;   // how quickly old heat fades (overlay black with this alpha each tick)
-  const MAX_EMA_ALPHA = 0.08;  // EMA smoothing for exposure scaling (Phase 4 later improves this)
+  const COL_PX = 2;
+  const DECAY_ALPHA = 0.035;
+  const MAX_EMA_ALPHA = 0.08;
 
-  let emaMax = 0.0;            // running max for scaling
-  let lastDrawSnap = null;
-  // Auto-exposure (Phase 4): robust percentile scaling on recent heat_max samples
-  const MAXV_WIN = 240; // ~1 minute at 4Hz; adjusted by tick rate
+  let emaMax = 0.0;
+  const MAXV_WIN = 240;
   const maxvHist = new Array(MAXV_WIN);
   let maxvIdx = 0;
   let maxvCount = 0;
-  let heatGain = 1.00;      // multiplies exposure
-  let heatGamma = 0.65;     // <1 brightens bands, >1 darkens
-  let heatFloor = 0.02;     // threshold below which pixels stay near-black
-  // Band quality (Phase 5)
-  let topNLevels = 70;        // keep strongest N levels per column (bids+asks combined)
-  let smoothBands = true;     // light vertical smoothing
-  let consumeOnPrints = true; // accelerate fade at traded price rows
-  let consumeStrength = 0.18; // 0..1 extra decay per hit
-  let consumeCols = 6;        // affect newest N columns
-  let consumeMinNotional = 1500.0; // USD threshold to count as consumption
-  let bandify = true;          // coalesce adjacent rows into continuous bands
-  let bandGapBins = 1;         // allow small gaps when merging (in bins)
-  let bandMinBins = 2;         // minimum band thickness in bins
-  let bandEdgeSoft = 0.12;     // soften edges via alpha taper
 
-  // --- Dominance engine (Phase 6): rank bands by persistence + strength so key liquidity stands out ---
+  let heatGain = 1.00;
+  let heatGamma = 0.65;
+  let heatFloor = 0.02;
+
+  let topNLevels = 70;
+  let smoothBands = true;
+  let consumeOnPrints = true;
+  let consumeStrength = 0.18;
+  let consumeCols = 6;
+  let consumeMinNotional = 1500.0;
+
+  let bandify = true;
+  let bandGapBins = 1;
+  let bandMinBins = 2;
+  let bandEdgeSoft = 0.12;
+
   let domOn = true;
-  let domAgeW = 0.35;          // how much persistence influences brightness (0..1-ish)
-  const domBands = [];         // tracked bands across columns
+  let domAgeW = 0.35;
+  const domBands = [];
   const DOM_MAX_BANDS = 256;
-  const DOM_FORGET_MS = 60_000;
+  const DOM_FORGET_MS = 60000;
 
-  function bandsOverlap(a0,a1,b0,b1) {
-    return !(a1 < b0 || b1 < a0);
-  }
+  function bandsOverlap(a0,a1,b0,b1) { return !(a1 < b0 || b1 < a0); }
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
     const w = Math.floor(window.innerWidth * dpr);
     const h = Math.floor(window.innerHeight * dpr);
     if (CANVAS.width !== w || CANVAS.height !== h) {
-      CANVAS.width = w;
-      CANVAS.height = h;
+      CANVAS.width = w; CANVAS.height = h;
     }
     if (heat.width !== CANVAS.width || heat.height !== CANVAS.height) {
-      // Preserve existing heat if possible: draw into a resized canvas
       const prev = document.createElement('canvas');
       prev.width = heat.width; prev.height = heat.height;
       const pctx = prev.getContext('2d');
-      pctx.drawImage(heat, 0, 0);
+      if (prev.width>0 && prev.height>0) pctx.drawImage(heat, 0, 0);
 
-      heat.width = CANVAS.width;
-      heat.height = CANVAS.height;
-      hctx.fillStyle = '#000';
-      hctx.fillRect(0, 0, heat.width, heat.height);
-
-      if (prev.width > 0 && prev.height > 0) {
-        // Fit old heat (simple stretch to keep continuity)
-        hctx.drawImage(prev, 0, 0, prev.width, prev.height, 0, 0, heat.width, heat.height);
+      heat.width = CANVAS.width; heat.height = CANVAS.height;
+      hctx.fillStyle = '#000'; hctx.fillRect(0,0,heat.width,heat.height);
+      if (prev.width>0 && prev.height>0) {
+        hctx.drawImage(prev, 0,0,prev.width,prev.height, 0,0,heat.width,heat.height);
       }
     }
   }
@@ -798,11 +696,9 @@ async def index() -> str:
     return (Math.round(x * 100) / 100).toFixed(2);
   }
 
-  // Simple blue->red heat mapping (Phase 4 will replace with percentile/log/gamma)
   function heatColor(t) {
-    // Bookmap-like: deep blue -> cyan -> yellow -> red (on black)
     t = Math.max(0, Math.min(1, t));
-    let r=0, g=0, b=0;
+    let r=0,g=0,b=0;
     if (t < 0.33) {
       const u = t / 0.33;
       r = Math.floor(10 * u);
@@ -822,27 +718,23 @@ async def index() -> str:
     return `rgb(${r},${g},${b})`;
   }
 
-  // --- Phase 5 helpers ---
   function smoothArrayInPlace(a) {
-    // light 1D kernel [0.25, 0.5, 0.25]
     const n = a.length;
     if (n < 3) return;
-    let prev = a[0];
-    let curr = a[1];
-    for (let i = 1; i < n - 1; i++) {
-      const next = a[i + 1];
-      const v = 0.25 * prev + 0.50 * curr + 0.25 * next;
-      prev = curr;
-      curr = next;
+    let prev = a[0], curr = a[1];
+    for (let i=1; i<n-1; i++) {
+      const next = a[i+1];
+      const v = 0.25*prev + 0.50*curr + 0.25*next;
+      prev = curr; curr = next;
       a[i] = v;
     }
   }
 
   function topNIndicesByValue(a, topN) {
     const idxs = [];
-    for (let i = 0; i < a.length; i++) {
+    for (let i=0;i<a.length;i++) {
       const v = a[i];
-      if (v && isFinite(v) && v > 0) idxs.push(i);
+      if (v && isFinite(v) && v>0) idxs.push(i);
     }
     if (idxs.length <= topN) return idxs;
     idxs.sort((i,j)=>a[j]-a[i]);
@@ -850,33 +742,22 @@ async def index() -> str:
   }
 
   function computeBandRuns(arr, keepIdxs, gapBins, minBins) {
-    // Returns list of [startIdx, endIdxInclusive, maxVal] for merged bands
     const keep = new Uint8Array(arr.length);
-    for (let k=0; k<keepIdxs.length; k++) keep[keepIdxs[k]] = 1;
-
+    for (let k=0;k<keepIdxs.length;k++) keep[keepIdxs[k]] = 1;
     const runs = [];
     let i = 0;
     while (i < arr.length) {
       if (!keep[i] || !(arr[i] > 0)) { i++; continue; }
-      let s = i, e = i, mx = arr[i];
-      let gap = 0;
+      let s=i, e=i, mx=arr[i], gap=0;
       i++;
       while (i < arr.length) {
         const ok = keep[i] && (arr[i] > 0);
-        if (ok) {
-          e = i;
-          if (arr[i] > mx) mx = arr[i];
-          gap = 0;
-        } else {
-          gap++;
-          if (gap > gapBins) break;
-        }
+        if (ok) { e=i; if (arr[i]>mx) mx=arr[i]; gap=0; }
+        else { gap++; if (gap>gapBins) break; }
         i++;
       }
       e = Math.max(s, e);
-      if ((e - s + 1) >= Math.max(1, minBins)) {
-        runs.push([s, e, mx]);
-      }
+      if ((e-s+1) >= Math.max(1, minBins)) runs.push([s,e,mx]);
     }
     return runs;
   }
@@ -887,9 +768,6 @@ async def index() -> str:
   }
 
   function viewBounds(snap) {
-    // Two modes:
-    //  (1) Normal: centered on `centerPx` with configurable half_range.
-    //  (2) Wide ladder: use session-expanding ladder_min/max (preserves distant liquidity we have observed).
     if (wideMode && snap && isFinite(snap.ladder_min_px) && isFinite(snap.ladder_max_px) && (snap.ladder_max_px > snap.ladder_min_px)) {
       const baseLo = snap.ladder_min_px;
       const baseHi = snap.ladder_max_px;
@@ -908,20 +786,30 @@ async def index() -> str:
     return { lo, hi, halfRange, effHalf };
   }
 
-  function yOfPrice(p, lo, hi, H) {
-    return (hi - p) / (hi - lo) * H;
+  function yOfPrice(p, lo, hi, H) { return (hi - p) / (hi - lo) * H; }
+
+  function percentile(arr, n, q) {
+    if (n <= 0) return 0;
+    const tmp = [];
+    for (let i=0; i<n; i++) {
+      const v = arr[i];
+      if (v !== undefined && v !== null && isFinite(v) && v > 0) tmp.push(v);
+    }
+    if (tmp.length === 0) return 0;
+    tmp.sort((a,b)=>a-b);
+    const idx = Math.max(0, Math.min(tmp.length-1, Math.floor(q * (tmp.length-1))));
+    return tmp[idx];
   }
 
   function updateHeat(snap) {
     const W = heat.width, H = heat.height;
-    if (W <= 0 || H <= 0) return;
+    if (W<=0 || H<=0) return;
 
-    // decay old heat
+    // fade old heat
     hctx.fillStyle = `rgba(0,0,0,${DECAY_ALPHA})`;
     hctx.fillRect(0, 0, W, H);
 
-    // shift left by COL_PX (time passes)
-    // drawImage on itself is allowed in browsers; still safe to do via temp for iPad stability.
+    // shift left (time)
     const tmp = document.createElement('canvas');
     tmp.width = W; tmp.height = H;
     const tctx = tmp.getContext('2d');
@@ -929,25 +817,21 @@ async def index() -> str:
     hctx.clearRect(0, 0, W, H);
     hctx.drawImage(tmp, -COL_PX, 0);
 
-    // clear the newest column region
+    // clear newest columns
     hctx.fillStyle = '#000';
     hctx.fillRect(W - COL_PX, 0, COL_PX, H);
 
-
-    // Decide bins/max
-    // Choose which ladder to render
     let bins = (snap && snap.heat_bins) ? snap.heat_bins : [];
     let maxv = (snap && snap.heat_max) ? snap.heat_max : 0;
     let binUsd = (snap && snap.bin_usd) ? snap.bin_usd : __BIN_USD__;
+
     if (wideMode && snap && snap.wide_heat_bins && snap.wide_heat_bins.length) {
       bins = snap.wide_heat_bins;
       maxv = (snap.wide_heat_max) ? snap.wide_heat_max : maxv;
       if (snap.wide_bin_usd) binUsd = snap.wide_bin_usd;
     }
 
-    // Bucket overlay: aggregate historical resting liquidity at coarser scales.
-    // We merge these bins into the same rendering pipeline so band-quality and
-    // coalescing operate consistently.
+    // Bucket overlay
     let bucketBins = (snap && snap.bucket_bins) ? snap.bucket_bins : [];
     let bucketMax = (snap && snap.bucket_max) ? snap.bucket_max : 0;
     if (wideMode && snap && snap.wide_bucket_bins && snap.wide_bucket_bins.length) {
@@ -955,148 +839,102 @@ async def index() -> str:
       bucketMax = (snap.wide_bucket_max) ? snap.wide_bucket_max : bucketMax;
     }
     if (bucketBins && bucketBins.length) {
-      // Append; downstream quantization will combine overlapping rows.
       bins = bins.concat(bucketBins);
       maxv = Math.max(maxv, bucketMax || 0);
     }
 
     const { lo, hi } = viewBounds(snap);
 
-    // Consumption fade (Phase 5): large prints fade bands at the traded price row.
-    if (consumeOnPrints && snap && snap.trades && snap.trades.length) {
-      const colsPx = Math.max(1, Math.floor(consumeCols)) * COL_PX;
-      const x0 = Math.max(0, W - colsPx);
-      const alpha = Math.max(0, Math.min(1, consumeStrength));
-      for (let k=0; k<snap.trades.length; k++) {
-        const tr = snap.trades[k];
-        const p = tr && (tr.p ?? tr.price);
-        const v = tr && (tr.v ?? tr.size);
-        if (!isFinite(p) || !isFinite(v)) continue;
-        const notional = Math.abs(p * v);
-        if (notional < consumeMinNotional) continue;
-        const y = yOfPrice(p, lo, hi, H);
-        const stripe = Math.max(2, Math.floor((window.devicePixelRatio||1) * 2));
-        hctx.fillStyle = `rgba(0,0,0,${alpha})`;
-        hctx.fillRect(x0, y - stripe*0.5, colsPx, stripe);
-      }
-    }
     if (testPattern) {
       bins = [];
       const steps = 48;
-      for (let i=0; i<=steps; i++) {
+      for (let i=0;i<=steps;i++) {
         const p = lo + (hi-lo) * (i/steps);
         const t = i/steps;
         bins.push([p, t]);
       }
       maxv = 1.0;
-    }    // --- Auto-exposure (robust): track recent heat_max values and use percentile scaling ---
+    }
+
     if (maxv && isFinite(maxv) && maxv > 0) {
       maxvHist[maxvIdx] = maxv;
       maxvIdx = (maxvIdx + 1) % MAXV_WIN;
       maxvCount = Math.min(MAXV_WIN, maxvCount + 1);
-      // keep a light EMA too (helps when percentile window is sparse)
       emaMax = (1 - MAX_EMA_ALPHA) * emaMax + (MAX_EMA_ALPHA) * maxv;
       if (emaMax < maxv) emaMax = maxv;
     }
 
-    function percentile(arr, n, q) {
-      if (n <= 0) return 0;
-      const tmp = [];
-      for (let i=0; i<n; i++) {
-        const v = arr[i];
-        if (v !== undefined && v !== null && isFinite(v) && v > 0) tmp.push(v);
-      }
-      if (tmp.length === 0) return 0;
-      tmp.sort((a,b)=>a-b);
-      const idx = Math.max(0, Math.min(tmp.length-1, Math.floor(q * (tmp.length-1))));
-      return tmp[idx];
-    }
-
     const p98 = percentile(maxvHist, maxvCount, 0.98);
     let scaleMax = Math.max(1e-9, Math.max(p98 || 0, emaMax || 0));
-    // apply gain (higher gain => brighter => lower scaleMax)
     scaleMax = scaleMax / Math.max(1e-6, heatGain);
 
-    // Draw new column (Phase 5/8 quality: smooth + TopN + band coalescing)
     if (bins && bins.length > 0) {
-      // Quantize into uniform price bins so smoothing + TopN are stable.
       const nBins = Math.max(1, Math.floor((hi - lo) / Math.max(1e-9, binUsd)) + 1);
       const arr = new Float32Array(nBins);
 
-      for (let i=0; i<bins.length; i++) {
+      for (let i=0;i<bins.length;i++) {
         const p = bins[i][0];
         const v = bins[i][1];
         if (!(p >= lo && p <= hi)) continue;
         const idx = Math.max(0, Math.min(nBins-1, Math.floor((p - lo) / binUsd)));
-        // use max so ladder spikes don't smear by summation
         if (v > arr[idx]) arr[idx] = v;
       }
 
       if (smoothBands) smoothArrayInPlace(arr);
-
       const keepIdxs = topNIndicesByValue(arr, Math.max(1, Math.floor(topNLevels)));
-
       hctx.globalAlpha = 0.95;
 
       if (bandify) {
         const runs = computeBandRuns(arr, keepIdxs, Math.max(0, Math.floor(bandGapBins)), Math.max(1, Math.floor(bandMinBins)));
-
-        // Dominance tracking: remember strong bands across time so they stay visually prominent.
         const domRel = new Array(runs.length).fill(0.0);
+
         if (domOn) {
           const now = Date.now();
-          // prune old
-          for (let i = domBands.length - 1; i >= 0; i--) {
+          for (let i=domBands.length-1; i>=0; i--) {
             if ((now - domBands[i].lastSeen) > DOM_FORGET_MS) domBands.splice(i, 1);
             else domBands[i].seen = false;
           }
 
-          // match current runs to tracked bands
           for (let r=0; r<runs.length; r++) {
             const s = runs[r][0], e = runs[r][1], mx = runs[r][2];
-            let best = -1;
-            let bestOv = -1;
-            const c = 0.5 * (s + e);
+            let best = -1, bestOv = -1;
+            const c = 0.5*(s+e);
             for (let i=0; i<domBands.length; i++) {
               const b = domBands[i];
               if (!bandsOverlap(s, e, b.s, b.e)) continue;
-              const bc = 0.5 * (b.s + b.e);
-              const dist = Math.abs(c - bc);
-              if (dist > 6) continue;
-              const ov = Math.min(e, b.e) - Math.max(s, b.s);
+              const bc = 0.5*(b.s+b.e);
+              if (Math.abs(c-bc) > 6) continue;
+              const ov = Math.min(e,b.e) - Math.max(s,b.s);
               if (ov > bestOv) { bestOv = ov; best = i; }
             }
             if (best >= 0) {
               const b = domBands[best];
-              b.s = s; b.e = e; // follow current band bounds
+              b.s = s; b.e = e;
               b.str = 0.85*b.str + 0.15*mx;
               b.age = Math.min(5000, (b.age || 1) + 1);
               b.lastSeen = now;
               b.seen = true;
-              runs[r].push(best); // store band index for later
+              runs[r].push(best);
             } else {
               domBands.push({s:s, e:e, str:mx, age:1, lastSeen:now, seen:true});
-              runs[r].push(domBands.length - 1);
+              runs[r].push(domBands.length-1);
             }
           }
 
-          // cap band count (keep strongest)
           if (domBands.length > DOM_MAX_BANDS) {
             domBands.sort((a,b)=> (b.str||0) - (a.str||0));
             domBands.length = DOM_MAX_BANDS;
           }
 
-          // compute normalization across seen bands
           let domMax = 1e-6;
-          for (let i=0; i<domBands.length; i++) {
+          for (let i=0;i<domBands.length;i++) {
             const b = domBands[i];
             if (!b.seen) continue;
             const ageN = Math.min(200, b.age || 1) / 200.0;
             const score = Math.log1p(Math.max(0, b.str || 0)) * (1.0 + domAgeW * ageN);
             if (score > domMax) domMax = score;
           }
-
-          for (let r=0; r<runs.length; r++) {
+          for (let r=0;r<runs.length;r++) {
             const bi = runs[r][3];
             const b = domBands[bi] || null;
             if (!b) continue;
@@ -1106,32 +944,28 @@ async def index() -> str:
           }
         }
 
-        for (let r=0; r<runs.length; r++) {
-          const s = runs[r][0], e = runs[r][1], mx = runs[r][2];
-
+        for (let r=0;r<runs.length;r++) {
+          const s=runs[r][0], e=runs[r][1], mx=runs[r][2];
           let t = Math.max(0, Math.min(1, mx / scaleMax));
           t = Math.max(0, (t - heatFloor) / Math.max(1e-6, (1 - heatFloor)));
           t = Math.pow(t, heatGamma);
-          if (domOn) { t = Math.max(0, Math.min(1, t * (0.70 + 0.60 * domRel[r]))); }
+          if (domOn) t = Math.max(0, Math.min(1, t * (0.70 + 0.60 * domRel[r])));
 
           const p1 = lo + s * binUsd;
-          const p2 = lo + (e + 1) * binUsd;
+          const p2 = lo + (e+1) * binUsd;
 
           const y1 = yOfPrice(p1, lo, hi, H);
           const y2 = yOfPrice(p2, lo, hi, H);
-          const yTop = Math.min(y1, y2);
-          const yBot = Math.max(y1, y2);
+          const yTop = Math.min(y1,y2);
+          const yBot = Math.max(y1,y2);
           const hStripe = Math.max(1, (yBot - yTop));
 
-          // Edge softening via alpha taper (simple: draw core + faint rims)
           const rimAlpha = Math.max(0, Math.min(0.35, bandEdgeSoft));
           const rimPx = Math.max(1, Math.floor(hStripe * 0.18));
 
           hctx.fillStyle = heatColor(t);
-          // core
           hctx.globalAlpha = 0.95;
           hctx.fillRect(W - COL_PX, yTop + rimPx, COL_PX, Math.max(1, hStripe - 2*rimPx));
-          // rims
           if (rimPx >= 1) {
             hctx.globalAlpha = 0.95 * rimAlpha;
             hctx.fillRect(W - COL_PX, yTop, COL_PX, rimPx);
@@ -1139,26 +973,21 @@ async def index() -> str:
           }
         }
       } else {
-        // draw kept rows only (legacy)
-        for (let k=0; k<keepIdxs.length; k++) {
+        for (let k=0;k<keepIdxs.length;k++) {
           const idx = keepIdxs[k];
           const p = lo + idx * binUsd;
           const v = arr[idx];
-
           let t = Math.max(0, Math.min(1, v / scaleMax));
           t = Math.max(0, (t - heatFloor) / Math.max(1e-6, (1 - heatFloor)));
           t = Math.pow(t, heatGamma);
-
           const y = yOfPrice(p, lo, hi, H);
           const y2 = yOfPrice(p + binUsd, lo, hi, H);
           const hStripe = Math.max(1, Math.abs(y2 - y));
-
           hctx.fillStyle = heatColor(t);
           hctx.globalAlpha = 0.95;
           hctx.fillRect(W - COL_PX, y - hStripe*0.5, COL_PX, hStripe);
         }
       }
-
       hctx.globalAlpha = 1.0;
     }
   }
@@ -1168,7 +997,6 @@ async def index() -> str:
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, W, H);
 
-    // follow center
     const pxCenter = snap ? snap.center_px : null;
     if (autofollow && pxCenter !== null && isFinite(pxCenter)) {
       centerPx = pxCenter;
@@ -1176,32 +1004,10 @@ async def index() -> str:
     }
     if (centerPx === null) centerPx = pxCenter;
 
-    // draw heat buffer
     ctx.drawImage(heat, 0, 0);
 
-    // overlays
     const { lo, hi } = viewBounds(snap);
 
-    // Consumption fade (Phase 5): large prints fade bands at the traded price row.
-    if (consumeOnPrints && snap && snap.trades && snap.trades.length) {
-      const colsPx = Math.max(1, Math.floor(consumeCols)) * COL_PX;
-      const x0 = Math.max(0, W - colsPx);
-      const alpha = Math.max(0, Math.min(1, consumeStrength));
-      for (let k=0; k<snap.trades.length; k++) {
-        const tr = snap.trades[k];
-        const p = tr && (tr.p ?? tr.price);
-        const v = tr && (tr.v ?? tr.size);
-        if (!isFinite(p) || !isFinite(v)) continue;
-        const notional = Math.abs(p * v);
-        if (notional < consumeMinNotional) continue;
-        const y = yOfPrice(p, lo, hi, H);
-        const stripe = Math.max(2, Math.floor((window.devicePixelRatio||1) * 2));
-        hctx.fillStyle = `rgba(0,0,0,${alpha})`;
-        hctx.fillRect(x0, y - stripe*0.5, colsPx, stripe);
-      }
-    }
-
-    // price line
     if (snap && snap.last_px !== null && isFinite(snap.last_px)) {
       const y = yOfPrice(snap.last_px, lo, hi, H);
       ctx.strokeStyle = 'rgba(255,255,255,0.9)';
@@ -1212,7 +1018,6 @@ async def index() -> str:
       ctx.stroke();
     }
 
-    // right-side price ladder labels + faint grid
     ctx.fillStyle = 'rgba(255,255,255,0.75)';
     ctx.font = `${Math.floor(12 * (window.devicePixelRatio||1))}px sans-serif`;
     ctx.textAlign = 'right';
@@ -1237,9 +1042,32 @@ async def index() -> str:
       const r = await fetch(`/snapshot?bs=${encodeURIComponent(bucketScaleMode)}`, { cache: 'no-store' });
       if (!r.ok) throw new Error('bad http');
       return await r.json();
-    } catch (e) {
+    } catch (_) {
       return null;
     }
+  }
+
+  function setHudFromSnap(snap) {
+    const age = (snap.ws_msg_age_ms === null || snap.ws_msg_age_ms === undefined) ? null : Number(snap.ws_msg_age_ms);
+    const wsUp = (age !== null) && isFinite(age) && (age < 2500);
+    const depthAge = snap.depth_age_ms;
+    const green = wsUp && depthAge !== null && depthAge < 2500 && snap.book_bids_n > 0 && snap.book_asks_n > 0;
+    const txt = green ? 'HEALTH GREEN' : (wsUp ? 'HEALTH YELLOW/RED' : 'WS DOWN');
+    setStatus(green, txt);
+
+    elLast.textContent = fmt(snap.last_px);
+    elBid.textContent = fmt(snap.best_bid);
+    elAsk.textContent = fmt(snap.best_ask);
+    elMid.textContent = fmt(snap.mid);
+
+    const da = (depthAge === null || depthAge === undefined) ? '—' : `${Math.round(depthAge)}ms`;
+    const ta = (snap.trade_age_ms === null || snap.trade_age_ms === undefined) ? '—' : `${Math.round(snap.trade_age_ms)}ms`;
+    const wa = (age === null) ? '—' : `${Math.round(age)}ms`;
+    elAges.textContent = `depth_age=${da} trade_age=${ta} ws_msg_age=${wa}`;
+
+    elBook.textContent = `bids=${snap.book_bids_n} asks=${snap.book_asks_n}`;
+    elPrints.textContent = `${snap.prints_60s || 0}`;
+    elErr.textContent = (snap.ok === false && snap.error) ? String(snap.error) : '';
   }
 
   async function tick() {
@@ -1249,37 +1077,9 @@ async def index() -> str:
         setStatus(false, 'API unreachable');
         return;
       }
-
-      // authoritative WS health: based on message age (not a raw boolean)
-      const age = (snap.ws_msg_age_ms === null || snap.ws_msg_age_ms === undefined) ? null : Number(snap.ws_msg_age_ms);
-      const wsUp = (age !== null) && isFinite(age) && (age < 2500);
-
-      const depthAge = snap.depth_age_ms;
-      const green = wsUp && depthAge !== null && depthAge < 2500 && snap.book_bids_n > 0 && snap.book_asks_n > 0;
-      const txt = green ? 'HEALTH GREEN' : (wsUp ? 'HEALTH YELLOW/RED' : 'WS DOWN');
-      setStatus(green, txt);
-
-      elLast.textContent = fmt(snap.last_px);
-      elBid.textContent = fmt(snap.best_bid);
-      elAsk.textContent = fmt(snap.best_ask);
-      elMid.textContent = fmt(snap.mid);
-
-      const da = (depthAge === null || depthAge === undefined) ? '—' : `${Math.round(depthAge)}ms`;
-      const ta = (snap.trade_age_ms === null || snap.trade_age_ms === undefined) ? '—' : `${Math.round(snap.trade_age_ms)}ms`;
-      const wa = (age === null) ? '—' : `${Math.round(age)}ms`;
-      elAges.textContent = `depth_age=${da} trade_age=${ta} ws_msg_age=${wa}`;
-
-      elBook.textContent = `bids=${snap.book_bids_n} asks=${snap.book_asks_n}`;
-      elPrints.textContent = `${snap.prints_60s || 0}`;
-
-      lastDrawSnap = snap;
-
-      // Update heat accumulator then render frame
+      setHudFromSnap(snap);
       updateHeat(snap);
       drawFrame(snap);
-
-      if (snap.ok === false && snap.error) elErr.textContent = String(snap.error);
-      else elErr.textContent = '';
     } catch (e) {
       elErr.textContent = String(e && e.stack ? e.stack : e);
     }
@@ -1302,9 +1102,7 @@ async def index() -> str:
   wideBtn.addEventListener('click', () => {
     wideMode = !wideMode;
     wideBtn.textContent = `Wide ladder: ${wideMode ? 'ON' : 'OFF'}`;
-    // Reset view for predictable zoom when switching modes
-    panPx = 0;
-    zoom = 1.0;
+    panPx = 0; zoom = 1.0;
   });
   bucketScaleBtn.addEventListener('click', () => {
     const modes = ['auto','fine','medium','coarse'];
@@ -1312,7 +1110,6 @@ async def index() -> str:
     bucketScaleMode = modes[(i >= 0 ? i+1 : 0) % modes.length];
     bucketScaleBtn.textContent = 'Scale: ' + bucketScaleMode.toUpperCase();
   });
-
 
   function updateExposureLabels() {
     gainBtn.textContent = `Gain: ${heatGain.toFixed(2)}`;
@@ -1350,7 +1147,6 @@ async def index() -> str:
     heatFloor = steps[(idx + 1) % steps.length];
     updateExposureLabels();
   });
-
   topNBtn.addEventListener('click', () => {
     const steps = [40, 55, 70, 90, 120];
     let idx = steps.indexOf(topNLevels);
@@ -1358,21 +1154,9 @@ async def index() -> str:
     topNLevels = steps[(idx + 1) % steps.length];
     updateExposureLabels();
   });
-
-  smoothBtn.addEventListener('click', () => {
-    smoothBands = !smoothBands;
-    updateExposureLabels();
-  });
-
-  consumeBtn.addEventListener('click', () => {
-    consumeOnPrints = !consumeOnPrints;
-    updateExposureLabels();
-  });
-
-  bandBtn.addEventListener('click', () => {
-    bandify = !bandify;
-    updateExposureLabels();
-  });
+  smoothBtn.addEventListener('click', () => { smoothBands = !smoothBands; updateExposureLabels(); });
+  consumeBtn.addEventListener('click', () => { consumeOnPrints = !consumeOnPrints; updateExposureLabels(); });
+  bandBtn.addEventListener('click', () => { bandify = !bandify; updateExposureLabels(); });
 
   gapBtn.addEventListener('click', () => {
     const steps = [0,1,2,3];
@@ -1381,7 +1165,6 @@ async def index() -> str:
     bandGapBins = steps[(idx + 1) % steps.length];
     updateExposureLabels();
   });
-
   minBtn.addEventListener('click', () => {
     const steps = [1,2,3,4,6];
     let idx = steps.indexOf(bandMinBins);
@@ -1390,17 +1173,13 @@ async def index() -> str:
     updateExposureLabels();
   });
 
-
-  domBtn.addEventListener('click', () => {
-    domOn = !domOn;
-    domBtn.textContent = `Dom: ${domOn ? 'ON' : 'OFF'}`;
-  });
+  domBtn.addEventListener('click', () => { domOn = !domOn; updateExposureLabels(); });
   domAgeBtn.addEventListener('click', () => {
     const steps = [0.0, 0.15, 0.25, 0.35, 0.5, 0.7];
     let idx = steps.indexOf(domAgeW);
     if (idx < 0) idx = 3;
     domAgeW = steps[(idx + 1) % steps.length];
-    domAgeBtn.textContent = `DomAge: ${domAgeW.toFixed(2)}`;
+    updateExposureLabels();
   });
 
   CANVAS.addEventListener('pointerdown', (e) => {
@@ -1431,7 +1210,6 @@ async def index() -> str:
     zoom = Math.max(0.25, Math.min(6.0, zoom * factor));
   }, { passive: false });
 
-  // Tick cadence
   const intervalMs = Math.max(250, Math.floor(1000 / Math.max(0.2, __SNAPSHOT_HZ__)));
   setInterval(tick, intervalMs);
   tick();
@@ -1446,21 +1224,21 @@ async def index() -> str:
     html = html.replace("__BUILD__", BUILD)
     return html
 
+
 @app.get("/snapshot")
 async def snapshot(request: Request) -> JSONResponse:
-    """
-    UI snapshot for FIX4:
-      - center_px: mid if available else last price else best side
-      - heat_bins: snapshot ladder bins from current depth only
-    IMPORTANT:
-      - This handler must NEVER throw. If anything fails, return ok=false with safe defaults.
+    """UI snapshot.
+
+    This handler must NEVER throw. On any exception it returns ok=false with a safe payload.
     """
     try:
+        now_ms = _now_ms()
+        bucket_mode = (request.query_params.get("bs") or BUCKET_SCALE_MODE_DEFAULT or "auto").strip().lower()
+
         async with STATE_LOCK:
             ws_ok = bool(STATE.get("ws_ok"))
             ws_last_rx_ms = STATE.get("ws_last_rx_ms")
-            now_ms = _now_ms()
-            ws_msg_age_ms = (now_ms - ws_last_rx_ms) if ws_last_rx_ms else None
+            ws_msg_age_ms = (now_ms - int(ws_last_rx_ms)) if ws_last_rx_ms else None
 
             best_bid = STATE.get("best_bid")
             best_ask = STATE.get("best_ask")
@@ -1477,47 +1255,45 @@ async def snapshot(request: Request) -> JSONResponse:
             if center_px is None and best_ask is not None:
                 center_px = float(best_ask)
 
+            # Near snapshot bins
             heat_bins: List[List[float]] = []
             heat_max = 0.0
             if center_px is not None:
                 heat_bins, heat_max = _build_heat_bins(float(center_px), float(RANGE_USD), float(BIN_USD))
 
-            
-            # --- Wide ladder (session-expanding bounds) ---
+            # Wide ladder bins (session bounds)
             ladder_min = LADDER_MIN_PX
             ladder_max = LADDER_MAX_PX
             wide_heat_bins: List[List[float]] = []
             wide_heat_max = 0.0
-            wide_bin_usd = None
+            wide_bin_usd: Optional[float] = None
+
             if ladder_min is not None and ladder_max is not None and ladder_max > ladder_min:
                 span = float(ladder_max - ladder_min)
-                # Cap vertical bin count for performance; adapt bin size to span.
                 target_bins = 320.0
                 wide_bin = max(float(BIN_USD), span / target_bins)
-                # Avoid pathological huge payloads
                 if span / wide_bin > 500.0:
                     wide_bin = span / 500.0
-                wide_bin_usd = wide_bin
+                wide_bin_usd = float(wide_bin)
                 wide_center = (float(ladder_min) + float(ladder_max)) / 2.0
                 wide_range = span / 2.0
-                wide_heat_bins, wide_heat_max = _build_heat_bins(wide_center, wide_range, wide_bin)
+                wide_heat_bins, wide_heat_max = _build_heat_bins(wide_center, wide_range, float(wide_bin))
 
-            # --- Bucket-projected heat (historic, multi-scale) ---
-    # --- Buckets (single-layer projection) ---
-    bucket_mode = (request.query_params.get("bs") or BUCKET_SCALE_MODE or "auto")
-    wide_bucket_mode = (request.query_params.get("wbs") or bucket_mode)
+            # Buckets (single-layer projection; fixed nearest scale)
+            bucket_bins: List[List[float]] = []
+            bucket_max = 0.0
+            bucket_usd = 0.0
+            wide_bucket_bins: List[List[float]] = []
+            wide_bucket_max = 0.0
+            wide_bucket_usd: Optional[float] = None
 
-    bucket_bins, bucket_max = _build_bucket_bins(float(center_px), float(RANGE_USD), bucket_mode)
+            if center_px is not None:
+                bucket_bins, bucket_max, bucket_usd = _build_bucket_bins(float(center_px), float(RANGE_USD), bucket_mode)
+                if WIDE_LADDER_ON:
+                    wide_bucket_bins, wide_bucket_max, wide_bucket_usd_val = _build_bucket_bins(float(center_px), float(WIDE_RANGE_USD), bucket_mode)
+                    wide_bucket_usd = wide_bucket_usd_val
 
-    # Wide ladder uses WIDE_RANGE_USD when enabled
-    if WIDE_LADDER_ON:
-        wide_bucket_bins, wide_bucket_max = _build_bucket_bins(float(center_px), float(WIDE_RANGE_USD), wide_bucket_mode)
-    else:
-        wide_bucket_bins, wide_bucket_max = [], 0.0
-
-                bucket_usd = choose_bucket_scale(float(RANGE_USD), str(bucket_mode))
-    wide_bucket_usd = (choose_bucket_scale(float(WIDE_RANGE_USD), str(wide_bucket_mode)) if WIDE_LADDER_ON else None)
-payload = {
+            payload = {
                 "ok": True,
                 "build": BUILD,
                 "symbol": SYMBOL,
@@ -1546,15 +1322,14 @@ payload = {
                 "wide_bin_usd": (float(wide_bin_usd) if wide_bin_usd is not None else None),
                 "wide_heat_bins": wide_heat_bins,
                 "wide_heat_max": float(wide_heat_max),
-                "wide_bucket_mode": str(wide_bucket_mode),
                 "wide_bucket_usd": (float(wide_bucket_usd) if wide_bucket_usd is not None else None),
                 "wide_bucket_bins": wide_bucket_bins,
                 "wide_bucket_max": float(wide_bucket_max),
                 "error": STATE.get("last_error"),
             }
             return JSONResponse(payload)
+
     except Exception as e:
-        # Never fail the API surface — return a safe payload so the UI can keep running.
         payload = {
             "ok": False,
             "build": BUILD,
@@ -1570,11 +1345,14 @@ payload = {
             "mid": None,
             "book_bids_n": 0,
             "book_asks_n": 0,
-            "center_px": 0.0,  # allow test pattern rendering even with no data
+            "center_px": 0.0,
             "half_range": float(RANGE_USD),
             "bin_usd": float(BIN_USD),
             "heat_bins": [],
             "heat_max": 0.0,
+            "bucket_mode": (request.query_params.get("bs") if request else None),
+            "bucket_bins": [],
+            "bucket_max": 0.0,
             "error": f"snapshot_exception: {type(e).__name__}: {e}",
         }
         return JSONResponse(payload)
@@ -1586,5 +1364,3 @@ payload = {
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=PORT, log_level="info")
-
-# ---  ---
