@@ -56,7 +56,7 @@ MAX_LEVELS_PER_SIDE = int(os.getenv("QD_MAX_LEVELS_PER_SIDE", "4000"))
 
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX10_REARCH_WIDE_LADDER_FIX1"
+BUILD = "FIX11_ADAPTIVE_VIEWPORT_MULTISCALE_FIX1"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -106,6 +106,25 @@ def _now_ms() -> int:
 def _set_err(msg: str) -> None:
     STATE["last_error"] = msg
 
+
+
+def _track_px(ts_ms: int, px: float) -> None:
+    """Maintain a short px history for adaptive viewport sizing."""
+    try:
+        PX_HIST.append((int(ts_ms), float(px)))
+        cutoff = int(time.time() * 1000 - MS_VOL_LOOKBACK_SEC * 1000)
+        # prune in-place (history is small)
+        i = 0
+        n = len(PX_HIST)
+        while i < n and PX_HIST[i][0] < cutoff:
+            i += 1
+        if i > 0:
+            del PX_HIST[:i]
+        # hard cap to prevent runaway
+        if len(PX_HIST) > 2000:
+            del PX_HIST[:-2000]
+    except Exception:
+        return
 
 def _track_print(now_s: float) -> None:
     _PRINT_TS.append(now_s)
