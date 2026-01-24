@@ -61,7 +61,7 @@ BUCKET_CAP_PER_SCALE = int(os.getenv("QD_BUCKET_CAP_PER_SCALE", "1200"))
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX12_BUCKETS_FIX5_FULL"
+BUILD = "FIX12_BUCKETS_FIX6_PERSIST_BANDS"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -634,7 +634,7 @@ async def index() -> str:
   let lastY = 0;
 
   const COL_PX = 2;
-  const DECAY_ALPHA = 0.035;
+  const DECAY_ALPHA = 0.015;   // slower fade (bands persist longer)
   const MAX_EMA_ALPHA = 0.08;
 
   let emaMax = 0.0;
