@@ -1,1 +1,1 @@
-web: uvicorn app:app --host 0.0.0.0 --port $PORT
+web: python QD_BOOKMAP_CONNECT_FIX01_BOOTSTRAP_P01__20260124.py
