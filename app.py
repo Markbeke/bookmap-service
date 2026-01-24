@@ -65,12 +65,15 @@ MEM_BIN_USD = float(os.getenv("MEM_BIN_USD", str(BIN_USD)))  # binning for memor
 MEM_HALFLIFE_SEC = float(os.getenv("MEM_HALFLIFE_SEC", "1800"))  # 30m half-life
 MEM_CAP_BINS = int(os.getenv("MEM_CAP_BINS", "50000"))  # hard cap to prevent unbounded growth
 MEM_MIN_QTY = float(os.getenv("MEM_MIN_QTY", "0"))  # ignore memory updates below this qty
+MEM_ACTIVATION_USD = float(os.getenv("MEM_ACTIVATION_USD", "800"))  # distance scale for "wake-up" of global memory
+MEM_ACTIVATION_MODE = (os.getenv("MEM_ACTIVATION_MODE", "rational") or "rational").strip().lower()  # rational|exp
+
 
 # Fixed coarse layers used for persistence; we pick nearest based on viewport.
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX1"
+BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX2"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -249,6 +252,24 @@ def _mem_bin(px: float) -> float:
         return float(px)
     b = round(px / MEM_BIN_USD) * MEM_BIN_USD
     return float(f"{b:.2f}")
+
+def _activation_weight(center: float, px: float, scale_usd: float) -> float:
+    """Distance-based activation for global memory.
+
+    - rational: 1/(1+(d/scale)^2) (slow tail, Bookmap-like reappearance)
+    - exp: exp(-d/scale)
+    """
+    try:
+        c = float(center)
+        p = float(px)
+        s = max(1e-6, float(scale_usd))
+        d = abs(p - c)
+        if MEM_ACTIVATION_MODE == "exp":
+            return float(math.exp(-d / s))
+        x = d / s
+        return float(1.0 / (1.0 + x * x))
+    except Exception:
+        return 1.0
 
 def _ladder_mem_decay(now_ms: int) -> None:
     global LADDER_MEM_LAST_MS, LADDER_MEM
@@ -1430,6 +1451,10 @@ async def snapshot(request: Request) -> JSONResponse:
             if center_px is None and best_ask is not None:
                 center_px = float(best_ask)
 
+            # View bounds anchored to price center (client pan/zoom is applied on the frontend).
+            lo = float(center_px) - float(RANGE_USD) if center_px is not None else -float(RANGE_USD)
+            hi = float(center_px) + float(RANGE_USD) if center_px is not None else float(RANGE_USD)
+
             # Near snapshot bins
             heat_bins: List[List[float]] = []
             heat_max = 0.0
@@ -1467,6 +1492,25 @@ async def snapshot(request: Request) -> JSONResponse:
                 if WIDE_LADDER_ON:
                     wide_bucket_bins, wide_bucket_max, wide_bucket_usd_val = _build_bucket_bins(float(center_px), float(WIDE_RANGE_USD), bucket_mode)
                     wide_bucket_usd = wide_bucket_usd_val
+                # Distance activation: make far-away historic buckets dormant until price approaches.
+                act_scale = float(MEM_ACTIVATION_USD)
+                if act_scale > 0:
+                    if bucket_bins:
+                        mx2 = 0.0
+                        for it in bucket_bins:
+                            w = _activation_weight(float(center_px), float(it[0]), act_scale)
+                            it[1] = float(it[1]) * w
+                            if it[1] > mx2:
+                                mx2 = it[1]
+                        bucket_max = float(mx2)
+                    if wide_bucket_bins:
+                        mx3 = 0.0
+                        for it in wide_bucket_bins:
+                            w = _activation_weight(float(center_px), float(it[0]), act_scale)
+                            it[1] = float(it[1]) * w
+                            if it[1] > mx3:
+                                mx3 = it[1]
+                        wide_bucket_max = float(mx3)
 
 
         # Global ladder memory bins (decayed)
@@ -1477,20 +1521,29 @@ async def snapshot(request: Request) -> JSONResponse:
         wide_mem_usd: Optional[float] = None
         if MEM_ENABLE:
             _ladder_mem_decay(now_ms)
-            # current view memory
+            # current view memory (distance-activated)
+            act_scale = float(MEM_ACTIVATION_USD)
             for px, val in LADDER_MEM.items():
-                if lo <= px <= hi:
-                    mem_bins.append([float(px), float(val)])
-                    if val > mem_max:
-                        mem_max = float(val)
+                if lo <= float(px) <= hi:
+                    w = _activation_weight(float(center_px) if center_px is not None else float(px), float(px), act_scale)
+                    vv = float(val) * w
+                    if vv <= 0:
+                        continue
+                    mem_bins.append([float(px), float(vv)])
+                    if vv > mem_max:
+                        mem_max = float(vv)
             if center_px is not None:
                 wlo = center_px - float(WIDE_RANGE_USD)
                 whi = center_px + float(WIDE_RANGE_USD)
                 for px, val in LADDER_MEM.items():
-                    if wlo <= px <= whi:
-                        wide_mem_bins.append([float(px), float(val)])
-                        if val > wide_mem_max:
-                            wide_mem_max = float(val)
+                    if wlo <= float(px) <= whi:
+                        w = _activation_weight(float(center_px), float(px), float(MEM_ACTIVATION_USD))
+                        vv = float(val) * w
+                        if vv <= 0:
+                            continue
+                        wide_mem_bins.append([float(px), float(vv)])
+                        if vv > wide_mem_max:
+                            wide_mem_max = float(vv)
                 wide_mem_usd = float(WIDE_RANGE_USD)
             payload = {
                 "ok": True,
