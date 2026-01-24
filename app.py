@@ -25,11 +25,12 @@ from __future__ import annotations
 import os
 import json
 import time
+import math
 import asyncio
 import heapq
 from typing import Any, Dict, List, Tuple, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 try:
@@ -56,7 +57,7 @@ MAX_LEVELS_PER_SIDE = int(os.getenv("QD_MAX_LEVELS_PER_SIDE", "4000"))
 
 SNAPSHOT_HZ = float(os.getenv("QD_SNAPSHOT_HZ", "2"))    # UI polling target
 
-BUILD = "FIX12_BUCKETS_FIX1"
+BUILD = "FIX12_BUCKETS_FIX4"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -331,57 +332,107 @@ def _update_buckets_from_book(now_ms: int) -> None:
                     d.pop(k, None)
 
 
-def _choose_bucket_scale(half_range: float) -> float:
-    # Choose a coarser scale when viewing a wider ladder range
-    if half_range <= 600:
-        return 25.0
-    if half_range <= 2000:
-        return 100.0
-    return 250.0
 
-
-def _build_bucket_bins(center: float, half_range: float, bucket_scale=None):
-    """Return (bins, max_qty) for a selected bucket scale.
-
-    bins = [[price, qty], ...] within viewport around center±half_range.
-    bucket_scale: if provided (>0), uses that scale; otherwise chooses from half_range.
+def choose_bucket_scale(half_range: float, mode: str = "auto") -> float:
     """
-    # decide scale
-    scale = None
-    try:
-        if bucket_scale is not None:
-            bs = float(bucket_scale)
-            if math.isfinite(bs) and bs > 0:
-                scale = bs
-    except Exception:
-        scale = None
-    if scale is None:
-        scale = choose_bucket_scale(half_range)
+    Select a USD bucket size for aggregating depth into stable liquidity bands.
 
-    d = BUCKETS.get(scale, {})
-    if not d:
-        return [], 1e-9
+    half_range: the viewport half-range in USD around the mid/last.
+    mode: "auto" | "fine" | "medium" | "coarse"
 
-    c = float(center)
-    hr = float(half_range)
-    lo = c - hr
-    hi = c + hr
+    Returns bucket_size_usd >= 0.1
+    """
+    hr = max(0.0, float(half_range or 0.0))
 
-    out = []
-    maxq = 1e-9
-    for px, qty in d.items():
+    # Base auto scale by visible range (heuristic for BTC perp).
+    if hr <= 50:
+        base = 1.0
+    elif hr <= 150:
+        base = 2.0
+    elif hr <= 300:
+        base = 5.0
+    elif hr <= 600:
+        base = 10.0
+    elif hr <= 1200:
+        base = 25.0
+    elif hr <= 2500:
+        base = 50.0
+    else:
+        base = 100.0
+
+    mode = (mode or "auto").lower()
+    if mode == "fine":
+        base = max(0.5, base / 2.0)
+    elif mode == "coarse":
+        base = base * 2.0
+    elif mode == "medium":
+        # keep base
+        base = base
+    else:
+        # auto / unknown
+        base = base
+
+    return float(base)
+
+
+def _build_bucket_bins(center: float, half_range: float, bucket_scale: str | None = None):
+    """
+    Build [bin_center, aggregated_qty] bins for the current viewport,
+    using a single aggregation layer (no multi-layer blending).
+    """
+    # Determine bucket size (USD)
+    mode = (bucket_scale or BUCKET_SCALE_MODE or "auto")
+    bucket = choose_bucket_scale(half_range, mode=str(mode))
+
+    vmin = float(center) - float(half_range)
+    vmax = float(center) + float(half_range)
+    if vmax <= vmin or bucket <= 0:
+        return [], 0.0
+
+    # Collect samples from current orderbook within [vmin, vmax]
+    bids = _sample_book_in_range(ORDERBOOK_BIDS, vmin, vmax)
+    asks = _sample_book_in_range(ORDERBOOK_ASKS, vmin, vmax)
+
+    # Bin aggregator keyed by bin index
+    agg = {}
+    maxq = 0.0
+
+    def add_level(px: float, qty: float):
+        nonlocal maxq
         try:
-            p = float(px)
-            q = float(qty)
+            px = float(px); qty = float(qty)
+        except Exception:
+            return
+        if qty <= 0:
+            return
+        # Index based on bucket size
+        idx = int(math.floor((px - vmin) / bucket))
+        if idx < 0:
+            return
+        bcenter = vmin + (idx + 0.5) * bucket
+        agg[bcenter] = agg.get(bcenter, 0.0) + qty
+        if agg[bcenter] > maxq:
+            maxq = agg[bcenter]
+
+    for lvl in bids:
+        # lvl can be (px, qty) OR [px, qty, count]
+        try:
+            px = lvl[0]; qty = lvl[1]
         except Exception:
             continue
-        if p < lo or p > hi:
+        add_level(px, qty)
+
+    for lvl in asks:
+        try:
+            px = lvl[0]; qty = lvl[1]
+        except Exception:
             continue
-        if q > maxq:
-            maxq = q
-        out.append([p, q])
-    out.sort(key=lambda x: x[0])
-    return out, maxq
+        add_level(px, qty)
+
+    # Convert to sorted list
+    out = [[float(k), float(v)] for k, v in sorted(agg.items(), key=lambda kv: kv[0])]
+    return out, float(maxq)
+
 
 
 def _bin_price(px: float, bin_usd: float) -> float:
@@ -608,6 +659,7 @@ async def index() -> str:
       <button id="resetBtn">Reset view</button>
       <button id="testBtn">Test pattern: OFF</button>
       <button id="wideBtn">Wide ladder: ON</button>
+      <button id="bucketScaleBtn">Scale: AUTO</button>
       <button id="gainBtn">Gain: 1.00</button>
       <button id="gammaBtn">Gamma: 0.65</button>
       <button id="floorBtn">Floor: 0.02</button>
@@ -648,6 +700,7 @@ async def index() -> str:
   const resetBtn = document.getElementById('resetBtn');
   const testBtn = document.getElementById('testBtn');
   const wideBtn = document.getElementById('wideBtn');
+  const bucketScaleBtn = document.getElementById('bucketScaleBtn');
   const gainBtn = document.getElementById('gainBtn');
   const gammaBtn = document.getElementById('gammaBtn');
   const floorBtn = document.getElementById('floorBtn');
@@ -662,7 +715,8 @@ async def index() -> str:
 
   let autofollow = true;
   let testPattern = false;
-  let wideMode = true; // use session-expanding ladder bounds + wide heat bins
+  let wideMode = true;
+    let bucketScaleMode = "auto"; // use session-expanding ladder bounds + wide heat bins
 
   // View state
   let centerPx = null;
@@ -1180,7 +1234,7 @@ async def index() -> str:
 
   async function fetchSnapshot() {
     try {
-      const r = await fetch('/snapshot', { cache: 'no-store' });
+      const r = await fetch(`/snapshot?bs=${encodeURIComponent(bucketScaleMode)}`, { cache: 'no-store' });
       if (!r.ok) throw new Error('bad http');
       return await r.json();
     } catch (e) {
@@ -1252,6 +1306,13 @@ async def index() -> str:
     panPx = 0;
     zoom = 1.0;
   });
+  bucketScaleBtn.addEventListener('click', () => {
+    const modes = ['auto','fine','medium','coarse'];
+    const i = modes.indexOf(bucketScaleMode);
+    bucketScaleMode = modes[(i >= 0 ? i+1 : 0) % modes.length];
+    bucketScaleBtn.textContent = 'Scale: ' + bucketScaleMode.toUpperCase();
+  });
+
 
   function updateExposureLabels() {
     gainBtn.textContent = `Gain: ${heatGain.toFixed(2)}`;
@@ -1386,7 +1447,7 @@ async def index() -> str:
     return html
 
 @app.get("/snapshot")
-async def snapshot() -> JSONResponse:
+async def snapshot(request: Request) -> JSONResponse:
     """
     UI snapshot for FIX4:
       - center_px: mid if available else last price else best side
@@ -1442,21 +1503,21 @@ async def snapshot() -> JSONResponse:
                 wide_heat_bins, wide_heat_max = _build_heat_bins(wide_center, wide_range, wide_bin)
 
             # --- Bucket-projected heat (historic, multi-scale) ---
-            bucket_bins: List[List[float]] = []
-            bucket_max = 0.0
-            bucket_scale = None
-            if center_px is not None:
-                bucket_scale = _choose_bucket_scale(float(RANGE_USD))
-                bucket_bins, bucket_max = _build_bucket_bins(float(center_px), float(RANGE_USD), float(bucket_scale))
+    # --- Buckets (single-layer projection) ---
+    bucket_mode = (request.query_params.get("bs") or BUCKET_SCALE_MODE or "auto")
+    wide_bucket_mode = (request.query_params.get("wbs") or bucket_mode)
 
-            wide_bucket_bins: List[List[float]] = []
-            wide_bucket_max = 0.0
-            wide_bucket_scale = None
-            if ladder_min is not None and ladder_max is not None and ladder_max > ladder_min:
-                wide_bucket_scale = _choose_bucket_scale(float(wide_range))
-                wide_bucket_bins, wide_bucket_max = _build_bucket_bins(float(wide_center), float(wide_range), float(wide_bucket_scale))
+    bucket_bins, bucket_max = _build_bucket_bins(float(center_px), float(RANGE_USD), bucket_mode)
 
-            payload = {
+    # Wide ladder uses WIDE_RANGE_USD when enabled
+    if WIDE_LADDER_ON:
+        wide_bucket_bins, wide_bucket_max = _build_bucket_bins(float(center_px), float(WIDE_RANGE_USD), wide_bucket_mode)
+    else:
+        wide_bucket_bins, wide_bucket_max = [], 0.0
+
+                bucket_usd = choose_bucket_scale(float(RANGE_USD), str(bucket_mode))
+    wide_bucket_usd = (choose_bucket_scale(float(WIDE_RANGE_USD), str(wide_bucket_mode)) if WIDE_LADDER_ON else None)
+payload = {
                 "ok": True,
                 "build": BUILD,
                 "symbol": SYMBOL,
@@ -1476,7 +1537,8 @@ async def snapshot() -> JSONResponse:
                 "bin_usd": float(BIN_USD),
                 "heat_bins": heat_bins,
                 "heat_max": float(heat_max),
-                "bucket_scale": (float(bucket_scale) if bucket_scale is not None else None),
+                "bucket_mode": str(bucket_mode),
+                "bucket_usd": float(bucket_usd),
                 "bucket_bins": bucket_bins,
                 "bucket_max": float(bucket_max),
                 "ladder_min_px": (float(ladder_min) if ladder_min is not None else None),
@@ -1484,7 +1546,8 @@ async def snapshot() -> JSONResponse:
                 "wide_bin_usd": (float(wide_bin_usd) if wide_bin_usd is not None else None),
                 "wide_heat_bins": wide_heat_bins,
                 "wide_heat_max": float(wide_heat_max),
-                "wide_bucket_scale": (float(wide_bucket_scale) if wide_bucket_scale is not None else None),
+                "wide_bucket_mode": str(wide_bucket_mode),
+                "wide_bucket_usd": (float(wide_bucket_usd) if wide_bucket_usd is not None else None),
                 "wide_bucket_bins": wide_bucket_bins,
                 "wide_bucket_max": float(wide_bucket_max),
                 "error": STATE.get("last_error"),
