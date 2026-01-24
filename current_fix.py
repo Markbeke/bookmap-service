@@ -1,20 +1,22 @@
 """
 QuantDesk Bookmap Service — current_fix.py
-Build: FIX02/P03
-Subsystem: STREAM (WS ingest)
+Build: FIX03/P01
+Subsystem: FOUNDATION (dependency-safe server) + STREAM (WS ingest)
 Date: 2026-01-24
 
-Goal of FIX02/P03
-- Stabilize WS connectivity in Replit by using the WS endpoint observed in user screenshots as default.
-- Add explicit, user-visible connector error diagnostics in /telemetry.json and on the status page.
-- Add robust reconnect with backoff + jitter and clear counters (reconnects, last_error, last_close_code/reason).
+Purpose of FIX03/P01 (Foundation Bootstrap Diagnostic)
+- Prevent "starts then stops immediately" in Replit by:
+  1) Making imports dependency-safe (FastAPI/Uvicorn/Websockets).
+  2) Providing a minimal fallback HTTP server if Uvicorn/FastAPI are missing.
+- Preserve FIX02/P03 WS reconnect loop and explicit diagnostics in /telemetry.json and status page.
+- Keep mandatory endpoints: /, /health.json, /telemetry.json
+- Bind to 0.0.0.0 and PORT env (default 5000) per QuantDesk workflow v1.2.
 
-Notes / limitations (truthful):
-- I cannot confirm MEXC's correct websocket base URL for your exact market stream without their live docs.
-  Therefore:
-    1) We default to the URL shown in your screenshots: wss://wss-api.mexc.com/ws
-    2) You can override via env QD_MEXC_WS_URL in Replit Secrets if needed.
-- FIX02/P03 still "counts frames" and does not decode protobuf/binary payloads yet (explicitly deferred).
+Truth & limitations:
+- I cannot confirm MEXC's correct websocket base URL for your exact market stream without live docs.
+  Default remains the URL shown in your prior screenshots: wss://wss-api.mexc.com/ws
+  Override via env QD_MEXC_WS_URL if needed.
+- This FIX counts frames; parsing/decoding and state-engine/visualization are deferred.
 """
 
 from __future__ import annotations
@@ -26,37 +28,34 @@ import random
 import threading
 import time
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional
-
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
-
-try:
-    import websockets  # type: ignore
-except Exception:  # pragma: no cover
-    websockets = None
-
+from typing import Any, Dict, List, Optional, Tuple
 
 # -----------------------------
 # Config
 # -----------------------------
 SERVICE_NAME = "qd-bookmap"
-BUILD = "FIX02/P03"
-SUBSYSTEM = "STREAM"
+BUILD = "FIX03/P01"
+SUBSYSTEM = "FOUNDATION+STREAM"
 
-# Symbol/streams are kept minimal and "best-effort".
-# If the exchange requires different stream names, you can override streams via env.
+DEFAULT_WS_URL = "wss://wss-api.mexc.com/ws"
+WS_URL = os.environ.get("QD_MEXC_WS_URL", DEFAULT_WS_URL).strip()
+
 DEFAULT_STREAMS = [
-    # These are placeholders aligned with earlier FIX02 behavior.
-    # If MEXC expects different identifiers, set QD_MEXC_STREAMS to a JSON list.
+    # Placeholders aligned with earlier behavior.
+    # Override with env QD_MEXC_STREAMS as JSON list or comma-separated.
     "spot@public.deals.v3.api@BTCUSDT",
     "spot@public.depth.v3.api@BTCUSDT@20",
 ]
 
-# IMPORTANT: Default to what your screenshot shows.
-DEFAULT_WS_URL = "wss://wss-api.mexc.com/ws"
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", os.environ.get("QD_PORT", "5000")))
 
-WS_URL = os.environ.get("QD_MEXC_WS_URL", DEFAULT_WS_URL).strip()
+START_TS = time.time()
+
+
+def _now_ts() -> float:
+    return time.time()
+
 
 def _load_streams() -> List[str]:
     raw = os.environ.get("QD_MEXC_STREAMS", "").strip()
@@ -65,21 +64,65 @@ def _load_streams() -> List[str]:
     try:
         v = json.loads(raw)
         if isinstance(v, list) and all(isinstance(x, str) for x in v):
-            return [x.strip() for x in v if x.strip()]
+            out = [x.strip() for x in v if x.strip()]
+            return out or DEFAULT_STREAMS[:]
     except Exception:
         pass
-    # Fallback: comma-separated
     parts = [p.strip() for p in raw.split(",")]
-    return [p for p in parts if p]
+    out = [p for p in parts if p]
+    return out or DEFAULT_STREAMS[:]
+
 
 STREAMS = _load_streams()
 
-# Replit typically routes external :80 -> internal :8000 or :5000 depending on config.
-# We bind to 0.0.0.0 and PORT env if present.
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", os.environ.get("QD_PORT", "5000")))
 
-START_TS = time.time()
+def _safe_exc(e: BaseException) -> str:
+    s = f"{type(e).__name__}: {str(e)}".strip()
+    return s[:700]
+
+
+# -----------------------------
+# Dependency probes (do not crash)
+# -----------------------------
+def _try_imports() -> Tuple[Optional[Any], Optional[Any], Optional[Any], List[str]]:
+    """
+    Returns (FastAPI, responses_module, websockets_module, errors)
+    Where responses_module provides HTMLResponse/JSONResponse/PlainTextResponse.
+    """
+    errors: List[str] = []
+
+    fastapi_mod = None
+    responses_mod = None
+    websockets_mod = None
+
+    try:
+        import fastapi  # type: ignore
+        from fastapi import FastAPI  # type: ignore
+        from fastapi import responses as _responses  # type: ignore
+
+        fastapi_mod = FastAPI
+        responses_mod = _responses
+    except Exception as e:
+        errors.append(f"fastapi import failed: {_safe_exc(e)}")
+
+    try:
+        import websockets  # type: ignore
+
+        websockets_mod = websockets
+    except Exception as e:
+        errors.append(f"websockets import failed: {_safe_exc(e)}")
+
+    # uvicorn is only required for the FastAPI path; fallback server does not require it.
+    try:
+        import uvicorn  # type: ignore
+        _ = uvicorn  # suppress unused
+    except Exception as e:
+        errors.append(f"uvicorn import failed: {_safe_exc(e)}")
+
+    return fastapi_mod, responses_mod, websockets_mod, errors
+
+
+FastAPI_cls, fastapi_responses, websockets, IMPORT_ERRORS = _try_imports()
 
 
 # -----------------------------
@@ -87,7 +130,7 @@ START_TS = time.time()
 # -----------------------------
 @dataclass
 class ConnectorState:
-    status: str = "DISCONNECTED"      # DISCONNECTED | CONNECTED | ERROR
+    status: str = "DISCONNECTED"  # DISCONNECTED | CONNECTED | ERROR
     frames_total: int = 0
     last_event_ts: float = 0.0
     last_ack_ts: float = 0.0
@@ -101,32 +144,21 @@ class ConnectorState:
     last_close_reason: str = ""
     last_connect_ts: float = 0.0
 
+    # foundation diagnostics
+    import_errors: List[str] = None  # type: ignore
+
     def to_public(self) -> Dict[str, Any]:
         d = asdict(self)
         d["streams"] = self.streams or []
+        d["import_errors"] = self.import_errors or []
         return d
 
 
-STATE = ConnectorState(streams=STREAMS[:])
+STATE = ConnectorState(streams=STREAMS[:], import_errors=IMPORT_ERRORS[:])
 STATE_LOCK = threading.Lock()
 
 
-def _now_ts() -> float:
-    return time.time()
-
-
-def _safe_exc(e: BaseException) -> str:
-    # keep it short but useful
-    s = f"{type(e).__name__}: {str(e)}".strip()
-    return s[:500]
-
-
 def _mexc_subscribe_payload(streams: List[str]) -> str:
-    """
-    Earlier FIX02 assumed MEXC spot v3 uses:
-      {"method":"SUBSCRIPTION","params":[...]}
-    If this turns out to be incorrect for your account/market, override streams/url.
-    """
     payload = {
         "method": "SUBSCRIPTION",
         "params": [s for s in streams if s.strip()],
@@ -141,7 +173,6 @@ def _mexc_subscribe_payload(streams: List[str]) -> str:
 async def _ws_session(ws_url: str, streams: List[str]) -> None:
     assert websockets is not None
 
-    # websockets.connect kwargs kept conservative for Replit stability
     async with websockets.connect(
         ws_url,
         ping_interval=20,
@@ -156,45 +187,41 @@ async def _ws_session(ws_url: str, streams: List[str]) -> None:
             STATE.last_close_reason = ""
             STATE.last_connect_ts = _now_ts()
 
-        # Subscribe
         sub = _mexc_subscribe_payload(streams)
         await ws.send(sub)
 
-        # Read loop
         while True:
-            msg = await ws.recv()  # may be str or bytes
+            msg = await ws.recv()
             ts = _now_ts()
             with STATE_LOCK:
                 STATE.frames_total += 1
                 STATE.last_event_ts = ts
 
-            # Best-effort "ack" detection (not guaranteed)
-            if isinstance(msg, str):
-                if '"code"' in msg or '"success"' in msg or '"ack"' in msg:
-                    with STATE_LOCK:
-                        STATE.last_ack_ts = ts
+            # best-effort ack signal
+            if isinstance(msg, str) and (
+                '"code"' in msg or '"success"' in msg or '"ack"' in msg
+            ):
+                with STATE_LOCK:
+                    STATE.last_ack_ts = ts
 
 
 async def _ws_reconnect_forever() -> None:
     if websockets is None:
         with STATE_LOCK:
             STATE.status = "ERROR"
-            STATE.last_error = "Missing dependency: websockets"
+            STATE.last_error = "Missing dependency: websockets (see import_errors)"
         return
 
-    # Exponential backoff with jitter
     backoff = 0.5
     backoff_max = 20.0
 
     while True:
         try:
             await _ws_session(STATE.ws_url, STATE.streams or [])
-            # If session exits cleanly (rare), reset backoff
             backoff = 0.5
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # Capture close codes if present (websockets raises ConnectionClosed*)
             close_code = getattr(e, "code", None)
             close_reason = getattr(e, "reason", "")
             with STATE_LOCK:
@@ -204,17 +231,12 @@ async def _ws_reconnect_forever() -> None:
                 STATE.last_close_reason = str(close_reason)[:300]
                 STATE.reconnects += 1
 
-            # Sleep with jitter then retry
             jitter = random.uniform(0.0, 0.25)
             await asyncio.sleep(min(backoff + jitter, backoff_max))
             backoff = min(backoff * 1.7, backoff_max)
 
 
 def _start_ws_thread() -> None:
-    """
-    Run asyncio WS reconnect loop in a dedicated daemon thread,
-    so FastAPI/Uvicorn can run normally.
-    """
     def runner() -> None:
         try:
             asyncio.run(_ws_reconnect_forever())
@@ -228,32 +250,30 @@ def _start_ws_thread() -> None:
 
 
 # -----------------------------
-# FastAPI app
+# Health logic (shared)
 # -----------------------------
-app = FastAPI(title="QuantDesk Bookmap Service", version=BUILD)
-
-@app.on_event("startup")
-async def _startup() -> None:
-    _start_ws_thread()
-
-
-def _health() -> Dict[str, Any]:
+def _health_payload() -> Dict[str, Any]:
     with STATE_LOCK:
         st = STATE.to_public()
 
     uptime = _now_ts() - START_TS
+    last_event = st.get("last_event_ts") or 0.0
+    fresh_s = _now_ts() - last_event if last_event else 1e9
 
-    # Health logic:
-    # - GREEN if connected and fresh
-    # - YELLOW if disconnected but process alive (startup / transient)
-    # - RED if persistent error (ERROR status or staleness)
-    fresh_s = _now_ts() - (st.get("last_event_ts") or 0.0) if st.get("last_event_ts") else 1e9
-    if st["status"] == "CONNECTED" and fresh_s < 3.0:
+    # Health rules:
+    # GREEN: connected + fresh frames
+    # YELLOW: server running but warming/disconnected (acceptable early)
+    # RED: connector error OR foundation import errors that prevent intended operation
+    import_errors = st.get("import_errors") or []
+
+    if st["status"] == "CONNECTED" and fresh_s < 3.0 and not import_errors:
         health = "GREEN"
     elif st["status"] == "ERROR":
         health = "RED"
+    elif import_errors:
+        # If imports failed, we may still be serving via fallback server.
+        health = "RED"
     else:
-        # DISCONNECTED or stale CONNECTED -> YELLOW then RED if too stale
         health = "YELLOW" if fresh_s < 30.0 else "RED"
 
     return {
@@ -265,37 +285,69 @@ def _health() -> Dict[str, Any]:
         "uptime_s": round(uptime, 3),
         "connector": st,
         "freshness_s": round(fresh_s, 3) if fresh_s < 1e8 else None,
+        "host": HOST,
+        "port": PORT,
     }
 
 
-@app.get("/health.json")
-async def health_json() -> JSONResponse:
-    return JSONResponse(_health())
+# -----------------------------
+# FastAPI path (preferred)
+# -----------------------------
+def _run_fastapi() -> None:
+    """
+    Runs FastAPI via Uvicorn. Only called if FastAPI + Uvicorn are importable.
+    """
+    assert FastAPI_cls is not None
+    assert fastapi_responses is not None
 
+    HTMLResponse = fastapi_responses.HTMLResponse
+    JSONResponse = fastapi_responses.JSONResponse
+    PlainTextResponse = fastapi_responses.PlainTextResponse
 
-@app.get("/telemetry.json")
-async def telemetry_json() -> JSONResponse:
-    # Alias to health for now; we keep separate endpoint for future expansion
-    return JSONResponse(_health())
+    app = FastAPI_cls(title="QuantDesk Bookmap Service", version=BUILD)
 
+    @app.on_event("startup")
+    async def _startup() -> None:
+        _start_ws_thread()
 
-@app.get("/", response_class=HTMLResponse)
-async def status_page() -> HTMLResponse:
-    h = _health()
-    conn = h["connector"]
+    @app.get("/health.json")
+    async def health_json() -> Any:
+        return JSONResponse(_health_payload())
 
-    health = h["health"]
-    health_color = {"GREEN": "#16a34a", "YELLOW": "#f59e0b", "RED": "#dc2626"}.get(health, "#6b7280")
+    @app.get("/telemetry.json")
+    async def telemetry_json() -> Any:
+        return JSONResponse(_health_payload())
 
-    def esc(s: Any) -> str:
-        return (
-            str(s)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
+    @app.get("/", response_class=HTMLResponse)
+    async def status_page() -> Any:
+        h = _health_payload()
+        conn = h["connector"]
+        health = h["health"]
+        health_color = {"GREEN": "#16a34a", "YELLOW": "#f59e0b", "RED": "#dc2626"}.get(
+            health, "#6b7280"
         )
 
-    html = f"""
+        def esc(s: Any) -> str:
+            return (
+                str(s)
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+
+        import_errs = conn.get("import_errors") or []
+        import_block = ""
+        if import_errs:
+            items = "".join(f"<li><code>{esc(x)}</code></li>" for x in import_errs[:10])
+            import_block = f"""
+            <div class="card">
+              <div class="muted"><b>Foundation import errors (action required)</b></div>
+              <ul>{items}</ul>
+              <div class="muted">If Replit previously started then stopped, these errors are the most likely root cause.</div>
+            </div>
+            """
+
+        html = f"""
 <!doctype html>
 <html>
 <head>
@@ -304,12 +356,12 @@ async def status_page() -> HTMLResponse:
   <title>QuantDesk Bookmap — Status</title>
   <style>
     body {{ font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }}
-    .row {{ display: grid; grid-template-columns: 1fr; gap: 12px; max-width: 820px; }}
+    .row {{ display: grid; grid-template-columns: 1fr; gap: 12px; max-width: 920px; }}
     .card {{ border: 1px solid #e5e7eb; border-radius: 14px; padding: 14px 16px; }}
-    .h {{ display: flex; align-items: center; gap: 12px; }}
+    .h {{ display: flex; align-items: center; gap: 12px; flex-wrap:wrap; }}
     .pill {{ padding: 6px 10px; border-radius: 999px; color: white; font-weight: 700; background: {health_color}; }}
     .muted {{ color: #6b7280; }}
-    .kv {{ display: grid; grid-template-columns: 140px 1fr; gap: 6px 12px; }}
+    .kv {{ display: grid; grid-template-columns: 160px 1fr; gap: 6px 12px; }}
     code {{ background: #f3f4f6; padding: 2px 6px; border-radius: 8px; }}
     a {{ color: #2563eb; text-decoration: none; }}
   </style>
@@ -329,9 +381,11 @@ async def status_page() -> HTMLResponse:
       </div>
     </div>
 
+    {import_block}
+
     <div class="card">
       <div class="kv">
-        <div class="muted">Server</div><div><code>{esc(HOST)}:{esc(PORT)}</code> · Uptime: <code>{esc(round(h["uptime_s"],1))}s</code></div>
+        <div class="muted">Server</div><div><code>{esc(h["host"])}:{esc(h["port"])}</code> · Uptime: <code>{esc(round(h["uptime_s"],1))}s</code></div>
         <div class="muted">Connector</div><div><b>{esc(conn.get("status",""))}</b></div>
         <div class="muted">WS URL</div><div><code>{esc(conn.get("ws_url",""))}</code></div>
         <div class="muted">Streams</div><div><code>{esc(", ".join(conn.get("streams",[])[:3]))}{esc("..." if len(conn.get("streams",[]))>3 else "")}</code></div>
@@ -346,26 +400,98 @@ async def status_page() -> HTMLResponse:
     <div class="card">
       <div class="muted">Notes</div>
       <div>
-        FIX02/P03: WS ingest loop enabled with explicit diagnostics.<br/>
-        Frames counted; decoding deferred to later FIX.<br/>
-        If connector stays RED with non-empty <code>Last error</code>, paste that string back to ChatGPT.
+        FIX03/P01: Dependency-safe foundation. If FastAPI/Uvicorn are missing, system will fall back to a minimal HTTP server instead of crashing.<br/>
+        WS ingest counts frames; decoding/state-engine/visualization are deferred to later FIX.<br/>
+        If health is RED, open <code>/</code> and copy <code>Last error</code> and/or <code>Foundation import errors</code>.
       </div>
     </div>
   </div>
 </body>
 </html>
 """
-    return HTMLResponse(html)
+        return HTMLResponse(html)
+
+    @app.get("/robots.txt")
+    async def robots() -> Any:
+        return PlainTextResponse("User-agent: *\nDisallow: /\n")
+
+    import uvicorn  # type: ignore
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 
-@app.get("/robots.txt")
-async def robots() -> PlainTextResponse:
-    return PlainTextResponse("User-agent: *\nDisallow: /\n")
+# -----------------------------
+# Fallback HTTP server (keeps Replit alive)
+# -----------------------------
+def _run_fallback_http() -> None:
+    """
+    If FastAPI/Uvicorn are unavailable, keep the process alive and serve diagnostics.
+    This prevents Replit from showing "starts then stops immediately" without any actionable output.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, status: int, body: str, ctype: str = "text/plain; charset=utf-8") -> None:
+            b = body.encode("utf-8", errors="replace")
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path in ("/health.json", "/telemetry.json"):
+                payload = _health_payload()
+                self._send(200, json.dumps(payload, indent=2), "application/json; charset=utf-8")
+                return
+
+            if self.path == "/" or self.path.startswith("/?"):
+                payload = _health_payload()
+                errs = payload["connector"].get("import_errors") or []
+                msg = [
+                    "QuantDesk Bookmap — FALLBACK SERVER (FastAPI/Uvicorn not available)",
+                    f"Build: {BUILD}",
+                    f"Bind: {HOST}:{PORT}",
+                    "",
+                    "Import errors:",
+                    *(f"- {e}" for e in errs),
+                    "",
+                    "Action:",
+                    "- Ensure fastapi + uvicorn are installed in the environment.",
+                    "- Then re-run with the normal path (Replit: delete workspace → re-import → Run) per workflow v1.2.",
+                    "",
+                    "Endpoints available in fallback:",
+                    "- /health.json",
+                    "- /telemetry.json",
+                ]
+                self._send(200, "\n".join(msg))
+                return
+
+            self._send(404, "Not found")
+
+        def log_message(self, format: str, *args: Any) -> None:
+            # keep logs quiet
+            return
+
+    httpd = HTTPServer((HOST, PORT), Handler)
+    # Also try to start WS thread even in fallback (if websockets available)
+    _start_ws_thread()
+    httpd.serve_forever()
 
 
 def main() -> None:
-    import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    # Preferred path: FastAPI + Uvicorn importable
+    # Fallback path: minimal HTTP server
+    can_fastapi = FastAPI_cls is not None and fastapi_responses is not None
+    has_uvicorn_error = any(e.startswith("uvicorn import failed") for e in IMPORT_ERRORS)
+    has_fastapi_error = any(e.startswith("fastapi import failed") for e in IMPORT_ERRORS)
+
+    if can_fastapi and not has_uvicorn_error and not has_fastapi_error:
+        _run_fastapi()
+    else:
+        with STATE_LOCK:
+            STATE.status = "ERROR"
+            STATE.last_error = "Foundation fallback active (missing FastAPI/Uvicorn). See import_errors."
+        _run_fallback_http()
 
 
 if __name__ == "__main__":
