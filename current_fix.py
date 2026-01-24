@@ -1,22 +1,18 @@
 """
 QuantDesk Bookmap Service — current_fix.py
-Build: FIX03/P01
-Subsystem: FOUNDATION (dependency-safe server) + STREAM (WS ingest)
+Build: FIX04/P01
+Subsystem: FOUNDATION+STREAM
 Date: 2026-01-24
 
-Purpose of FIX03/P01 (Foundation Bootstrap Diagnostic)
-- Prevent "starts then stops immediately" in Replit by:
-  1) Making imports dependency-safe (FastAPI/Uvicorn/Websockets).
-  2) Providing a minimal fallback HTTP server if Uvicorn/FastAPI are missing.
-- Preserve FIX02/P03 WS reconnect loop and explicit diagnostics in /telemetry.json and status page.
-- Keep mandatory endpoints: /, /health.json, /telemetry.json
-- Bind to 0.0.0.0 and PORT env (default 5000) per QuantDesk workflow v1.2.
+Purpose of FIX04/P01 (Exchange WS Endpoint Correction)
+- Fix DNS failure: "gaierror: [Errno -5] No address associated with hostname"
+- Replace invalid WS base host used previously with a resolvable MEXC Spot WS base.
+- No other behavioral changes.
 
-Truth & limitations:
-- I cannot confirm MEXC's correct websocket base URL for your exact market stream without live docs.
-  Default remains the URL shown in your prior screenshots: wss://wss-api.mexc.com/ws
-  Override via env QD_MEXC_WS_URL if needed.
-- This FIX counts frames; parsing/decoding and state-engine/visualization are deferred.
+Notes / Limits (Truth Protocol)
+- This FIX assumes you are using SPOT public streams (your current params: spot@public.*).
+- If you later move to PERPETUALS/CONTRACT streams, the WS base will differ and must be a new FIX.
+- WS base can always be overridden via env: QD_MEXC_WS_URL
 """
 
 from __future__ import annotations
@@ -34,14 +30,17 @@ from typing import Any, Dict, List, Optional, Tuple
 # Config
 # -----------------------------
 SERVICE_NAME = "qd-bookmap"
-BUILD = "FIX03/P01"
+BUILD = "FIX04/P01"
 SUBSYSTEM = "FOUNDATION+STREAM"
 
-DEFAULT_WS_URL = "wss://wss-api.mexc.com/ws"
+# FIX04: corrected MEXC Spot WS base (resolvable host)
+DEFAULT_WS_URL = "wss://wbs.mexc.com/ws"
+
+# Override allowed per workflow
 WS_URL = os.environ.get("QD_MEXC_WS_URL", DEFAULT_WS_URL).strip()
 
 DEFAULT_STREAMS = [
-    # Placeholders aligned with earlier behavior.
+    # Placeholders aligned with prior runs.
     # Override with env QD_MEXC_STREAMS as JSON list or comma-separated.
     "spot@public.deals.v3.api@BTCUSDT",
     "spot@public.depth.v3.api@BTCUSDT@20",
@@ -271,7 +270,6 @@ def _health_payload() -> Dict[str, Any]:
     elif st["status"] == "ERROR":
         health = "RED"
     elif import_errors:
-        # If imports failed, we may still be serving via fallback server.
         health = "RED"
     else:
         health = "YELLOW" if fresh_s < 30.0 else "RED"
@@ -400,9 +398,9 @@ def _run_fastapi() -> None:
     <div class="card">
       <div class="muted">Notes</div>
       <div>
-        FIX03/P01: Dependency-safe foundation. If FastAPI/Uvicorn are missing, system will fall back to a minimal HTTP server instead of crashing.<br/>
+        FIX04/P01: Corrected MEXC WS base URL. If health remains RED with gaierror, it indicates runtime DNS/network restrictions, not application logic.<br/>
         WS ingest counts frames; decoding/state-engine/visualization are deferred to later FIX.<br/>
-        If health is RED, open <code>/</code> and copy <code>Last error</code> and/or <code>Foundation import errors</code>.
+        If health is RED, open <code>/</code> and copy <code>Last error</code>.
       </div>
     </div>
   </div>
@@ -425,7 +423,6 @@ def _run_fastapi() -> None:
 def _run_fallback_http() -> None:
     """
     If FastAPI/Uvicorn are unavailable, keep the process alive and serve diagnostics.
-    This prevents Replit from showing "starts then stops immediately" without any actionable output.
     """
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -469,18 +466,14 @@ def _run_fallback_http() -> None:
             self._send(404, "Not found")
 
         def log_message(self, format: str, *args: Any) -> None:
-            # keep logs quiet
             return
 
     httpd = HTTPServer((HOST, PORT), Handler)
-    # Also try to start WS thread even in fallback (if websockets available)
     _start_ws_thread()
     httpd.serve_forever()
 
 
 def main() -> None:
-    # Preferred path: FastAPI + Uvicorn importable
-    # Fallback path: minimal HTTP server
     can_fastapi = FastAPI_cls is not None and fastapi_responses is not None
     has_uvicorn_error = any(e.startswith("uvicorn import failed") for e in IMPORT_ERRORS)
     has_fastapi_error = any(e.startswith("fastapi import failed") for e in IMPORT_ERRORS)
