@@ -73,7 +73,7 @@ MEM_ACTIVATION_MODE = (os.getenv("MEM_ACTIVATION_MODE", "rational") or "rational
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX4_1"
+BUILD = "FIX13_GLOBAL_LADDER_MEMORY_ENGINE_FIX4_2"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -1195,15 +1195,23 @@ async def index() -> str:
 
     const { lo, hi } = viewBounds(snap);
 
+    // Test pattern must ALWAYS paint something visible.
     if (testPattern) {
-      bins = [];
-      const steps = 48;
-      for (let i=0;i<=steps;i++) {
-        const p = lo + (hi-lo) * (i/steps);
-        const t = i/steps;
-        bins.push([p, t]);
+      // Ensure bounds are sane
+      const _lo = (isFinite(lo) ? lo : (snap && snap.mid_px ? snap.mid_px - __RANGE_USD__ : 0));
+      const _hi = (isFinite(hi) && hi > lo) ? hi : (_lo + Math.max(1, __RANGE_USD__));
+      // Use a direct vertical gradient stripe column so it can't be filtered out by band logic.
+      const ySteps = 96;
+      for (let i=0;i<ySteps;i++) {
+        const t = i/(ySteps-1);
+        const p = _lo + (_hi - _lo) * t;
+        const y = yOfPrice(p, _lo, _hi, H);
+        hctx.fillStyle = heatColor(t);
+        hctx.globalAlpha = 0.95;
+        hctx.fillRect(W - COL_PX, Math.max(0, y-1), COL_PX, 2);
       }
-      maxv = 1.0;
+      heatPrimed = true;
+      return;
     }
 
     if (maxv && isFinite(maxv) && maxv > 0) {
@@ -1472,10 +1480,30 @@ async def index() -> str:
         return;
       }
       setHudFromSnap(snap);
-      updateHeat(snap);
-      drawFrame(snap);
+
+      // Run heat update and frame draw in separate guards so a single JS error
+      // never blanks the entire chart without a readable message.
+      try {
+        updateHeat(snap);
+      } catch (e1) {
+        const msg = (e1 && (e1.message || e1.toString)) ? (e1.message || e1.toString()) : String(e1);
+        const stk = (e1 && e1.stack) ? String(e1.stack) : '';
+        elErr.textContent = `updateHeat error: ${msg}
+${stk}`;
+      }
+      try {
+        drawFrame(snap);
+      } catch (e2) {
+        const msg = (e2 && (e2.message || e2.toString)) ? (e2.message || e2.toString()) : String(e2);
+        const stk = (e2 && e2.stack) ? String(e2.stack) : '';
+        elErr.textContent = `drawFrame error: ${msg}
+${stk}`;
+      }
     } catch (e) {
-      elErr.textContent = String(e && e.stack ? e.stack : e);
+      const msg = (e && (e.message || e.toString)) ? (e.message || e.toString()) : String(e);
+      const stk = (e && e.stack) ? String(e.stack) : '';
+      elErr.textContent = `tick error: ${msg}
+${stk}`;
     }
   }
 
