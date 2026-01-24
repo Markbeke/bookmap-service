@@ -1,34 +1,20 @@
-""" 
-QuantDesk Bookmap — CURRENT FIX ENTRYPOINT
+"""
+QuantDesk Bookmap Service — current_fix.py
+Build: FIX02/P03
+Subsystem: STREAM (WS ingest)
+Date: 2026-01-24
 
-Build: FIX02 / P02
-Subsystem: STREAM (WS ingest loop)
+Goal of FIX02/P03
+- Stabilize WS connectivity in Replit by using the WS endpoint observed in user screenshots as default.
+- Add explicit, user-visible connector error diagnostics in /telemetry.json and on the status page.
+- Add robust reconnect with backoff + jitter and clear counters (reconnects, last_error, last_close_code/reason).
 
-What this FIX guarantees
-- FastAPI server stays up.
-- Status page renders (/) plus /health.json and /telemetry.json.
-- Background WS ingest loop connects to MEXC, subscribes to configured channels,
-  and updates telemetry/health continuously.
-
-Notes
-- This is intentionally a *minimal* ingest: it counts frames and preserves last
-  activity timestamps. Book reconstruction, protobuf decoding, and order book
-  semantics are later FIX milestones.
-- If WS subscription format changes, adjust WS_CHANNELS env without editing code.
-
-Env vars
-- PORT (default 5000)
-- HOST (default 0.0.0.0)
-- QD_SERVICE (default qd-bookmap)
-- QD_SYMBOL (default BTCUSDT)
-- MEXC_WS_URL (default wss://wss-api.mexc.com/ws)
-- WS_CHANNELS (default derived from symbol; comma-separated)
-- WS_CONNECT_TIMEOUT (seconds, default 10)
-- WS_PING_INTERVAL (seconds, default 20)
-- WS_PING_TIMEOUT (seconds, default 20)
-
-Run (manual):
-  python current_fix.py
+Notes / limitations (truthful):
+- I cannot confirm MEXC's correct websocket base URL for your exact market stream without their live docs.
+  Therefore:
+    1) We default to the URL shown in your screenshots: wss://wss-api.mexc.com/ws
+    2) You can override via env QD_MEXC_WS_URL in Replit Secrets if needed.
+- FIX02/P03 still "counts frames" and does not decode protobuf/binary payloads yet (explicitly deferred).
 """
 
 from __future__ import annotations
@@ -36,440 +22,349 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
+import threading
 import time
-import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-# websockets is expected via requirements.txt
 try:
-    import websockets
-    from websockets.client import WebSocketClientProtocol
+    import websockets  # type: ignore
 except Exception:  # pragma: no cover
     websockets = None
-    WebSocketClientProtocol = Any  # type: ignore
 
 
-# ---------------------------
+# -----------------------------
 # Config
-# ---------------------------
+# -----------------------------
+SERVICE_NAME = "qd-bookmap"
+BUILD = "FIX02/P03"
+SUBSYSTEM = "STREAM"
 
-def _env_str(name: str, default: str) -> str:
-    v = os.getenv(name)
-    return v if v not in (None, "") else default
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v in (None, ""):
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-HOST = _env_str("HOST", "0.0.0.0")
-PORT = _env_int("PORT", 5000)
-SERVICE = _env_str("QD_SERVICE", "qd-bookmap")
-SYMBOL = _env_str("QD_SYMBOL", "BTCUSDT")
-MEXC_WS_URL = _env_str("MEXC_WS_URL", "wss://wss-api.mexc.com/ws")
-
-WS_CONNECT_TIMEOUT = float(_env_int("WS_CONNECT_TIMEOUT", 10))
-WS_PING_INTERVAL = float(_env_int("WS_PING_INTERVAL", 20))
-WS_PING_TIMEOUT = float(_env_int("WS_PING_TIMEOUT", 20))
-
-# Default channel set: use MEXC public v3 API naming convention (spot).
-# If you need futures/perp channels, override WS_CHANNELS with a comma-separated list.
-DEFAULT_CHANNELS = [
-    f"spot@public.deals.v3.api@{SYMBOL}",
-    f"spot@public.increase.depth.v3.api@{SYMBOL}",
+# Symbol/streams are kept minimal and "best-effort".
+# If the exchange requires different stream names, you can override streams via env.
+DEFAULT_STREAMS = [
+    # These are placeholders aligned with earlier FIX02 behavior.
+    # If MEXC expects different identifiers, set QD_MEXC_STREAMS to a JSON list.
+    "spot@public.deals.v3.api@BTCUSDT",
+    "spot@public.depth.v3.api@BTCUSDT@20",
 ]
-WS_CHANNELS = [c.strip() for c in _env_str("WS_CHANNELS", ",".join(DEFAULT_CHANNELS)).split(",") if c.strip()]
+
+# IMPORTANT: Default to what your screenshot shows.
+DEFAULT_WS_URL = "wss://wss-api.mexc.com/ws"
+
+WS_URL = os.environ.get("QD_MEXC_WS_URL", DEFAULT_WS_URL).strip()
+
+def _load_streams() -> List[str]:
+    raw = os.environ.get("QD_MEXC_STREAMS", "").strip()
+    if not raw:
+        return DEFAULT_STREAMS[:]
+    try:
+        v = json.loads(raw)
+        if isinstance(v, list) and all(isinstance(x, str) for x in v):
+            return [x.strip() for x in v if x.strip()]
+    except Exception:
+        pass
+    # Fallback: comma-separated
+    parts = [p.strip() for p in raw.split(",")]
+    return [p for p in parts if p]
+
+STREAMS = _load_streams()
+
+# Replit typically routes external :80 -> internal :8000 or :5000 depending on config.
+# We bind to 0.0.0.0 and PORT env if present.
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", os.environ.get("QD_PORT", "5000")))
+
+START_TS = time.time()
 
 
-# ---------------------------
-# Telemetry model
-# ---------------------------
-
+# -----------------------------
+# State / Telemetry
+# -----------------------------
 @dataclass
 class ConnectorState:
-    status: str = "DISCONNECTED"  # DISCONNECTED|CONNECTING|CONNECTED|ERROR
-    ws_url: str = MEXC_WS_URL
-    channels: List[str] = None  # type: ignore
+    status: str = "DISCONNECTED"      # DISCONNECTED | CONNECTED | ERROR
+    frames_total: int = 0
     last_event_ts: float = 0.0
     last_ack_ts: float = 0.0
-    frames_total: int = 0
     reconnects: int = 0
+
+    ws_url: str = WS_URL
+    streams: List[str] = None  # type: ignore
+
     last_error: str = ""
+    last_close_code: Optional[int] = None
+    last_close_reason: str = ""
+    last_connect_ts: float = 0.0
 
-    def __post_init__(self) -> None:
-        if self.channels is None:
-            self.channels = list(WS_CHANNELS)
-
-
-@dataclass
-class ServiceState:
-    service: str = SERVICE
-    subsystem: str = "STREAM"
-    build: str = "FIX02/P02"
-    date: str = "2026-01-24"
-    server_started_ts: float = 0.0
-    server_host: str = HOST
-    server_port: int = PORT
-    health: str = "YELLOW"  # GREEN|YELLOW|RED
-    notes: str = "FIX02/P02: WebSocket ingest loop enabled. Frames counted; decoding deferred to later FIX."
+    def to_public(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["streams"] = self.streams or []
+        return d
 
 
-STATE = ServiceState(server_started_ts=time.time())
-CONNECTOR = ConnectorState()
+STATE = ConnectorState(streams=STREAMS[:])
+STATE_LOCK = threading.Lock()
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
-
-
-def _now() -> float:
+def _now_ts() -> float:
     return time.time()
 
 
-def _age(ts: float) -> Optional[float]:
-    if not ts:
-        return None
-    return max(0.0, _now() - ts)
+def _safe_exc(e: BaseException) -> str:
+    # keep it short but useful
+    s = f"{type(e).__name__}: {str(e)}".strip()
+    return s[:500]
 
 
-def _set_health_from_state() -> None:
-    """Health policy for FIX02: strict but simple."""
-    # If websockets library missing: hard RED.
-    if websockets is None:
-        STATE.health = "RED"
-        return
-
-    if CONNECTOR.status == "CONNECTED":
-        # Freshness window: 3 seconds to stay GREEN.
-        age = _age(CONNECTOR.last_event_ts)
-        if age is not None and age <= 3.0:
-            STATE.health = "GREEN"
-        else:
-            # Connected but stale.
-            STATE.health = "YELLOW"
-    elif CONNECTOR.status in ("CONNECTING", "DISCONNECTED"):
-        STATE.health = "YELLOW"
-    else:
-        STATE.health = "RED"
-
-
-def _safe_json(obj: Any) -> str:
-    try:
-        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-    except Exception:
-        return "{}"
-
-
-# ---------------------------
-# WS ingest
-# ---------------------------
-
-
-def _build_subscribe_payload(channels: List[str], req_id: int) -> Dict[str, Any]:
-    """MEXC v3 public subscribe shape.
-
-    Common forms observed in MEXC documentation and examples:
-      {"method":"SUBSCRIPTION","params":["channel@..."],"id":1}
-
-    If the venue expects a different method name in your market (swap/perp),
-    override WS_CHANNELS with the correct channel strings; method name remains
-    SUBSCRIPTION for this FIX.
+def _mexc_subscribe_payload(streams: List[str]) -> str:
     """
-    return {"method": "SUBSCRIPTION", "params": channels, "id": req_id}
+    Earlier FIX02 assumed MEXC spot v3 uses:
+      {"method":"SUBSCRIPTION","params":[...]}
+    If this turns out to be incorrect for your account/market, override streams/url.
+    """
+    payload = {
+        "method": "SUBSCRIPTION",
+        "params": [s for s in streams if s.strip()],
+        "id": int(_now_ts() * 1000) % 1_000_000_000,
+    }
+    return json.dumps(payload, separators=(",", ":"))
 
 
-async def _ws_connect_and_stream() -> None:
+# -----------------------------
+# WS loop
+# -----------------------------
+async def _ws_session(ws_url: str, streams: List[str]) -> None:
+    assert websockets is not None
+
+    # websockets.connect kwargs kept conservative for Replit stability
+    async with websockets.connect(
+        ws_url,
+        ping_interval=20,
+        ping_timeout=20,
+        close_timeout=10,
+        max_queue=64,
+    ) as ws:
+        with STATE_LOCK:
+            STATE.status = "CONNECTED"
+            STATE.last_error = ""
+            STATE.last_close_code = None
+            STATE.last_close_reason = ""
+            STATE.last_connect_ts = _now_ts()
+
+        # Subscribe
+        sub = _mexc_subscribe_payload(streams)
+        await ws.send(sub)
+
+        # Read loop
+        while True:
+            msg = await ws.recv()  # may be str or bytes
+            ts = _now_ts()
+            with STATE_LOCK:
+                STATE.frames_total += 1
+                STATE.last_event_ts = ts
+
+            # Best-effort "ack" detection (not guaranteed)
+            if isinstance(msg, str):
+                if '"code"' in msg or '"success"' in msg or '"ack"' in msg:
+                    with STATE_LOCK:
+                        STATE.last_ack_ts = ts
+
+
+async def _ws_reconnect_forever() -> None:
     if websockets is None:
-        CONNECTOR.status = "ERROR"
-        CONNECTOR.last_error = "Missing dependency: websockets"
-        _set_health_from_state()
+        with STATE_LOCK:
+            STATE.status = "ERROR"
+            STATE.last_error = "Missing dependency: websockets"
         return
 
-    backoff = 1.0
-    req_id = 1
+    # Exponential backoff with jitter
+    backoff = 0.5
+    backoff_max = 20.0
 
     while True:
         try:
-            CONNECTOR.status = "CONNECTING"
-            CONNECTOR.last_error = ""
-            _set_health_from_state()
-
-            async with websockets.connect(
-                MEXC_WS_URL,
-                ping_interval=WS_PING_INTERVAL,
-                ping_timeout=WS_PING_TIMEOUT,
-                close_timeout=5,
-                open_timeout=WS_CONNECT_TIMEOUT,
-                max_size=None,
-            ) as ws:
-                await _ws_on_open(ws, req_id)
-                req_id += 1
-                backoff = 1.0
-
-                CONNECTOR.status = "CONNECTED"
-                _set_health_from_state()
-
-                async for msg in ws:
-                    CONNECTOR.frames_total += 1
-                    CONNECTOR.last_event_ts = _now()
-
-                    # MEXC sometimes sends pings as JSON or raw strings; handle both.
-                    await _ws_handle_message(ws, msg)
-
-                    _set_health_from_state()
-
+            await _ws_session(STATE.ws_url, STATE.streams or [])
+            # If session exits cleanly (rare), reset backoff
+            backoff = 0.5
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            CONNECTOR.reconnects += 1
-            CONNECTOR.status = "ERROR"
-            CONNECTOR.last_error = f"{type(e).__name__}: {e}"
-            _set_health_from_state()
+            # Capture close codes if present (websockets raises ConnectionClosed*)
+            close_code = getattr(e, "code", None)
+            close_reason = getattr(e, "reason", "")
+            with STATE_LOCK:
+                STATE.status = "ERROR"
+                STATE.last_error = _safe_exc(e)
+                STATE.last_close_code = int(close_code) if isinstance(close_code, int) else None
+                STATE.last_close_reason = str(close_reason)[:300]
+                STATE.reconnects += 1
 
-            # bounded exponential backoff with jitter
-            await asyncio.sleep(min(15.0, backoff) + (0.1 * (CONNECTOR.reconnects % 7)))
-            backoff = min(15.0, backoff * 1.8)
+            # Sleep with jitter then retry
+            jitter = random.uniform(0.0, 0.25)
+            await asyncio.sleep(min(backoff + jitter, backoff_max))
+            backoff = min(backoff * 1.7, backoff_max)
 
 
-async def _ws_on_open(ws: WebSocketClientProtocol, req_id: int) -> None:
-    # Subscribe
-    payload = _build_subscribe_payload(CONNECTOR.channels, req_id=req_id)
-    await ws.send(_safe_json(payload))
-
-
-async def _ws_handle_message(ws: WebSocketClientProtocol, msg: Any) -> None:
-    # msg can be str or bytes
-    if isinstance(msg, (bytes, bytearray)):
-        # For FIX02 we do not decode binary frames; just count them.
-        return
-
-    if not isinstance(msg, str):
-        return
-
-    s = msg.strip()
-
-    # Some endpoints send literal "pong" / "ping".
-    if s.lower() == "ping":
+def _start_ws_thread() -> None:
+    """
+    Run asyncio WS reconnect loop in a dedicated daemon thread,
+    so FastAPI/Uvicorn can run normally.
+    """
+    def runner() -> None:
         try:
-            await ws.send("pong")
-        except Exception:
-            pass
-        return
+            asyncio.run(_ws_reconnect_forever())
+        except Exception as e:
+            with STATE_LOCK:
+                STATE.status = "ERROR"
+                STATE.last_error = f"WS thread crashed: {_safe_exc(e)}"
 
-    # JSON payload handling
-    try:
-        j = json.loads(s)
-    except Exception:
-        return
-
-    # Common ack patterns: {"code":0,"msg":"..."} or {"id":1,"code":0,...}
-    if isinstance(j, dict):
-        # MEXC v3 examples: {"id":1,"code":0,"msg":"success"}
-        code = j.get("code")
-        if code == 0 and ("id" in j or j.get("msg") in ("success", "Success", "SUCCESS")):
-            CONNECTOR.last_ack_ts = _now()
-
-        # Some ping formats: {"ping": 123456}
-        if "ping" in j:
-            try:
-                await ws.send(_safe_json({"pong": j["ping"]}))
-            except Exception:
-                pass
+    t = threading.Thread(target=runner, name="qd_ws_thread", daemon=True)
+    t.start()
 
 
-# ---------------------------
-# FastAPI
-# ---------------------------
-
-app = FastAPI(title="QuantDesk Bookmap", version=STATE.build)
-
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI(title="QuantDesk Bookmap Service", version=BUILD)
 
 @app.on_event("startup")
 async def _startup() -> None:
-    # Ensure loop starts and doesn't crash the server.
-    asyncio.create_task(_ws_connect_and_stream())
+    _start_ws_thread()
+
+
+def _health() -> Dict[str, Any]:
+    with STATE_LOCK:
+        st = STATE.to_public()
+
+    uptime = _now_ts() - START_TS
+
+    # Health logic:
+    # - GREEN if connected and fresh
+    # - YELLOW if disconnected but process alive (startup / transient)
+    # - RED if persistent error (ERROR status or staleness)
+    fresh_s = _now_ts() - (st.get("last_event_ts") or 0.0) if st.get("last_event_ts") else 1e9
+    if st["status"] == "CONNECTED" and fresh_s < 3.0:
+        health = "GREEN"
+    elif st["status"] == "ERROR":
+        health = "RED"
+    else:
+        # DISCONNECTED or stale CONNECTED -> YELLOW then RED if too stale
+        health = "YELLOW" if fresh_s < 30.0 else "RED"
+
+    return {
+        "ts": _now_ts(),
+        "service": SERVICE_NAME,
+        "build": BUILD,
+        "subsystem": SUBSYSTEM,
+        "health": health,
+        "uptime_s": round(uptime, 3),
+        "connector": st,
+        "freshness_s": round(fresh_s, 3) if fresh_s < 1e8 else None,
+    }
 
 
 @app.get("/health.json")
 async def health_json() -> JSONResponse:
-    _set_health_from_state()
-    payload = {
-        "service": STATE.service,
-        "subsystem": STATE.subsystem,
-        "build": STATE.build,
-        "date": STATE.date,
-        "health": STATE.health,
-        "server": {
-            "host": STATE.server_host,
-            "port": STATE.server_port,
-            "uptime_s": round(_now() - STATE.server_started_ts, 3),
-        },
-        "connector": {
-            "status": CONNECTOR.status,
-            "ws_url": CONNECTOR.ws_url,
-            "channels": CONNECTOR.channels,
-            "last_event_age_s": None if _age(CONNECTOR.last_event_ts) is None else round(_age(CONNECTOR.last_event_ts), 3),
-            "last_ack_age_s": None if _age(CONNECTOR.last_ack_ts) is None else round(_age(CONNECTOR.last_ack_ts), 3),
-            "frames_total": CONNECTOR.frames_total,
-            "reconnects": CONNECTOR.reconnects,
-            "last_error": CONNECTOR.last_error,
-        },
-        "notes": STATE.notes,
-        "release_gate": {
-            "deps.fastapi_uvicorn": "PASS",
-            "server.bind_config": "PASS" if STATE.server_port in (5000, 8000) else "WARN",
-            "process.liveness": "PASS",
-            "data.freshness": "PASS" if STATE.health == "GREEN" else ("WARN" if STATE.health == "YELLOW" else "FAIL"),
-        },
-    }
-    return JSONResponse(payload)
+    return JSONResponse(_health())
 
 
 @app.get("/telemetry.json")
 async def telemetry_json() -> JSONResponse:
-    _set_health_from_state()
-    payload = {
-        "ts": _now(),
-        "service": STATE.service,
-        "build": STATE.build,
-        "health": STATE.health,
-        "connector": {
-            "status": CONNECTOR.status,
-            "frames_total": CONNECTOR.frames_total,
-            "last_event_ts": CONNECTOR.last_event_ts,
-            "last_ack_ts": CONNECTOR.last_ack_ts,
-            "reconnects": CONNECTOR.reconnects,
-        },
-    }
-    return JSONResponse(payload)
+    # Alias to health for now; we keep separate endpoint for future expansion
+    return JSONResponse(_health())
 
 
-@app.get("/")
-async def root() -> HTMLResponse:
-    _set_health_from_state()
+@app.get("/", response_class=HTMLResponse)
+async def status_page() -> HTMLResponse:
+    h = _health()
+    conn = h["connector"]
 
-    health_color = {
-        "GREEN": "#22c55e",
-        "YELLOW": "#f59e0b",
-        "RED": "#ef4444",
-    }.get(STATE.health, "#f59e0b")
+    health = h["health"]
+    health_color = {"GREEN": "#16a34a", "YELLOW": "#f59e0b", "RED": "#dc2626"}.get(health, "#6b7280")
 
-    uptime = round(_now() - STATE.server_started_ts, 1)
-    last_event_age = _age(CONNECTOR.last_event_ts)
-    last_event_age_txt = "—" if last_event_age is None else f"{last_event_age:.2f}s"
+    def esc(s: Any) -> str:
+        return (
+            str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
 
-    html = f"""<!doctype html>
-<html lang=\"en\">
+    html = f"""
+<!doctype html>
+<html>
 <head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>QuantDesk Bookmap — Status</title>
   <style>
-    :root {{ --fg:#111827; --muted:#6b7280; --card:#ffffff; --bg:#f3f4f6; }}
-    body {{ margin:0; font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--fg); }}
-    .wrap {{ max-width: 920px; margin: 28px auto; padding: 0 14px; }}
-    .title {{ font-size: 24px; font-weight: 700; margin-bottom: 6px; }}
-    .subtitle {{ color: var(--muted); margin-bottom: 14px; }}
-    .row {{ display:flex; gap:14px; flex-wrap:wrap; }}
-    .badge {{ display:inline-block; padding:6px 10px; border-radius: 999px; font-weight:700; color:white; background:{health_color}; }}
-    .card {{ background:var(--card); border-radius: 14px; padding: 14px; box-shadow: 0 1px 8px rgba(0,0,0,.06); min-width: 240px; flex:1; }}
-    .k {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
-    .v {{ font-size: 18px; font-weight: 700; margin-top: 3px; }}
-    .links a {{ margin-right: 10px; }}
-    table {{ width:100%; border-collapse:collapse; margin-top: 10px; }}
-    th, td {{ text-align:left; padding: 10px 8px; border-bottom: 1px solid #e5e7eb; }}
-    th {{ color: var(--muted); font-weight:600; font-size: 13px; }}
+    body {{ font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }}
+    .row {{ display: grid; grid-template-columns: 1fr; gap: 12px; max-width: 820px; }}
+    .card {{ border: 1px solid #e5e7eb; border-radius: 14px; padding: 14px 16px; }}
+    .h {{ display: flex; align-items: center; gap: 12px; }}
+    .pill {{ padding: 6px 10px; border-radius: 999px; color: white; font-weight: 700; background: {health_color}; }}
+    .muted {{ color: #6b7280; }}
+    .kv {{ display: grid; grid-template-columns: 140px 1fr; gap: 6px 12px; }}
+    code {{ background: #f3f4f6; padding: 2px 6px; border-radius: 8px; }}
+    a {{ color: #2563eb; text-decoration: none; }}
   </style>
 </head>
 <body>
-  <div class=\"wrap\">
-    <div class=\"title\">QuantDesk Bookmap — Status</div>
-    <div class=\"subtitle\">Service: {STATE.service} · Subsystem: {STATE.subsystem} · Build: {STATE.build} · Date: {STATE.date}</div>
-
-    <div class=\"row\" style=\"align-items:center; margin-bottom: 10px;\">
-      <span class=\"badge\">HEALTH: {STATE.health}</span>
-      <span class=\"links\" style=\"margin-left:10px\">
-        <a href=\"/health.json\" target=\"_blank\">health.json</a>
-        <a href=\"/telemetry.json\" target=\"_blank\">telemetry.json</a>
-      </span>
+  <div class="row">
+    <div class="h">
+      <h2 style="margin:0;">QuantDesk Bookmap — Status</h2>
+      <span class="pill">HEALTH: {esc(health)}</span>
+      <span class="muted">Service: {esc(SERVICE_NAME)} · Subsystem: {esc(SUBSYSTEM)} · Build: {esc(BUILD)} · Date: 2026-01-24</span>
     </div>
 
-    <div class=\"row\">
-      <div class=\"card\">
-        <div class=\"k\">Server</div>
-        <div class=\"v\">{STATE.server_host}:{STATE.server_port}</div>
-        <div class=\"k\" style=\"margin-top:10px\">Uptime</div>
-        <div class=\"v\">{uptime}s</div>
-      </div>
-      <div class=\"card\">
-        <div class=\"k\">Connector</div>
-        <div class=\"v\">{CONNECTOR.status}</div>
-        <div class=\"k\" style=\"margin-top:10px\">WS</div>
-        <div class=\"v\" style=\"font-size:13px; font-weight:600\">{CONNECTOR.ws_url}</div>
-        <div class=\"k\" style=\"margin-top:10px\">Last event</div>
-        <div class=\"v\">{last_event_age_txt}</div>
+    <div class="card">
+      <div style="display:flex; gap:16px; flex-wrap:wrap;">
+        <a href="/health.json">health.json</a>
+        <a href="/telemetry.json">telemetry.json</a>
       </div>
     </div>
 
-    <div class=\"card\" style=\"margin-top:14px\">
-      <div class=\"k\">Notes</div>
-      <div style=\"margin-top:6px\">{STATE.notes}</div>
+    <div class="card">
+      <div class="kv">
+        <div class="muted">Server</div><div><code>{esc(HOST)}:{esc(PORT)}</code> · Uptime: <code>{esc(round(h["uptime_s"],1))}s</code></div>
+        <div class="muted">Connector</div><div><b>{esc(conn.get("status",""))}</b></div>
+        <div class="muted">WS URL</div><div><code>{esc(conn.get("ws_url",""))}</code></div>
+        <div class="muted">Streams</div><div><code>{esc(", ".join(conn.get("streams",[])[:3]))}{esc("..." if len(conn.get("streams",[]))>3 else "")}</code></div>
+        <div class="muted">Frames</div><div><code>{esc(conn.get("frames_total",0))}</code></div>
+        <div class="muted">Freshness</div><div><code>{esc(h.get("freshness_s"))}s</code></div>
+        <div class="muted">Reconnects</div><div><code>{esc(conn.get("reconnects",0))}</code></div>
+        <div class="muted">Last error</div><div><code>{esc(conn.get("last_error","") or "—")}</code></div>
+        <div class="muted">Last close</div><div><code>{esc(conn.get("last_close_code"))}:{esc(conn.get("last_close_reason") or "")}</code></div>
+      </div>
     </div>
 
-    <div class=\"card\" style=\"margin-top:14px\">
-      <div class=\"k\">Release Gate Summary</div>
-      <table>
-        <thead><tr><th>Gate</th><th>Status</th><th>Detail</th></tr></thead>
-        <tbody>
-          <tr><td>deps.fastapi_uvicorn</td><td><b>PASS</b></td><td>FastAPI and Uvicorn imported.</td></tr>
-          <tr><td>server.bind_config</td><td><b>PASS</b></td><td>Host/port configured: {STATE.server_host}:{STATE.server_port}</td></tr>
-          <tr><td>process.liveness</td><td><b>PASS</b></td><td>Uptime {uptime}s</td></tr>
-          <tr><td>data.freshness</td><td><b>{'PASS' if STATE.health=='GREEN' else 'WARN' if STATE.health=='YELLOW' else 'FAIL'}</b></td>
-              <td>Connector={CONNECTOR.status}. Frames={CONNECTOR.frames_total}. Reconnects={CONNECTOR.reconnects}.</td></tr>
-        </tbody>
-      </table>
+    <div class="card">
+      <div class="muted">Notes</div>
+      <div>
+        FIX02/P03: WS ingest loop enabled with explicit diagnostics.<br/>
+        Frames counted; decoding deferred to later FIX.<br/>
+        If connector stays RED with non-empty <code>Last error</code>, paste that string back to ChatGPT.
+      </div>
     </div>
-
   </div>
-
-  <script>
-    // Auto-refresh minimal status indicators without noisy logging.
-    setInterval(async () => {{
-      try {{
-        const r = await fetch('/health.json', {{cache:'no-store'}});
-        const j = await r.json();
-        const badge = document.querySelector('.badge');
-        if (!badge) return;
-        badge.textContent = 'HEALTH: ' + j.health;
-      }} catch (e) {{ /* ignore */ }}
-    }}, 1000);
-  </script>
 </body>
-</html>"""
-
+</html>
+"""
     return HTMLResponse(html)
 
 
-# ---------------------------
-# Entrypoint
-# ---------------------------
+@app.get("/robots.txt")
+async def robots() -> PlainTextResponse:
+    return PlainTextResponse("User-agent: *\nDisallow: /\n")
 
 
 def main() -> None:
     import uvicorn
-
-    # Running via python current_fix.py should always work.
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 
