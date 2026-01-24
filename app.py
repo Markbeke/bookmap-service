@@ -61,7 +61,7 @@ BUCKET_CAP_PER_SCALE = int(os.getenv("QD_BUCKET_CAP_PER_SCALE", "1200"))
 BUCKET_SCALES_USD = [25.0, 100.0, 250.0]
 BUCKET_HALF_LIFE_SEC = {25.0: 6 * 60.0, 100.0: 18 * 60.0, 250.0: 60 * 60.0}
 
-BUILD = "FIX12_BUCKETS_FIX6_PERSIST_BANDS"
+BUILD = "FIX12_BUCKETS_FIX7_NEWTAB_BOOTSTRAP"
 
 app = FastAPI(title=f"QuantDesk Bookmap {BUILD}")
 
@@ -718,6 +718,53 @@ async def index() -> str:
     return `rgb(${r},${g},${b})`;
   }
 
+    // Snapshot overlay (instant visual even before heat history accumulates)
+    // Draw current snapshot bins as horizontal bands across the right edge.
+    function drawSnapshotOverlay(snap, lo, hi) {
+      if (!snap) return;
+      let bins = (snap && snap.heat_bins) ? snap.heat_bins : [];
+      let maxv = (snap && snap.heat_max) ? snap.heat_max : 0;
+      let binUsd = (snap && snap.bin_usd) ? snap.bin_usd : __BIN_USD__;
+      if (wideMode && snap && snap.wide_heat_bins && snap.wide_heat_bins.length) {
+        bins = snap.wide_heat_bins;
+        maxv = (snap.wide_heat_max) ? snap.wide_heat_max : maxv;
+        if (snap.wide_bin_usd) binUsd = snap.wide_bin_usd;
+      }
+      // include bucket bins too (historic bands)
+      let bucketBins = (snap && snap.bucket_bins) ? snap.bucket_bins : [];
+      let bucketMax = (snap && snap.bucket_max) ? snap.bucket_max : 0;
+      if (wideMode && snap && snap.wide_bucket_bins && snap.wide_bucket_bins.length) {
+        bucketBins = snap.wide_bucket_bins;
+        bucketMax = (snap.wide_bucket_max) ? snap.wide_bucket_max : bucketMax;
+      }
+      if (bucketBins && bucketBins.length) {
+        bins = bins.concat(bucketBins);
+        maxv = Math.max(maxv, bucketMax || 0);
+      }
+      if (!bins || bins.length === 0 || !isFinite(maxv) || maxv <= 0) return;
+
+      const W = CANVAS.width, H = CANVAS.height;
+      const x0 = Math.floor(W * 0.86);
+      const w = Math.max(12, W - x0);
+      const scaleMax = Math.max(1e-9, maxv);
+
+      for (let i=0; i<bins.length; i++) {
+        const p = bins[i][0];
+        const v = bins[i][1];
+        if (!(p >= lo && p <= hi)) continue;
+        let t = Math.max(0, Math.min(1, v / scaleMax));
+        t = Math.max(0, (t - heatFloor) / Math.max(1e-6, (1 - heatFloor)));
+        t = Math.pow(t, heatGamma);
+        const y = yOfPrice(p, lo, hi, H);
+        const y2 = yOfPrice(p + binUsd, lo, hi, H);
+        const hStripe = Math.max(1, Math.abs(y2 - y));
+        ctx.fillStyle = heatColor(t);
+        ctx.globalAlpha = 0.55;
+        ctx.fillRect(x0, y - hStripe*0.5, w, hStripe);
+      }
+      ctx.globalAlpha = 1.0;
+    }
+
   function smoothArrayInPlace(a) {
     const n = a.length;
     if (n < 3) return;
@@ -1072,6 +1119,7 @@ async def index() -> str:
 
   async function tick() {
     try {
+      resize();
       const snap = await fetchSnapshot();
       if (!snap) {
         setStatus(false, 'API unreachable');
