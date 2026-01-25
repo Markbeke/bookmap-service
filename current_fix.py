@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX16/P01"
+BUILD = "FIX16/P02"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -937,21 +937,40 @@ def _ui_html() -> str:
     sendView();
   }}, {{ passive: false }});
 
-  cv.addEventListener('mousedown', (ev) => {{
-    dragging = true;
+    // Pointer pan (mouse + touch) — works reliably on iPad
+  let pointerActive = false;
+  let pointerId = null;
+
+  cv.addEventListener('pointerdown', (ev) => {
+    // Ensure the page does not scroll/zoom on touch interactions
+    ev.preventDefault();
+    pointerActive = true;
+    pointerId = ev.pointerId;
     lastY = ev.clientY;
-  }});
-  window.addEventListener('mouseup', () => {{ dragging = false; }});
-  window.addEventListener('mousemove', (ev) => {{
-    if (!dragging) return;
+    try { cv.setPointerCapture(pointerId); } catch (e) {}
+  }, { passive: false });
+
+  cv.addEventListener('pointermove', (ev) => {
+    if (!pointerActive) return;
+    if (pointerId !== null && ev.pointerId !== pointerId) return;
+    ev.preventDefault();
     const dy = ev.clientY - lastY;
     lastY = ev.clientY;
-    // Drag up should pan to higher prices (increase panTicks)
-    // Convert pixels to ticks using approximate row height (fallback 6)
     const approxRowH = 6;
     view.panTicks = clamp(view.panTicks + (-dy / approxRowH), -2000.0, 2000.0);
     sendView();
-  }});
+  }, { passive: false });
+
+  function endPointer(ev) {
+    if (pointerId !== null && ev.pointerId !== pointerId) return;
+    pointerActive = false;
+    pointerId = null;
+    try { cv.releasePointerCapture(ev.pointerId); } catch (e) {}
+  }
+
+  cv.addEventListener('pointerup', endPointer, { passive: true });
+  cv.addEventListener('pointercancel', endPointer, { passive: true });
+
 
   // Touch support (iPad): one-finger drag = pan, two-finger pinch = zoom
   let touchMode = null;
@@ -965,6 +984,7 @@ def _ui_html() -> str:
   }}
 
   cv.addEventListener('touchstart', (ev) => {{
+    ev.preventDefault();
     if (ev.touches.length === 1) {{
       touchMode = 'pan';
       lastY = ev.touches[0].clientY;
@@ -973,7 +993,7 @@ def _ui_html() -> str:
       pinchStartDist = dist(ev.touches[0], ev.touches[1]);
       pinchStartZoom = view.zoom;
     }}
-  }}, {{ passive: true }});
+  }}, {{ passive: false }});
 
   cv.addEventListener('touchmove', (ev) => {{
     if (view.baseStep === null) return;
