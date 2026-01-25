@@ -1,83 +1,81 @@
+#!/usr/bin/env python3
 # =========================================================
-# QuantDesk Bookmap Service — FIX14_CLOB_SIDE_PARITY_INCREMENTAL_MERGE
+# QuantDesk Bookmap Service — FIX15_PRICE_TRAVEL_TIME_WINDOW
+#
+# Builds on FIX14 (parity-safe incremental book):
+# - Maintains canonical CLOB via incremental merge (no side wipeouts)
+# - Adds Price Travel engine: moving anchored price window (mid/last trade)
+# - Corrects price-axis orientation: higher prices rendered at the TOP
+# - Adds minimal time-window overlay (anchor history) to make motion visible
+#
+# Still NOT included (intentional):
+# - Heatmap bands, zoom/pan UX, replay determinism, footprints
+#
 # Replit runtime contract:
 # - Single entrypoint: current_fix.py
 # - FastAPI on 0.0.0.0:5000
-# - Always stays up (no hard exit) even if WS feed fails
-# - Provides:
-#     /            (UI dashboard + render bridge demo)
-#     /health.json (health summary)
-#     /telemetry.json
-#     /book.json   (best bid/ask + depth aggregates)
-#     /tape.json   (last trades)
-#     /render.json (render-bridge frame contract)
-#     /render.ws   (WebSocket stream of render frames)
-#     /raw.json    (raw ring buffer; debug)
-#     /bootlog.txt (startup + runtime log)
-#
-# NOTE: This build does not claim Bookmap parity; it formalizes the
-#       render-bridge contract required by the next rendering engine phase.
+# - Always stays up even if WS feed fails
+# - Endpoints:
+#     /              (UI: render-bridge demo)
+#     /health.json   (health summary)
+#     /telemetry.json(telemetry snapshot)
+#     /book.json     (canonical book summary)
+#     /tape.json     (recent trades)
+#     /render.json   (single render frame)
+#     /render.ws     (continuous render frames)
+#     /raw.json      (last raw WS message excerpt)
+#     /bootlog.txt   (boot log)
 # =========================================================
-
-from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
-import traceback
-from collections import deque
 from dataclasses import dataclass, field
+from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-# websockets is optional in some Replit envs; we degrade safely.
-try:
-    import websockets  # type: ignore
-except Exception:  # pragma: no cover
-    websockets = None  # type: ignore
+# NOTE: We rely on `websockets` for WS client.
+import websockets  # type: ignore
 
-
-# ----------------------------
-# Runtime configuration
-# ----------------------------
-BUILD = "FIX14/P01"
-SERVICE = "qd-bookmap"
-SYMBOL = os.getenv("QD_SYMBOL", "BTC_USDT")
-WS_URL = os.getenv("QD_WS_URL", "wss://contract.mexc.com/edge")  # contract WS
+SERVICE = "quantdesk-bookmap-ui"
+BUILD = "FIX15/P01"
 
 HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", "5000"))
+PORT = int(os.environ.get("PORT", "5000"))
 
-RAW_RING_MAX = int(os.getenv("QD_RAW_RING", "200"))
-TAPE_MAX = int(os.getenv("QD_TAPE_MAX", "200"))
-DEPTH_MAX_LEVELS = int(os.getenv("QD_DEPTH_MAX", "200"))  # per side
+SYMBOL = os.environ.get("QD_SYMBOL", "BTC_USDT")
+WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
 
-RENDER_DEFAULT_LEVELS = int(os.getenv("QD_RENDER_LEVELS", "120"))
-RENDER_DEFAULT_STEP = float(os.getenv("QD_RENDER_STEP", "0.1"))
-RENDER_FPS = float(os.getenv("QD_RENDER_FPS", "8"))  # ws push rate
+# Render controls (minimal)
+RENDER_FPS = float(os.environ.get("QD_RENDER_FPS", "8"))
+RENDER_LEVELS = int(os.environ.get("QD_LEVELS", "140"))   # visible rows
+RENDER_STEP = float(os.environ.get("QD_STEP", "0.1"))      # price tick for ladder rows
+ANCHOR_ALPHA = float(os.environ.get("QD_ANCHOR_ALPHA", "0.25"))  # smoothing factor
+ANCHOR_HISTORY_SEC = float(os.environ.get("QD_ANCHOR_HISTORY_SEC", "90"))  # overlay window seconds
 
-BOOTLOG_PATH = os.getenv("QD_BOOTLOG_PATH", "bootlog.txt")
+# Book bounds (avoid unbounded growth)
+MAX_LEVELS_PER_SIDE = int(os.environ.get("QD_MAX_LEVELS_PER_SIDE", "1200"))
+
+BOOTLOG_PATH = "/tmp/qd_bootlog.txt"
 
 
 def _now() -> float:
     return time.time()
 
 
-def _fmt_ts(ts: float) -> str:
-    # lightweight iso-ish
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + f".{int((ts%1)*1000):03d}Z"
-
-
 def bootlog(msg: str) -> None:
     try:
-        line = f"[{_fmt_ts(_now())}] {msg}\n"
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        line = f"[{ts}Z] {msg}"
         with open(BOOTLOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line)
+            f.write(line + "\n")
     except Exception:
-        # never crash for logging
+        # Never crash because of logging
         pass
 
 
@@ -85,13 +83,6 @@ def _as_float(x: Any) -> Optional[float]:
     try:
         if x is None:
             return None
-        if isinstance(x, (int, float)):
-            return float(x)
-        if isinstance(x, str):
-            x = x.strip()
-            if not x:
-                return None
-            return float(x)
         return float(x)
     except Exception:
         return None
@@ -101,18 +92,34 @@ def _as_int(x: Any) -> Optional[int]:
     try:
         if x is None:
             return None
-        if isinstance(x, int):
-            return int(x)
-        if isinstance(x, float):
-            return int(x)
-        if isinstance(x, str):
-            x = x.strip()
-            if not x:
-                return None
-            return int(float(x))
         return int(x)
     except Exception:
         return None
+
+
+# ----------------------------
+# Canonical Book + Tape
+# ----------------------------
+
+@dataclass
+class Book:
+    bids: Dict[float, float] = field(default_factory=dict)  # price -> qty
+    asks: Dict[float, float] = field(default_factory=dict)  # price -> qty
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    bid_qty_total: float = 0.0
+    ask_qty_total: float = 0.0
+    version: int = 0
+    last_update_ts: float = 0.0
+
+    def recompute(self) -> None:
+        self.best_bid = max(self.bids) if self.bids else None
+        self.best_ask = min(self.asks) if self.asks else None
+        self.bid_qty_total = float(sum(self.bids.values())) if self.bids else 0.0
+        self.ask_qty_total = float(sum(self.asks.values())) if self.asks else 0.0
+        # version is used as a monotonic local counter (not exchange seq)
+        self.version += 1
+        self.last_update_ts = _now()
 
 
 @dataclass
@@ -120,358 +127,345 @@ class Trade:
     ts: float
     px: float
     qty: float
-    side: str  # "buy" or "sell"
-
-
-@dataclass
-class Book:
-    bids: Dict[float, float] = field(default_factory=dict)  # px -> qty
-    asks: Dict[float, float] = field(default_factory=dict)  # px -> qty
-    version: Optional[int] = None
-    last_update_ts: Optional[float] = None
-
-    best_bid: Optional[float] = None
-    best_ask: Optional[float] = None
-
-    bid_qty_total: float = 0.0
-    ask_qty_total: float = 0.0
-
-    def recompute(self) -> None:
-        self.best_bid = max(self.bids.keys()) if self.bids else None
-        self.best_ask = min(self.asks.keys()) if self.asks else None
-        self.bid_qty_total = float(sum(self.bids.values())) if self.bids else 0.0
-        self.ask_qty_total = float(sum(self.asks.values())) if self.asks else 0.0
+    side: str  # "buy" | "sell" | "unknown"
 
 
 @dataclass
 class State:
-    start_ts: float = field(default_factory=_now)
-
-    # connector
-    status: str = "INIT"  # INIT/CONNECTING/CONNECTED/ERROR
-    frames: int = 0
+    status: str = "INIT"  # INIT | CONNECTING | CONNECTED | ERROR
+    last_error: Optional[str] = None
     reconnects: int = 0
-    last_error: str = ""
-    last_connect_ts: Optional[float] = None
+    frames: int = 0
     last_event_ts: Optional[float] = None
-    last_close_code: Optional[int] = None
-    last_close_reason: str = ""
 
-    # parsing stats
-    parse_hits: int = 0
-    parse_misses: int = 0
-
-    # rings
-    raw_ring: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=RAW_RING_MAX))
-    trades: Deque[Trade] = field(default_factory=lambda: deque(maxlen=TAPE_MAX))
-
-    # book
+    # Canonical state
     book: Book = field(default_factory=Book)
-    snapshots_applied: int = 0
+    trades: Deque[Trade] = field(default_factory=lambda: deque(maxlen=500))
 
-    # depth merge stats / parity (FIX14)
+    # Render anchor + history (time window)
+    anchor_px: Optional[float] = None
+    anchor_hist: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=5000))
+
+    # Debug
+    last_raw: Optional[Dict[str, Any]] = None
+
+    # Counters
+    depth_msgs: int = 0
+    trade_msgs: int = 0
     depth_updates_applied: int = 0
-    last_bid_side_ts: Optional[float] = None
-    last_ask_side_ts: Optional[float] = None
-    last_parity_ok_ts: Optional[float] = None
-
-    def uptime_s(self) -> float:
-        return _now() - self.start_ts
+    snapshots_seen: int = 0
 
 
 STATE = State()
 
-# ----------------------------
-# Depth parsing & merge
-# ----------------------------
-
-def _apply_depth_update(obj: Dict[str, Any], ts: float) -> bool:
-    """
-    Applies MEXC contract depth payloads in a *parity-safe* way.
-
-    Critical FIX14 change:
-    - Do NOT overwrite the entire book when only one side (bids/asks) is present.
-    - Support incremental merging semantics: qty<=0 deletes level; qty>0 sets level.
-
-    We treat a payload as a "full snapshot" only when BOTH sides are present
-    and the book is empty OR the payload looks large enough to plausibly be a snapshot.
-    """
-    data = obj.get("data")
-    if not isinstance(data, dict):
-        return False
-
-    bids = data.get("bids")
-    asks = data.get("asks")
-    if not isinstance(bids, list) and not isinstance(asks, list):
-        return False
-
-    def _iter_levels(side_list: Any):
-        if not isinstance(side_list, list):
-            return
-        for lvl in side_list[:DEPTH_MAX_LEVELS]:
-            px = qty = None
-            if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
-                px = _as_float(lvl[0])
-                qty = _as_float(lvl[1])
-            elif isinstance(lvl, dict):
-                px = _as_float(lvl.get("price") or lvl.get("p"))
-                qty = _as_float(lvl.get("quantity") or lvl.get("q"))
-            if px is None or qty is None:
-                continue
-            yield float(px), float(qty)
-
-    # Heuristic: treat as full snapshot only when both sides present and either
-    # (a) we have no book yet, or (b) the payload size is large.
-    both_present = isinstance(bids, list) and isinstance(asks, list)
-    looks_like_snapshot = both_present and (
-        (len(STATE.book.bids) == 0 and len(STATE.book.asks) == 0) or
-        (len(bids) >= 50 and len(asks) >= 50)
-    )
-
-    if looks_like_snapshot:
-        new_bids: Dict[float, float] = {}
-        new_asks: Dict[float, float] = {}
-
-        for px, qty in _iter_levels(bids):
-            if qty > 0:
-                new_bids[px] = qty
-        for px, qty in _iter_levels(asks):
-            if qty > 0:
-                new_asks[px] = qty
-
-        STATE.book.bids = new_bids
-        STATE.book.asks = new_asks
-        STATE.snapshots_applied += 1
-        STATE.depth_updates_applied += 1
-
-        STATE.last_bid_side_ts = ts if new_bids else STATE.last_bid_side_ts
-        STATE.last_ask_side_ts = ts if new_asks else STATE.last_ask_side_ts
-    else:
-        changed = False
-
-        if isinstance(bids, list):
-            # incremental merge for bids
-            for px, qty in _iter_levels(bids):
-                if qty <= 0:
-                    if px in STATE.book.bids:
-                        del STATE.book.bids[px]
-                        changed = True
-                else:
-                    if STATE.book.bids.get(px) != qty:
-                        STATE.book.bids[px] = qty
-                        changed = True
-            STATE.last_bid_side_ts = ts
-
-        if isinstance(asks, list):
-            # incremental merge for asks
-            for px, qty in _iter_levels(asks):
-                if qty <= 0:
-                    if px in STATE.book.asks:
-                        del STATE.book.asks[px]
-                        changed = True
-                else:
-                    if STATE.book.asks.get(px) != qty:
-                        STATE.book.asks[px] = qty
-                        changed = True
-            STATE.last_ask_side_ts = ts
-
-        if changed:
-            STATE.depth_updates_applied += 1
-
-    # version / timestamps
-    STATE.book.version = _as_int(data.get("version") or obj.get("version") or obj.get("v"))
-    STATE.book.last_update_ts = ts
-    STATE.book.recompute()
-
-    # parity signal
-    if STATE.book.best_bid is not None and STATE.book.best_ask is not None and len(STATE.book.bids) > 0 and len(STATE.book.asks) > 0:
-        STATE.last_parity_ok_ts = ts
-
-    return True
-
-def _extract_trade_events(obj: Dict[str, Any], ts: float) -> int:
-    """
-    Accepts MEXC contract deal push variants. Common patterns:
-      - data is dict with fields p/v/S (price/vol/side)
-      - data is list of dicts (batch)
-    Side field varies; we map to buy/sell if possible, else unknown.
-    """
-    data = obj.get("data")
-    if data is None:
-        return 0
-
-    events: List[Dict[str, Any]] = []
-    if isinstance(data, list):
-        events = [x for x in data if isinstance(x, dict)]
-    elif isinstance(data, dict):
-        # sometimes nested: {"deals":[...]}
-        if isinstance(data.get("deals"), list):
-            events = [x for x in data.get("deals") if isinstance(x, dict)]
-        else:
-            events = [data]
-    else:
-        return 0
-
-    pushed = 0
-    for ev in events:
-        px = _as_float(ev.get("p") or ev.get("price") or ev.get("px"))
-        qty = _as_float(ev.get("v") or ev.get("vol") or ev.get("qty") or ev.get("q"))
-        if px is None or qty is None:
-            continue
-
-        side_raw = ev.get("S") or ev.get("side") or ev.get("t") or ev.get("T")
-        side = "unknown"
-        if isinstance(side_raw, str):
-            s = side_raw.lower()
-            if "buy" in s or s in ("b", "bid"):
-                side = "buy"
-            elif "sell" in s or s in ("s", "ask"):
-                side = "sell"
-        elif isinstance(side_raw, (int, float)):
-            # Some feeds use 1/2, 1=buy 2=sell (cannot confirm for MEXC)
-            if int(side_raw) == 1:
-                side = "buy"
-            elif int(side_raw) == 2:
-                side = "sell"
-
-        STATE.trades.append(Trade(ts=ts, px=px, qty=qty, side=side))
-        pushed += 1
-
-    return pushed
-
-
-def _handle_ws_message(raw: str) -> None:
-    ts = _now()
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        STATE.parse_misses += 1
-        return
-
-    STATE.raw_ring.append({"ts": ts, "raw": obj})
-    STATE.frames += 1
-    STATE.last_event_ts = ts
-
-    if isinstance(obj, dict):
-        hit = False
-        ch = obj.get("channel") or obj.get("c") or ""
-        if isinstance(ch, str):
-            ch_l = ch.lower()
-        else:
-            ch_l = ""
-
-        # Depth: push.depth or any dict containing bids/asks
-        if "depth" in ch_l or ("data" in obj and isinstance(obj.get("data"), dict) and ("bids" in obj["data"] or "asks" in obj["data"])):
-            if _apply_depth_update(obj, ts):
-                hit = True
-
-        # Deals/trades: push.deal, push.trade, deals, etc.
-        if ("deal" in ch_l) or ("trade" in ch_l) or ("deals" in ch_l):
-            pushed = _extract_trade_events(obj, ts)
-            if pushed > 0:
-                hit = True
-
-        if hit:
-            STATE.parse_hits += 1
-        else:
-            STATE.parse_misses += 1
-    else:
-        STATE.parse_misses += 1
-
-
-# ----------------------------
-# Connector loop (MEXC contract WS)
-# ----------------------------
-
-async def _connector_loop() -> None:
-    if websockets is None:
-        STATE.status = "ERROR"
-        STATE.last_error = "python package 'websockets' is not available in this environment"
-        bootlog("ERROR: websockets module missing; connector disabled")
-        return
-
-    sub_depth = {"method": "sub.depth", "param": {"symbol": SYMBOL, "depth": 200}, "id": 1}
-    sub_deals = {"method": "sub.deal", "param": {"symbol": SYMBOL}, "id": 2}
-
-    while True:
-        try:
-            STATE.status = "CONNECTING"
-            bootlog(f"Connecting WS: {WS_URL} symbol={SYMBOL}")
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, close_timeout=10) as ws:
-                STATE.status = "CONNECTED"
-                STATE.last_connect_ts = _now()
-                STATE.last_error = ""
-                STATE.last_close_code = None
-                STATE.last_close_reason = ""
-
-                try:
-                    await ws.send(json.dumps(sub_depth))
-                    await ws.send(json.dumps(sub_deals))
-                except Exception as e:
-                    STATE.last_error = f"subscribe_send_failed: {e}"
-                    bootlog(f"ERROR: subscribe send failed: {e}")
-
-                while True:
-                    raw = await ws.recv()
-                    if isinstance(raw, bytes):
-                        try:
-                            raw = raw.decode("utf-8", errors="replace")
-                        except Exception:
-                            raw = str(raw)
-                    _handle_ws_message(str(raw))
-        except Exception as e:
-            STATE.status = "ERROR"
-            STATE.reconnects += 1
-            STATE.last_error = f"{type(e).__name__}: {e}"
-            bootlog(f"WS ERROR: {STATE.last_error}\n{traceback.format_exc()}")
-            # bounded backoff
-            await asyncio.sleep(min(10.0, 0.5 * STATE.reconnects))
-
-
-# ----------------------------
-# Render Bridge Contract
-# ----------------------------
 
 def _mid_px() -> Optional[float]:
     bb = STATE.book.best_bid
     ba = STATE.book.best_ask
     if bb is not None and ba is not None:
         return (bb + ba) / 2.0
+    # fallback to last trade
     if STATE.trades:
         return STATE.trades[-1].px
     return bb or ba
 
 
+def _update_anchor() -> Optional[float]:
+    """Price-travel anchor: smoothed mid (or last trade)."""
+    target = _mid_px()
+    if target is None:
+        return STATE.anchor_px
+    if STATE.anchor_px is None:
+        STATE.anchor_px = float(target)
+    else:
+        # Exponential smoothing to reduce jitter while still allowing travel
+        a = max(0.02, min(0.95, ANCHOR_ALPHA))
+        STATE.anchor_px = (1.0 - a) * STATE.anchor_px + a * float(target)
+
+    # Maintain history (time window)
+    ts = _now()
+    STATE.anchor_hist.append((ts, float(STATE.anchor_px)))
+    # Trim old points (by time)
+    cutoff = ts - max(10.0, ANCHOR_HISTORY_SEC)
+    while STATE.anchor_hist and STATE.anchor_hist[0][0] < cutoff:
+        STATE.anchor_hist.popleft()
+    return STATE.anchor_px
+
+
+def _apply_side_updates(side: Dict[float, float], raw_levels: Any) -> int:
+    """Apply incremental updates to a side dict.
+
+    For each level:
+      - qty <= 0 => delete level
+      - qty > 0  => set level
+    Returns number of levels touched.
+    """
+    if raw_levels is None:
+        return 0
+    touched = 0
+
+    # normalize to iterable
+    if isinstance(raw_levels, dict):
+        # sometimes exchanges send {price: qty, ...}
+        items = list(raw_levels.items())
+    else:
+        items = raw_levels
+
+    if not isinstance(items, (list, tuple)):
+        return 0
+
+    for lvl in items:
+        px = None
+        qty = None
+        if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+            px = _as_float(lvl[0])
+            qty = _as_float(lvl[1])
+        elif isinstance(lvl, dict):
+            px = _as_float(lvl.get("price") or lvl.get("p"))
+            qty = _as_float(lvl.get("quantity") or lvl.get("q"))
+        if px is None or qty is None:
+            continue
+        touched += 1
+        if qty <= 0:
+            side.pop(px, None)
+        else:
+            side[px] = qty
+    return touched
+
+
+def _trim_book() -> None:
+    """Bound book size to avoid unbounded growth if we only merge updates."""
+    n = max(200, MAX_LEVELS_PER_SIDE)
+    if len(STATE.book.bids) > n:
+        # keep top-n highest bids
+        keep = dict(sorted(STATE.book.bids.items(), key=lambda kv: kv[0], reverse=True)[:n])
+        STATE.book.bids = keep
+    if len(STATE.book.asks) > n:
+        # keep top-n lowest asks
+        keep = dict(sorted(STATE.book.asks.items(), key=lambda kv: kv[0])[:n])
+        STATE.book.asks = keep
+
+
+# ----------------------------
+# MEXC WS parsing
+# ----------------------------
+
+def _handle_depth(obj: Dict[str, Any], ts: float) -> bool:
+    """Parity-safe incremental depth merge.
+
+    FIX14 failure cause was side wipeout when messages were partial.
+    FIX15 keeps the FIX14 rules:
+      - If a message omits bids or asks, that side is NOT cleared.
+      - qty <= 0 deletes
+      - qty > 0 sets
+    """
+    try:
+        data = obj.get("data", obj)
+        bids_raw = data.get("bids") if isinstance(data, dict) else None
+        asks_raw = data.get("asks") if isinstance(data, dict) else None
+
+        touched = 0
+        if bids_raw is not None:
+            touched += _apply_side_updates(STATE.book.bids, bids_raw)
+        if asks_raw is not None:
+            touched += _apply_side_updates(STATE.book.asks, asks_raw)
+
+        if touched <= 0:
+            return False
+
+        STATE.depth_updates_applied += touched
+        STATE.depth_msgs += 1
+        _trim_book()
+        STATE.book.recompute()
+        STATE.last_event_ts = ts
+        return True
+    except Exception as e:
+        STATE.last_error = f"depth_parse_error: {e}"
+        return False
+
+
+def _extract_trade_side(d: Dict[str, Any]) -> str:
+    # Known variants:
+    # - "S": 1 buy, 2 sell (common)
+    # - "side": "buy"/"sell"
+    # - "T"/"m" maker-taker flags; we avoid guessing if unclear
+    s = d.get("S") if isinstance(d, dict) else None
+    if s in (1, "1", "buy", "BUY"):
+        return "buy"
+    if s in (2, "2", "sell", "SELL"):
+        return "sell"
+    side = d.get("side") if isinstance(d, dict) else None
+    if isinstance(side, str):
+        side_l = side.lower()
+        if "buy" in side_l:
+            return "buy"
+        if "sell" in side_l:
+            return "sell"
+    return "unknown"
+
+
+def _handle_trades(obj: Dict[str, Any], ts: float) -> int:
+    """Parse trade push messages; store in tape."""
+    try:
+        data = obj.get("data")
+        if data is None:
+            return 0
+
+        events: List[Dict[str, Any]] = []
+        if isinstance(data, dict):
+            events = [data]
+        elif isinstance(data, list):
+            events = [x for x in data if isinstance(x, dict)]
+        else:
+            return 0
+
+        added = 0
+        for d in events:
+            px = _as_float(d.get("p") or d.get("price"))
+            qty = _as_float(d.get("v") or d.get("qty") or d.get("volume"))
+            if px is None or qty is None:
+                continue
+            side = _extract_trade_side(d)
+            STATE.trades.append(Trade(ts=ts, px=float(px), qty=float(qty), side=side))
+            added += 1
+
+        if added:
+            STATE.trade_msgs += 1
+            STATE.last_event_ts = ts
+        return added
+    except Exception as e:
+        STATE.last_error = f"trade_parse_error: {e}"
+        return 0
+
+
+def _route_message(obj: Dict[str, Any]) -> None:
+    # Persist last raw for debugging (small excerpt)
+    try:
+        STATE.last_raw = {"ts": _now(), "obj": obj}
+    except Exception:
+        STATE.last_raw = None
+
+    ts = _now()
+    method = obj.get("channel") or obj.get("c") or obj.get("method") or obj.get("event")
+
+    # MEXC contract WS often uses:
+    # - "push.depth" or "depth" style channels
+    # - "push.deal"  for trades
+    if isinstance(method, str):
+        m = method.lower()
+    else:
+        m = ""
+
+    if "depth" in m:
+        _handle_depth(obj, ts)
+        return
+    if "deal" in m or "trade" in m:
+        _handle_trades(obj, ts)
+        return
+
+    # Some messages may carry data without channel hints; attempt depth heuristic
+    data = obj.get("data")
+    if isinstance(data, dict) and ("bids" in data or "asks" in data):
+        _handle_depth(obj, ts)
+        return
+
+
+# ----------------------------
+# Connector loop (resilient)
+# ----------------------------
+
+async def _connector_loop() -> None:
+    backoff = 1.0
+    while True:
+        try:
+            STATE.status = "CONNECTING"
+            STATE.last_error = None
+            bootlog(f"CONNECTING ws={WS_URL} symbol={SYMBOL}")
+
+            async with websockets.connect(WS_URL, ping_interval=15, ping_timeout=15, close_timeout=5) as ws:
+                # Subscribe to depth + trades
+                sub_depth = {
+                    "method": "sub.depth",
+                    "param": {"symbol": SYMBOL, "depth": 200},
+                }
+                sub_trade = {
+                    "method": "sub.deal",
+                    "param": {"symbol": SYMBOL},
+                }
+                await ws.send(json.dumps(sub_depth))
+                await ws.send(json.dumps(sub_trade))
+
+                STATE.status = "CONNECTED"
+                backoff = 1.0
+                bootlog("CONNECTED")
+
+                async for msg in ws:
+                    try:
+                        obj = json.loads(msg)
+                    except Exception:
+                        continue
+                    _route_message(obj)
+
+        except Exception as e:
+            STATE.status = "ERROR"
+            STATE.last_error = str(e)
+            STATE.reconnects += 1
+            bootlog(f"WS ERROR: {e} (reconnects={STATE.reconnects})")
+
+            # bounded exponential backoff with jitter
+            await asyncio.sleep(backoff + (0.1 * backoff * (0.5 - (time.time() % 1.0))))
+            backoff = min(backoff * 1.8, 20.0)
+
+
+# ----------------------------
+# Render frame (bridge contract)
+# ----------------------------
+
 def _render_frame(levels: int, step: float) -> Dict[str, Any]:
     ts = _now()
-    mid = _mid_px()
+    anchor = _update_anchor()
     bb = STATE.book.best_bid
     ba = STATE.book.best_ask
 
-    # Create a symmetric ladder around mid if possible
+    # Determine ladder around anchor
     prices: List[float] = []
     bid_qty: List[float] = []
     ask_qty: List[float] = []
 
-    if mid is not None and step > 0 and levels > 0:
-        center = round(mid / step) * step
+    if anchor is not None and step > 0 and levels > 0:
+        center = round(anchor / step) * step
         half = levels // 2
         start = center - half * step
+
+        # NOTE: prices are ascending low->high; UI will map high->top (axis fix)
         for i in range(levels):
             px = round(start + i * step, 10)
             prices.append(px)
             bid_qty.append(float(STATE.book.bids.get(px, 0.0)))
             ask_qty.append(float(STATE.book.asks.get(px, 0.0)))
 
-    # Tape (last N, newest last)
-    tape = [
-        {"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side}
-        for t in list(STATE.trades)[-50:]
-    ]
+    # Trades (last N)
+    tape = [{"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side} for t in list(STATE.trades)[-60:]]
+
+    # Anchor history for time window overlay
+    hist = [{"ts": hts, "px": hpx} for (hts, hpx) in list(STATE.anchor_hist)[-900:]]
 
     last_event_age = None
     if STATE.last_event_ts is not None:
         last_event_age = ts - STATE.last_event_ts
+
+    # Health gating:
+    # - GREEN only if connected AND fresh data AND parity ok
+    # - YELLOW if warming / no frames yet / not connected
+    # - RED if connector ERROR
+    parity_ok = (bb is not None) and (ba is not None) and (len(STATE.book.bids) > 0) and (len(STATE.book.asks) > 0)
+    fresh = (STATE.last_event_ts is not None) and ((ts - STATE.last_event_ts) <= 5.0)
+    if STATE.status == "ERROR":
+        health = "RED"
+    elif STATE.status == "CONNECTED" and fresh and parity_ok:
+        health = "GREEN"
+    else:
+        health = "YELLOW"
 
     return {
         "ts": ts,
@@ -479,13 +473,16 @@ def _render_frame(levels: int, step: float) -> Dict[str, Any]:
         "build": BUILD,
         "symbol": SYMBOL,
         "ws_url": WS_URL,
-        "health": "GREEN" if STATE.status == "CONNECTED" else ("YELLOW" if STATE.status in ("INIT", "CONNECTING") else "RED"),
+        "health": health,
         "connector": {
             "status": STATE.status,
             "frames": STATE.frames,
             "reconnects": STATE.reconnects,
             "last_error": STATE.last_error,
             "last_event_age_s": last_event_age,
+            "depth_msgs": STATE.depth_msgs,
+            "trade_msgs": STATE.trade_msgs,
+            "depth_updates_applied": STATE.depth_updates_applied,
         },
         "book": {
             "best_bid": bb,
@@ -495,36 +492,29 @@ def _render_frame(levels: int, step: float) -> Dict[str, Any]:
             "totals": {"bid_qty": STATE.book.bid_qty_total, "ask_qty": STATE.book.ask_qty_total},
             "last_update_ts": STATE.book.last_update_ts,
         },
-        "tape": {
-            "trades_seen": len(STATE.trades),
-            "last_trade_px": STATE.trades[-1].px if STATE.trades else None,
-            "last_trade_qty": STATE.trades[-1].qty if STATE.trades else None,
-            "last_trade_side": STATE.trades[-1].side if STATE.trades else None,
-            "last_trade_ts": STATE.trades[-1].ts if STATE.trades else None,
-            "items": tape,
-        },
+        "tape": {"items": tape},
         "render": {
             "levels": levels,
             "step": step,
-            "mid_px": mid,
+            "anchor_px": anchor,
             "prices": prices,
             "bid_qty": bid_qty,
             "ask_qty": ask_qty,
+            "anchor_hist": hist,
         },
     }
 
 
 # ----------------------------
-# FastAPI App (with lifespan)
+# FastAPI app
 # ----------------------------
 
 app = FastAPI(title="QuantDesk Bookmap", version=BUILD)
 
-@app.on_event("startup")  # OK for Replit; deprecation warning is acceptable for now
+
+@app.on_event("startup")
 async def _startup() -> None:
     bootlog(f"Starting {SERVICE} {BUILD} on {HOST}:{PORT}")
-    bootlog(f"Lifespan startup entered")
-    # Start connector in background
     asyncio.create_task(_connector_loop())
 
 
@@ -539,122 +529,29 @@ async def bootlog_txt() -> PlainTextResponse:
 
 @app.get("/health.json")
 async def health_json() -> JSONResponse:
-    # Health semantics (matching prior workflow):
-    # GREEN: server up + connector CONNECTED + fresh frames
-    # YELLOW: server up but connector not connected yet (warmup) OR no frames yet
-    # RED: server up but connector in ERROR
-    now = _now()
-    fresh = (STATE.last_event_ts is not None) and (now - STATE.last_event_ts < 5.0)
-    parity_ok = (STATE.book.best_bid is not None) and (STATE.book.best_ask is not None) and (len(STATE.book.bids) > 0) and (len(STATE.book.asks) > 0)
-    # Health semantics:
-    # GREEN: server up + connector CONNECTED + fresh frames + book parity OK
-    # YELLOW: warmup/degraded (e.g., parity not yet achieved) but not fatal
-    # RED: connector ERROR OR prolonged parity failure while connected
-    if STATE.status == "ERROR":
-        h = "RED"
-    else:
-        if STATE.status == "CONNECTED" and fresh and STATE.frames > 0:
-            if parity_ok:
-                h = "GREEN"
-            else:
-                # allow warmup; after extended time, treat as RED because visuals would be misleading
-                up = STATE.uptime_s()
-                h = "YELLOW" if up < 30.0 else "RED"
-        else:
-            h = "YELLOW"
-    return JSONResponse({
-        "ts": now,
-        "service": SERVICE,
-        "build": BUILD,
-        "symbol": SYMBOL,
-        "ws_url": WS_URL,
-        "health": h,
-        "uptime_s": round(STATE.uptime_s(), 3),
-        "connector": {
-            "status": STATE.status,
-            "frames": STATE.frames,
-            "reconnects": STATE.reconnects,
-            "last_error": STATE.last_error,
-            "last_event_ts": STATE.last_event_ts,
-            "last_connect_ts": STATE.last_connect_ts,
-        },
-        "book": {
-            "best_bid": STATE.book.best_bid,
-            "best_ask": STATE.book.best_ask,
-            "depth_counts": {"bids": len(STATE.book.bids), "asks": len(STATE.book.asks)},
-            "version": STATE.book.version,
-            "last_update_ts": STATE.book.last_update_ts,
-            "parity_ok": (STATE.book.best_bid is not None) and (STATE.book.best_ask is not None) and (len(STATE.book.bids) > 0) and (len(STATE.book.asks) > 0),
-            "last_parity_ok_ts": STATE.last_parity_ok_ts,
-            "last_bid_side_ts": STATE.last_bid_side_ts,
-            "last_ask_side_ts": STATE.last_ask_side_ts,
-        },
-        "tape": {
-            "trades_seen": len(STATE.trades),
-            "last_trade_px": STATE.trades[-1].px if STATE.trades else None,
-            "last_trade_ts": STATE.trades[-1].ts if STATE.trades else None,
-        },
-    })
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP)
+    return JSONResponse({"service": SERVICE, "build": BUILD, "health": frame["health"], "connector": frame["connector"], "book": frame["book"]})
 
 
 @app.get("/telemetry.json")
 async def telemetry_json() -> JSONResponse:
-    return JSONResponse({
-        "ts": _now(),
-        "service": SERVICE,
-        "build": BUILD,
-        "symbol": SYMBOL,
-        "ws_url": WS_URL,
-        "uptime_s": round(STATE.uptime_s(), 3),
-        "connector": {
-            "status": STATE.status,
-            "frames": STATE.frames,
-            "reconnects": STATE.reconnects,
-            "last_error": STATE.last_error,
-            "last_close_code": STATE.last_close_code,
-            "last_close_reason": STATE.last_close_reason,
-            "last_connect_ts": STATE.last_connect_ts,
-            "last_event_ts": STATE.last_event_ts,
-        },
-        "parser": {
-            "parse_hits": STATE.parse_hits,
-            "parse_misses": STATE.parse_misses,
-            "snapshots_applied": STATE.snapshots_applied,
-            "depth_updates_applied": STATE.depth_updates_applied,
-            "last_bid_side_ts": STATE.last_bid_side_ts,
-            "last_ask_side_ts": STATE.last_ask_side_ts,
-            "last_parity_ok_ts": STATE.last_parity_ok_ts,
-        },
-        "rings": {
-            "raw_ring_size": len(STATE.raw_ring),
-            "tape_size": len(STATE.trades),
-        },
-        "host": HOST,
-        "port": PORT,
-    })
-
-
-@app.get("/raw.json")
-async def raw_json() -> JSONResponse:
-    return JSONResponse({
-        "ts": _now(),
-        "build": BUILD,
-        "raw_ring": list(STATE.raw_ring),
-    })
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP)
+    return JSONResponse(frame)
 
 
 @app.get("/book.json")
 async def book_json() -> JSONResponse:
+    b = STATE.book
     return JSONResponse({
         "ts": _now(),
         "build": BUILD,
         "symbol": SYMBOL,
-        "best_bid": STATE.book.best_bid,
-        "best_ask": STATE.book.best_ask,
-        "depth_counts": {"bids": len(STATE.book.bids), "asks": len(STATE.book.asks)},
-        "totals": {"bid_qty": STATE.book.bid_qty_total, "ask_qty": STATE.book.ask_qty_total},
-        "version": STATE.book.version,
-        "last_update_ts": STATE.book.last_update_ts,
+        "best_bid": b.best_bid,
+        "best_ask": b.best_ask,
+        "depth_counts": {"bids": len(b.bids), "asks": len(b.asks)},
+        "totals": {"bid_qty": b.bid_qty_total, "ask_qty": b.ask_qty_total},
+        "version": b.version,
+        "last_update_ts": b.last_update_ts,
     })
 
 
@@ -665,38 +562,41 @@ async def tape_json() -> JSONResponse:
         "build": BUILD,
         "symbol": SYMBOL,
         "trades_seen": len(STATE.trades),
-        "last_trade_px": STATE.trades[-1].px if STATE.trades else None,
-        "last_trade_qty": STATE.trades[-1].qty if STATE.trades else None,
-        "last_trade_side": STATE.trades[-1].side if STATE.trades else None,
-        "last_trade_ts": STATE.trades[-1].ts if STATE.trades else None,
-        "tape": [{"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side} for t in list(STATE.trades)],
+        "items": [{"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side} for t in list(STATE.trades)[-120:]],
     })
 
 
+@app.get("/raw.json")
+async def raw_json() -> JSONResponse:
+    return JSONResponse({"ts": _now(), "build": BUILD, "last_raw": STATE.last_raw})
+
+
 @app.get("/render.json")
-async def render_json(levels: int = RENDER_DEFAULT_LEVELS, step: float = RENDER_DEFAULT_STEP) -> JSONResponse:
-    # Contract: always returns a frame; empty arrays allowed during warmup.
-    levels = max(10, min(400, int(levels)))
-    step = float(step) if step and step > 0 else RENDER_DEFAULT_STEP
-    return JSONResponse(_render_frame(levels=levels, step=step))
+async def render_json() -> JSONResponse:
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP)
+    return JSONResponse(frame["render"])
 
 
 @app.websocket("/render.ws")
 async def render_ws(ws: WebSocket) -> None:
     await ws.accept()
-    fps = max(1.0, min(30.0, RENDER_FPS))
-    period = 1.0 / fps
     try:
+        interval = 1.0 / max(1.0, RENDER_FPS)
         while True:
-            frame = _render_frame(levels=RENDER_DEFAULT_LEVELS, step=RENDER_DEFAULT_STEP)
+            frame = _render_frame(RENDER_LEVELS, RENDER_STEP)
+            STATE.frames += 1
             await ws.send_text(json.dumps(frame))
-            await asyncio.sleep(period)
+            await asyncio.sleep(interval)
     except Exception:
-        # client disconnect or send failure
+        # client disconnected
         return
 
 
 def _ui_html() -> str:
+    # Minimal bridge demo:
+    # - Canvas ladder view
+    # - Price axis corrected: higher prices at top
+    # - Time-window overlay: anchor history line
     return f"""<!doctype html>
 <html>
 <head>
@@ -715,178 +615,235 @@ def _ui_html() -> str:
     @media (min-width: 980px) {{
       .grid {{ grid-template-columns: 1.2fr 0.8fr; }}
     }}
-    pre {{ background:#0b0b0c; color:#e8e8e8; padding:14px; border-radius:12px; overflow:auto; font-size:12px; line-height:1.25; }}
-    canvas {{ width:100%; height:520px; background:#fff; border:1px solid #ddd; border-radius:12px; }}
-    .links a {{ display:block; margin:4px 0; }}
+    .card {{ border:1px solid #eee; border-radius:12px; padding:12px; box-shadow: 0 1px 8px rgba(0,0,0,0.04); }}
+    canvas {{ width:100%; height:520px; border:1px solid #eee; border-radius:12px; background:#fff; }}
+    .small {{ font-size: 12px; }}
+    a {{ color: inherit; }}
+    .endpoints a {{ display:inline-block; margin-right:12px; }}
+    pre {{ white-space: pre-wrap; word-break: break-word; }}
   </style>
 </head>
 <body>
   <h1>QuantDesk Bookmap</h1>
   <div class="top">
-    <span id="healthPill" class="pill yellow">HEALTH: ...</span>
-    <span class="muted">Build: {BUILD}</span>
-    <span class="muted">Symbol: {SYMBOL}</span>
-    <span class="muted">WS: {WS_URL}</span>
+    <div id="health" class="pill yellow">HEALTH: YELLOW</div>
+    <div><b>Build:</b> {BUILD}</div>
+    <div><b>Symbol:</b> {SYMBOL}</div>
+    <div class="muted small">WS: {WS_URL}</div>
   </div>
 
-  <p class="muted">
-    This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a minimal ladder.
-    It is not a full Bookmap renderer yet.
-  </p>
-
   <div class="grid">
-    <div>
-      <canvas id="cv" width="1100" height="520"></canvas>
-      <p class="muted" style="margin-top:8px;">
-        Ladder: green = bids, red = asks. Mid line shown when available.
-      </p>
+    <div class="card">
+      <div class="muted">This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a moving anchored ladder (price travel). It is not a full Bookmap renderer yet.</div>
+      <div style="height:10px"></div>
+      <canvas id="cv" width="980" height="520"></canvas>
+      <div class="muted small" style="margin-top:8px;">Ladder: green = bids, red = asks. Axis: higher prices at top. Mid line shows anchor.</div>
     </div>
-    <div>
-      <div class="links">
-        <b>Endpoints</b>
-        <a href="/health.json" target="_blank">/health.json</a>
-        <a href="/telemetry.json" target="_blank">/telemetry.json</a>
-        <a href="/book.json" target="_blank">/book.json</a>
-        <a href="/tape.json" target="_blank">/tape.json</a>
-        <a href="/render.json" target="_blank">/render.json</a>
-        <a href="/raw.json" target="_blank">/raw.json</a>
-        <a href="/bootlog.txt" target="_blank">/bootlog.txt</a>
+
+    <div class="card">
+      <div><b>Endpoints</b></div>
+      <div class="endpoints small" style="margin-top:6px;">
+        <a href="/health.json">/health.json</a>
+        <a href="/telemetry.json">/telemetry.json</a>
+        <a href="/book.json">/book.json</a>
+        <a href="/tape.json">/tape.json</a>
+        <a href="/render.json">/render.json</a>
+        <a href="/raw.json">/raw.json</a>
+        <a href="/bootlog.txt">/bootlog.txt</a>
       </div>
-      <h3>Status (auto-refresh)</h3>
-      <pre id="statusPre">{{}}</pre>
+      <div style="height:10px"></div>
+      <div class="muted small"><b>Status</b> (auto-refresh)</div>
+      <pre id="status" class="small"></pre>
     </div>
   </div>
 
 <script>
-(function() {{
-  const statusPre = document.getElementById('statusPre');
-  const pill = document.getElementById('healthPill');
+(() => {{
   const cv = document.getElementById('cv');
   const ctx = cv.getContext('2d');
+  const healthEl = document.getElementById('health');
+  const statusEl = document.getElementById('status');
 
-  function setPill(h) {{
-    pill.classList.remove('green','yellow','red');
-    if (h === 'GREEN') pill.classList.add('green');
-    else if (h === 'RED') pill.classList.add('red');
-    else pill.classList.add('yellow');
-    pill.textContent = 'HEALTH: ' + h;
+  function setHealth(h) {{
+    healthEl.classList.remove('green','yellow','red');
+    if (h === 'GREEN') healthEl.classList.add('green');
+    else if (h === 'RED') healthEl.classList.add('red');
+    else healthEl.classList.add('yellow');
+    healthEl.textContent = 'HEALTH: ' + h;
+  }}
+
+  function fmt(x) {{
+    if (x === null || x === undefined) return 'null';
+    if (typeof x === 'number') {{
+      if (Math.abs(x) >= 1000) return x.toFixed(1);
+      return x.toFixed(2);
+    }}
+    return String(x);
   }}
 
   function draw(frame) {{
-    // Clear
-    ctx.clearRect(0,0,cv.width,cv.height);
+    const W = cv.width, H = cv.height;
+    ctx.clearRect(0,0,W,H);
 
-    const prices = frame?.render?.prices || [];
-    const bid = frame?.render?.bid_qty || [];
-    const ask = frame?.render?.ask_qty || [];
+    const r = frame.render;
+    const prices = r.prices || [];
+    const bids = r.bid_qty || [];
+    const asks = r.ask_qty || [];
+    const levels = prices.length;
 
-    // Background
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0,0,cv.width,cv.height);
+    // Layout
+    const padL = 84;
+    const padR = 18;
+    const axisX = padL;
+    const midX = Math.floor(W*0.52);
+    const bidX0 = padL + 10;
+    const bidX1 = midX - 8;
+    const askX0 = midX + 8;
+    const askX1 = W - padR;
 
-    if (!prices.length) {{
-      ctx.fillStyle = '#666';
-      ctx.font = '16px system-ui';
-      ctx.fillText('Waiting for render frames...', 16, 28);
-      return;
+    // Scaling for bars
+    let maxQty = 1.0;
+    for (let i=0;i<levels;i++) {{
+      maxQty = Math.max(maxQty, bids[i]||0, asks[i]||0);
+    }}
+    const bidW = Math.max(10, bidX1 - bidX0);
+    const askW = Math.max(10, askX1 - askX0);
+
+    // Row height (fit canvas)
+    const rowH = Math.max(3, Math.floor((H-20) / Math.max(1, levels)));
+    const top = 10;
+
+    // Helper: map index to Y with correct price orientation:
+    // prices array is low->high, but screen Y increases downward.
+    // So high price should be near top => invert index.
+    function yForIndex(i) {{
+      const inv = (levels - 1 - i);
+      return top + inv * rowH;
     }}
 
-    const n = prices.length;
-    const padL = 80, padR = 20, padT = 16, padB = 16;
-    const W = cv.width - padL - padR;
-    const H = cv.height - padT - padB;
+    // Price labels + grid
+    ctx.font = '12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.fillStyle = '#444';
+    ctx.strokeStyle = '#eee';
 
-    // Scale qty to bars
-    let maxQ = 0;
-    for (let i=0;i<n;i++) {{
-      maxQ = Math.max(maxQ, bid[i]||0, ask[i]||0);
-    }}
-    maxQ = Math.max(1e-9, maxQ);
-
-    // Draw ladder rows
-    const rowH = H / n;
-    for (let i=0;i<n;i++) {{
-      const y = padT + i*rowH;
-      const b = (bid[i]||0) / maxQ;
-      const a = (ask[i]||0) / maxQ;
-
-      // price labels
-      if (i % Math.max(1, Math.floor(n/12)) === 0) {{
-        ctx.fillStyle = '#333';
-        ctx.font = '12px system-ui';
-        ctx.fillText(prices[i].toFixed(1), 10, y + rowH*0.8);
-        // light grid
-        ctx.strokeStyle = '#eee';
+    for (let i=0;i<levels;i++) {{
+      const y = yForIndex(i);
+      if (i % 10 === 0) {{
+        // horizontal grid line
         ctx.beginPath();
-        ctx.moveTo(padL, y);
-        ctx.lineTo(padL+W, y);
+        ctx.moveTo(padL, y+0.5);
+        ctx.lineTo(W-padR, y+0.5);
         ctx.stroke();
-      }}
 
-      // bid bar (left-to-right)
-      if (b > 0) {{
-        ctx.fillStyle = 'rgba(46, 125, 50, 0.45)';
-        ctx.fillRect(padL, y, W * b, rowH);
-      }}
-      // ask bar (right-to-left)
-      if (a > 0) {{
-        ctx.fillStyle = 'rgba(198, 40, 40, 0.40)';
-        ctx.fillRect(padL + (W * (1 - a)), y, W * a, rowH);
+        // price label
+        ctx.fillText(fmt(prices[i]), 8, y + 10);
       }}
     }}
 
-    // Mid line
-    const mid = frame?.render?.mid_px;
-    if (typeof mid === 'number') {{
-      // find nearest row
-      let bestI = 0, bestD = 1e18;
-      for (let i=0;i<n;i++) {{
-        const d = Math.abs(prices[i]-mid);
-        if (d < bestD) {{ bestD = d; bestI = i; }}
+    // Draw bids/asks
+    for (let i=0;i<levels;i++) {{
+      const y = yForIndex(i);
+      const bq = bids[i] || 0;
+      const aq = asks[i] || 0;
+
+      // bid bar
+      const bw = Math.min(bidW, (bq / maxQty) * bidW);
+      if (bw > 0.5) {{
+        ctx.fillStyle = 'rgba(46,125,50,0.35)';
+        ctx.fillRect(bidX1 - bw, y, bw, rowH-1);
       }}
-      const y = padT + bestI*rowH + rowH/2;
-      ctx.strokeStyle = '#111';
-      ctx.lineWidth = 1;
+
+      // ask bar
+      const aw = Math.min(askW, (aq / maxQty) * askW);
+      if (aw > 0.5) {{
+        ctx.fillStyle = 'rgba(198,40,40,0.35)';
+        ctx.fillRect(askX0, y, aw, rowH-1);
+      }}
+    }}
+
+    // Mid/anchor line (center of ladder)
+    if (r.anchor_px !== null && r.anchor_px !== undefined) {{
+      // anchor index nearest to anchor_px
+      const step = r.step || 0.1;
+      const anchor = r.anchor_px;
+      // find closest index by rounding
+      const center = Math.round(anchor / step) * step;
+      // find index of center in array (prices[i] == center)
+      let idx = -1;
+      for (let i=0;i<levels;i++) {{
+        if (Math.abs((prices[i]||0) - center) < (step/2 + 1e-9)) {{ idx = i; break; }}
+      }}
+      if (idx >= 0) {{
+        const y = yForIndex(idx) + Math.floor(rowH/2);
+        ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+        ctx.beginPath();
+        ctx.moveTo(padL, y+0.5);
+        ctx.lineTo(W-padR, y+0.5);
+        ctx.stroke();
+        ctx.fillStyle = '#111';
+        ctx.fillText('anchor ' + fmt(anchor), padL+6, y-4);
+      }}
+    }}
+
+    // Time-window overlay (anchor history as a line on the far right)
+    const hist = r.anchor_hist || [];
+    if (hist.length >= 2 && levels > 0) {{
+      // map px -> y using ladder window
+      const pMin = prices[0];
+      const pMax = prices[levels-1];
+      const tMin = hist[0].ts;
+      const tMax = hist[hist.length-1].ts;
+      const x0 = W - 180;
+      const x1 = W - 20;
+
+      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
       ctx.beginPath();
-      ctx.moveTo(padL, y);
-      ctx.lineTo(padL+W, y);
+      for (let k=0;k<hist.length;k++) {{
+        const t = hist[k].ts;
+        const px = hist[k].px;
+        const x = x0 + (t - tMin) / Math.max(1e-9, (tMax - tMin)) * (x1 - x0);
+        // price to y: higher price -> smaller y
+        const y = top + (pMax - px) / Math.max(1e-9, (pMax - pMin)) * (levels*rowH);
+        if (k===0) ctx.moveTo(x,y);
+        else ctx.lineTo(x,y);
+      }}
       ctx.stroke();
-      ctx.lineWidth = 1;
+
+      ctx.fillStyle = '#666';
+      ctx.fillText('anchor history', x0, 18);
     }}
+
+    // Status panel
+    try {{
+      statusEl.textContent = JSON.stringify({{
+        service: frame.service,
+        build: frame.build,
+        symbol: frame.symbol,
+        connector: frame.connector,
+        book: frame.book,
+        render: {{
+          levels: r.levels,
+          step: r.step,
+          anchor_px: r.anchor_px
+        }}
+      }}, null, 2);
+    }} catch(e) {{}}
   }}
 
-  // Health poll
-  async function poll() {{
-    try {{
-      const r = await fetch('/health.json', {{cache:'no-store'}});
-      const j = await r.json();
-      setPill(j.health || 'YELLOW');
-    }} catch (e) {{
-      setPill('YELLOW');
-    }}
+  function connect() {{
+    const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+    const ws = new WebSocket(proto + '://' + location.host + '/render.ws');
+    ws.onmessage = (ev) => {{
+      try {{
+        const frame = JSON.parse(ev.data);
+        setHealth(frame.health || 'YELLOW');
+        draw(frame);
+      }} catch(e) {{}}
+    }};
+    ws.onclose = () => setTimeout(connect, 600);
   }}
-  setInterval(poll, 1000);
-  poll();
 
-  // Render WS
-  const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
-  const wsUrl = proto + '://' + location.host + '/render.ws';
-  const ws = new WebSocket(wsUrl);
-  ws.onmessage = (ev) => {{
-    try {{
-      const frame = JSON.parse(ev.data);
-      statusPre.textContent = JSON.stringify(frame, null, 2);
-      draw(frame);
-    }} catch (e) {{
-      // ignore
-    }}
-  }};
-  ws.onopen = () => {{
-    // noop
-  }};
-  ws.onerror = () => {{
-    // noop
-  }};
+  connect();
 }})();
 </script>
 </body>
