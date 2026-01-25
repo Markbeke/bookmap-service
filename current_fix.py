@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =========================================================
-# QuantDesk Bookmap Service — FIX17_HEATMAP_TIME_DENSITY_LAYER
+# QuantDesk Bookmap Service — FIX20_P04_PRICE_LOD
 #
 # Builds on FIX14 (parity-safe incremental book):
 # - Maintains canonical CLOB via incremental merge (no side wipeouts)
@@ -43,8 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX20/P02"
-
+BUILD = "FIX20_P04"
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
 
@@ -1237,31 +1236,60 @@ def _ui_html() -> str:
     const plotW = W - leftPad - rightPad;
     const plotH = H - topPad - botPad;
 
-    // Determine vmax (robust): sample max across visible points
-    let vmax = 0;
-    for (let i=0;i<cols.length;i++) {{
-      const pts = cols[i].pts || [];
-      for (let j=0;j<pts.length;j++) {{
-        const v = pts[j][1];
-        if (v > vmax) vmax = v;
-      }}
-    }}
-    // soft cap for stability
-    vmax = Math.max(1e-9, vmax);
+// LOD aggregation for wide zoom parity (FIX20_P04)
+// When zoomed out, multiple price bins map to a single pixel row. We aggregate bins into buckets
+// so the heatmap remains stratified (Bookmap-style) instead of collapsing into a solid slab.
+const span = Math.max(1, (maxIdx - minIdx));
+const pxPerBin = plotH / span;
+const binsPerPixel = span / Math.max(1, plotH);
+const bucketBins = Math.max(1, Math.ceil(binsPerPixel)); // >=1 bins aggregated into one rendered row
 
-    // Render columns
+function aggPtsMax(pts) {{
+  if (bucketBins <= 1) return pts;
+  const map = new Map(); // bucket -> max v
+  for (let j=0;j<pts.length;j++) {{
+    const idx = pts[j][0];
+    const v = pts[j][1];
+    const b = Math.floor((idx - minIdx) / bucketBins);
+    const prev = map.get(b);
+    if (prev === undefined || v > prev) map.set(b, v);
+  }}
+  const out = [];
+  map.forEach((v,b) => {{
+    const idxRep = minIdx + b*bucketBins + Math.floor(bucketBins/2);
+    out.push([idxRep, v]);
+  }});
+  return out;
+}}
+
+    // Determine vmax (robust): sample max across visible (aggregated) points
+let vmax = 0;
+for (let i=0;i<cols.length;i++) {{
+  const pts0 = cols[i].pts || [];
+  const pts = aggPtsMax(pts0);
+  for (let j=0;j<pts.length;j++) {{
+    const v = pts[j][1];
+    if (v > vmax) vmax = v;
+  }}
+}}
+// soft floor for stability
+vmax = Math.max(1e-9, vmax);
+
+// Render columns
+
     const colW = Math.max(1, Math.floor(plotW / Math.max(1, cols.length)));
     const span = Math.max(1, (maxIdx - minIdx));
     const pxPerBin = plotH / span;
 
     for (let ci=0; ci<cols.length; ci++) {{
       const x0 = leftPad + ci * colW;
-      const pts = cols[ci].pts || [];
+      const pts = aggPtsMax(cols[ci].pts || []);
+      const rowH = Math.max(1, Math.ceil(bucketBins * pxPerBin));
       for (let k=0; k<pts.length; k++) {{
         const idx = pts[k][0];
         const v = pts[k][1];
         const y = topPad + (maxIdx - idx) * pxPerBin; // higher idx at top
-        const h = Math.max(1, Math.ceil(pxPerBin));
+        const h = rowH;
         const rgb = valToRGB(v, vmax);
         ctx.fillStyle = `rgb(${{rgb[0]}},${{rgb[1]}},${{rgb[2]}})`;
         ctx.fillRect(x0, y, colW, h);
