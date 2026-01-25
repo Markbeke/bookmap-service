@@ -45,7 +45,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX19/P01"
+BUILD = "FIX20/P01"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -706,6 +706,8 @@ async def render_ws(ws: WebSocket) -> None:
         "levels": int(RENDER_LEVELS),
         "step": float(RENDER_STEP),
         "pan_ticks": 0.0,
+        "t_offset": 0.0,
+        "t_scale": 1.0,
     }
 
     def _apply_view(payload: dict) -> None:
@@ -722,6 +724,17 @@ async def render_ws(ws: WebSocket) -> None:
             if "pan_ticks" in payload:
                 pt = float(payload["pan_ticks"])
                 view_state["pan_ticks"] = max(-2000.0, min(pt, 2000.0))
+
+            if "t_offset" in payload:
+                try:
+                    view_state["t_offset"] = max(0.0, float(payload["t_offset"]))
+                except Exception:
+                    pass
+            if "t_scale" in payload:
+                try:
+                    view_state["t_scale"] = max(0.25, min(6.0, float(payload["t_scale"])))
+                except Exception:
+                    pass
         except Exception:
             # ignore malformed values
             return
@@ -790,6 +803,11 @@ def _ui_html() -> str:
     a {{ color: inherit; }}
     .endpoints a {{ display:inline-block; margin-right:12px; }}
     pre {{ white-space: pre-wrap; word-break: break-word; }}
+  
+    .badge { padding:6px 10px; border-radius:999px; font-weight:700; font-size:12px; }
+    .badge-live { background:#e6f6ea; color:#1b7f3c; border:1px solid #b9e5c6; }
+    .badge-hist { background:#f2f2f2; color:#555; border:1px solid #ddd; }
+
   </style>
 </head>
 <body>
@@ -798,6 +816,8 @@ def _ui_html() -> str:
     <div id="health" class="pill yellow">HEALTH: YELLOW</div>
     <div><b>Build:</b> {BUILD}</div>
     <div><b>Symbol:</b> {SYMBOL}</div>
+    <div id="liveBadge" class="badge badge-live">LIVE</div>
+    <div id="timeInfo" class="muted small">time scale x1.00</div>
     <div class="muted small">WS: {WS_URL}</div>
   </div>
 
@@ -836,41 +856,77 @@ def _ui_html() -> str:
   // Interactive view state (FIX16):
   // - wheel / pinch zoom changes step
   // - drag pans ladder in price ticks
-  let view = {{ levels: null, baseStep: null, step: null, zoom: 1.0, panTicks: 0.0 }};
+  let view = {{ levels: null, baseStep: null, step: null, zoom: 1.0, panTicks: 0.0 }}
+
+  // ----------------------------
+  // Time ring buffer + UI (FIX20)
+  // ----------------------------
+  const HIST_MAX = 1200; // frames
+  const hist = [];
+  function pushHist(frame){{
+    hist.push({{t: Date.now(), frame}});
+    if (hist.length > HIST_MAX) hist.splice(0, hist.length - HIST_MAX);
+  }}
+  function selectFrame(){{
+    if (hist.length === 0) return null;
+    const off = Math.round(view.tOffset);
+    const idx = Math.max(0, Math.min(hist.length-1, hist.length-1 - off));
+    return hist[idx].frame;
+  }}
+  function historyOffsetMs(){{
+    if (hist.length === 0) return 0;
+    const off = Math.round(view.tOffset);
+    const idx = Math.max(0, Math.min(hist.length-1, hist.length-1 - off));
+    const tLatest = hist[hist.length-1].t;
+    const tSel = hist[idx].t;
+    return Math.max(0, tLatest - tSel);
+  }}
+  function setHistoryUI(){{
+    const badge = document.getElementById('liveBadge');
+    const info = document.getElementById('timeInfo');
+    if (!badge || !info) return;
+    const live = (view.tOffset <= 0.5);
+    badge.textContent = live ? 'LIVE' : 'HISTORY';
+    badge.className = live ? 'badge badge-live' : 'badge badge-hist';
+    const ms = historyOffsetMs();
+    const sec = Math.round(ms/100)/10.0;
+    info.textContent = live ? `time scale x${{view.tScale.toFixed(2)}}` : `offset T-${{sec}}s | scale x${{view.tScale.toFixed(2)}}`;
+  }}
+;
   let wsRef = null;
 
-  function clamp(x, a, b) {{ return Math.max(a, Math.min(b, x)); }}
+  function clamp(x, a, b) {{{{ return Math.max(a, Math.min(b, x)); }}}}
 
-  function sendView() {{
+  function sendView() {{{{
     if (!wsRef || wsRef.readyState !== 1) return;
-    const payload = {{
+    const payload = {{{{
       cmd: "set_view",
       levels: view.levels,
       step: view.step,
       pan_ticks: view.panTicks
-    }};
-    try {{ wsRef.send(JSON.stringify(payload)); }} catch(e) {{}}
-  }}
+    }}}};
+    try {{{{ wsRef.send(JSON.stringify(payload)); }}}} catch(e) {{{{}}}}
+  }}}}
 
 
-  function setHealth(h) {{
+  function setHealth(h) {{{{
     healthEl.classList.remove('green','yellow','red');
     if (h === 'GREEN') healthEl.classList.add('green');
     else if (h === 'RED') healthEl.classList.add('red');
     else healthEl.classList.add('yellow');
     healthEl.textContent = 'HEALTH: ' + h;
-  }}
+  }}}}
 
-  function fmt(x) {{
+  function fmt(x) {{{{
     if (x === null || x === undefined) return 'null';
-    if (typeof x === 'number') {{
+    if (typeof x === 'number') {{{{
       if (Math.abs(x) >= 1000) return x.toFixed(1);
       return x.toFixed(2);
-    }}
+    }}}}
     return String(x);
-  }}
+  }}}}
 
-  function draw(frame) {{
+  function draw(frame) {{{{
     const W = cv.width, H = cv.height;
     ctx.clearRect(0,0,W,H);
 
@@ -899,9 +955,9 @@ def _ui_html() -> str:
 
     // Scaling for bars
     let maxQty = 1.0;
-    for (let i=0;i<levels;i++) {{
+    for (let i=0;i<levels;i++) {{{{
       maxQty = Math.max(maxQty, bids[i]||0, asks[i]||0);
-    }}
+    }}}}
     const bidW = Math.max(10, bidX1 - bidX0);
     const askW = Math.max(10, askX1 - askX0);
 
@@ -912,19 +968,19 @@ def _ui_html() -> str:
     // Helper: map index to Y with correct price orientation:
     // prices array is low->high, but screen Y increases downward.
     // So high price should be near top => invert index.
-    function yForIndex(i) {{
+    function yForIndex(i) {{{{
       const inv = (levels - 1 - i);
       return top + inv * rowH;
-    }}
+    }}}}
 
     // Price labels + grid
     ctx.font = '12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.fillStyle = '#444';
     ctx.strokeStyle = '#eee';
 
-    for (let i=0;i<levels;i++) {{
+    for (let i=0;i<levels;i++) {{{{
       const y = yForIndex(i);
-      if (i % 10 === 0) {{
+      if (i % 10 === 0) {{{{
         // horizontal grid line
         ctx.beginPath();
         ctx.moveTo(padL, y+0.5);
@@ -933,52 +989,52 @@ def _ui_html() -> str:
 
         // price label
         ctx.fillText(fmt(prices[i]), 8, y + 10);
-      }}
-    }}
+      }}}}
+    }}}}
 
     
     // Heatmap background (FIX17): draw decayed liquidity intensity per price level
     // Values are normalized 0..1 server-side.
     const heatMaxAlpha = clamp((frame.render && frame.render.heat_alpha) ? frame.render.heat_alpha : 0.55, 0.0, 1.0);
-    for (let i=0;i<levels;i++) {{
+    for (let i=0;i<levels;i++) {{{{
       const y = yForIndex(i);
       const hb = heatB[i] || 0;
       const ha = heatA[i] || 0;
-      if (hb > 0.001) {{
+      if (hb > 0.001) {{{{
         const a = Math.min(heatMaxAlpha, hb * heatMaxAlpha);
         ctx.fillStyle = 'rgba(46,125,50,' + (0.06 + 0.34*a).toFixed(3) + ')';
         ctx.fillRect(bidX0, y, bidX1 - bidX0, rowH-1);
-      }}
-      if (ha > 0.001) {{
+      }}}}
+      if (ha > 0.001) {{{{
         const a = Math.min(heatMaxAlpha, ha * heatMaxAlpha);
         ctx.fillStyle = 'rgba(198,40,40,' + (0.06 + 0.34*a).toFixed(3) + ')';
         ctx.fillRect(askX0, y, askX1 - askX0, rowH-1);
-      }}
-    }}
+      }}}}
+    }}}}
 
 // Draw bids/asks
-    for (let i=0;i<levels;i++) {{
+    for (let i=0;i<levels;i++) {{{{
       const y = yForIndex(i);
       const bq = bids[i] || 0;
       const aq = asks[i] || 0;
 
       // bid bar
       const bw = Math.min(bidW, (bq / maxQty) * bidW);
-      if (bw > 0.5) {{
+      if (bw > 0.5) {{{{
         ctx.fillStyle = 'rgba(46,125,50,0.35)';
         ctx.fillRect(bidX1 - bw, y, bw, rowH-1);
-      }}
+      }}}}
 
       // ask bar
       const aw = Math.min(askW, (aq / maxQty) * askW);
-      if (aw > 0.5) {{
+      if (aw > 0.5) {{{{
         ctx.fillStyle = 'rgba(198,40,40,0.35)';
         ctx.fillRect(askX0, y, aw, rowH-1);
-      }}
-    }}
+      }}}}
+    }}}}
 
     // Mid/anchor line (center of ladder)
-    if (r.anchor_px !== null && r.anchor_px !== undefined) {{
+    if (r.anchor_px !== null && r.anchor_px !== undefined) {{{{
       // anchor index nearest to anchor_px
       const step = r.step || 0.1;
       const anchor = r.anchor_px;
@@ -986,10 +1042,10 @@ def _ui_html() -> str:
       const center = Math.round(anchor / step) * step;
       // find index of center in array (prices[i] == center)
       let idx = -1;
-      for (let i=0;i<levels;i++) {{
-        if (Math.abs((prices[i]||0) - center) < (step/2 + 1e-9)) {{ idx = i; break; }}
-      }}
-      if (idx >= 0) {{
+      for (let i=0;i<levels;i++) {{{{
+        if (Math.abs((prices[i]||0) - center) < (step/2 + 1e-9)) {{{{ idx = i; break; }}}}
+      }}}}
+      if (idx >= 0) {{{{
         const y = yForIndex(idx) + Math.floor(rowH/2);
         ctx.strokeStyle = 'rgba(0,0,0,0.35)';
         ctx.beginPath();
@@ -998,12 +1054,12 @@ def _ui_html() -> str:
         ctx.stroke();
         ctx.fillStyle = '#111';
         ctx.fillText('anchor ' + fmt(anchor), padL+6, y-4);
-      }}
-    }}
+      }}}}
+    }}}}
 
     // Time-window overlay (anchor history as a line on the far right)
     const hist = r.anchor_hist || [];
-    if (hist.length >= 2 && levels > 0) {{
+    if (hist.length >= 2 && levels > 0) {{{{
       // map px -> y using ladder window
       const pMin = prices[0];
       const pMax = prices[levels-1];
@@ -1014,7 +1070,7 @@ def _ui_html() -> str:
 
       ctx.strokeStyle = 'rgba(0,0,0,0.25)';
       ctx.beginPath();
-      for (let k=0;k<hist.length;k++) {{
+      for (let k=0;k<hist.length;k++) {{{{
         const t = hist[k].ts;
         const px = hist[k].px;
         const x = x0 + (t - tMin) / Math.max(1e-9, (tMax - tMin)) * (x1 - x0);
@@ -1022,29 +1078,29 @@ def _ui_html() -> str:
         const y = top + (pMax - px) / Math.max(1e-9, (pMax - pMin)) * (levels*rowH);
         if (k===0) ctx.moveTo(x,y);
         else ctx.lineTo(x,y);
-      }}
+      }}}}
       ctx.stroke();
 
       ctx.fillStyle = '#666';
       ctx.fillText('anchor history', x0, 18);
-    }}
+    }}}}
 
     // Status panel
-    try {{
-      statusEl.textContent = JSON.stringify({{
+    try {{{{
+      statusEl.textContent = JSON.stringify({{{{
         service: frame.service,
         build: frame.build,
         symbol: frame.symbol,
         connector: frame.connector,
         book: frame.book,
-        render: {{
+        render: {{{{
           levels: r.levels,
           step: r.step,
           anchor_px: r.anchor_px
-        }}
-      }}, null, 2);
-    }} catch(e) {{}}
-  }}
+        }}}}
+      }}}}, null, 2);
+    }}}} catch(e) {{{{}}}}
+  }}}}
 
   function connect() {{
     const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
@@ -1054,7 +1110,10 @@ def _ui_html() -> str:
       try {{
         const frame = JSON.parse(ev.data);
         setHealth(frame.health || 'YELLOW');
-        draw(frame);
+        pushHist(frame);
+        const sel = selectFrame();
+        if (sel) draw(sel);
+        setHistoryUI();
       }} catch(e) {{}}
     }};
 
@@ -1133,39 +1192,89 @@ def _ui_html() -> str:
     return Math.sqrt(dx*dx + dy*dy);
   }}
 
+  
+  // Touch support (iPad): one-finger vertical pan, pinch price zoom, two-finger drag time scrub/zoom (FIX20)
+  let touchMode = null; // 'pan' | 'pinch' | 'time'
+  let startPanY = 0;
+  let startPanTicks = 0;
+  let pinchStartDist = 0;
+  let pinchStartZoom = 1.0;
+  let twoStartMid = {{x:0,y:0}};
+  let twoStartOffset = 0;
+  let twoStartScale = 1.0;
+
+  function dist(a,b){{ const dx=a.clientX-b.clientX, dy=a.clientY-b.clientY; return Math.sqrt(dx*dx+dy*dy); }}
+  function mid(a,b){{ return {{x:(a.clientX+b.clientX)/2, y:(a.clientY+b.clientY)/2}}; }}
+
   cv.addEventListener('touchstart', (ev) => {{
-    ev.preventDefault();
-    if (ev.touches.length === 1) {{
+    if (!ev.touches || ev.touches.length === 0) return;
+    if (ev.touches.length === 1){{
       touchMode = 'pan';
-      lastY = ev.touches[0].clientY;
-    }} else if (ev.touches.length === 2) {{
-      touchMode = 'pinch';
+      startPanY = ev.touches[0].clientY;
+      startPanTicks = view.panTicks;
+    }} else if (ev.touches.length === 2){{
+      touchMode = 'time';
       pinchStartDist = dist(ev.touches[0], ev.touches[1]);
       pinchStartZoom = view.zoom;
+      twoStartMid = mid(ev.touches[0], ev.touches[1]);
+      twoStartOffset = view.tOffset;
+      twoStartScale = view.tScale;
     }}
-  }}, {{ passive: false }});
+  }}, {{passive:false}});
 
   cv.addEventListener('touchmove', (ev) => {{
-    if (view.baseStep === null) return;
-    if (touchMode === 'pan' && ev.touches.length === 1) {{
-      const y = ev.touches[0].clientY;
-      const dy = y - lastY;
-      lastY = y;
-      const approxRowH = 6;
-      view.panTicks = clamp(view.panTicks + (-dy / approxRowH), -2000.0, 2000.0);
+    if (!ev.touches) return;
+    if (ev.touches.length === 1 && touchMode === 'pan'){{
+      ev.preventDefault();
+      const dy = ev.touches[0].clientY - startPanY;
+      const ticksPerPx = 0.12;
+      view.panTicks = startPanTicks + Math.round(dy * ticksPerPx);
+      view.autoFollow = (view.tOffset <= 0.5);
       sendView();
-    }} else if (touchMode === 'pinch' && ev.touches.length === 2) {{
-      const d = dist(ev.touches[0], ev.touches[1]);
-      if (pinchStartDist > 1) {{
-        const ratio = pinchStartDist / d; // closer fingers => zoom in
-        view.zoom = clamp(pinchStartZoom * ratio, 0.25, 8.0);
-        view.step = view.baseStep * view.zoom;
-        sendView();
-      }}
+      setHistoryUI();
+      return;
     }}
-  }}, {{ passive: true }});
+    if (ev.touches.length === 2){{
+      ev.preventDefault();
+      const d = dist(ev.touches[0], ev.touches[1]);
+      const mm = mid(ev.touches[0], ev.touches[1]);
+      const dx = mm.x - twoStartMid.x;
+      const dy = mm.y - twoStartMid.y;
 
-  cv.addEventListener('touchend', () => {{ touchMode = null; }}, {{ passive: true }});
+      // Pinch (price zoom) dominates if distance changed enough
+      if (Math.abs(d - pinchStartDist) > 10){{
+        touchMode = 'pinch';
+        const factor = clamp(d / Math.max(1, pinchStartDist), 0.6, 1.8);
+        view.zoom = clamp(pinchStartZoom / factor, 0.25, 8.0);
+        if (view.baseStep !== null) view.step = view.baseStep * view.zoom;
+        sendView();
+        setHistoryUI();
+        return;
+      }}
+
+      // Two-finger drag: time scrub (horizontal) OR time zoom (vertical)
+      touchMode = 'time';
+      if (Math.abs(dx) >= Math.abs(dy)){{
+        const colsPerPx = 0.06 / Math.max(0.25, view.tScale);
+        view.tOffset = clamp(twoStartOffset - dx * colsPerPx, 0, Math.max(0, hist.length-1));
+      }} else {{
+        const scalePerPx = 0.01;
+        view.tScale = clamp(twoStartScale * Math.exp(-dy * scalePerPx), 0.25, 6.0);
+      }}
+
+      view.autoFollow = (view.tOffset <= 0.5);
+      const sel = selectFrame();
+      if (sel) draw(sel);
+      setHistoryUI();
+      return;
+    }}
+  }}, {{passive:false}});
+
+  cv.addEventListener('touchend', (ev) => {{
+    if (!ev.touches || ev.touches.length === 0){{
+      touchMode = null;
+    }}
+  }});
 
   connect();
 }})();
