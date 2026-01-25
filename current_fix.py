@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 # =========================================================
-# QuantDesk Bookmap Service — FIX17_P04_BOOKMAP_COORDINATE_PIVOT
+# QuantDesk Bookmap Service — FIX17_HEATMAP_DENSITY_LAYER
 #
-# STRICT BOOKMAP PARITY PIVOT:
-# - Absolute price axis (no price-centered/anchor-relative heatmap sliding)
-# - Time scrolls left→right (newest at right)
-# - Camera/viewport moves over a price-anchored heatmap world
-# - iPad gestures:
-#     * 1-finger drag: price pan (camera)
-#     * pinch: price zoom (span)
-#     * 2-finger horizontal drag: time scrub (history)
-#     * 2-finger vertical drag: time scale (seconds per column)
+# Builds on FIX14 (parity-safe incremental book):
+# - Maintains canonical CLOB via incremental merge (no side wipeouts)
+# - Adds Price Travel engine: moving anchored price window (mid/last trade)
+# - Corrects price-axis orientation: higher prices rendered at the TOP
+# - Adds minimal time-window overlay (anchor history) to make motion visible
 #
-# Backend remains parity-safe:
-# - Incremental depth merge (no side wipeouts)
-# - qty<=0 removes level
-# - best_bid<best_ask invariant
+# Still NOT included (intentional):
+# - Heatmap bands, zoom/pan UX, replay determinism, footprints
 #
 # Replit runtime contract:
 # - Single entrypoint: current_fix.py
 # - FastAPI on 0.0.0.0:5000
-# - Endpoints: /, /health.json, /telemetry.json, /book.json, /tape.json, /render.ws, /raw.json, /bootlog.txt
+# - Always stays up even if WS feed fails
+# - Endpoints:
+#     /              (UI: render-bridge demo)
+#     /health.json   (health summary)
+#     /telemetry.json(telemetry snapshot)
+#     /book.json     (canonical book summary)
+#     /tape.json     (recent trades)
+#     /render.json   (single render frame)
+#     /render.ws     (continuous render frames)
+#     /raw.json      (last raw WS message excerpt)
+#     /bootlog.txt   (boot log)
 # =========================================================
 
 import asyncio
@@ -28,17 +32,18 @@ import json
 import math
 import os
 import time
-from collections import deque
 from dataclasses import dataclass, field
+from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
+# NOTE: We rely on `websockets` for WS client.
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX17/P04"
+BUILD = "FIX17/P04_FIX2"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -46,979 +51,972 @@ PORT = int(os.environ.get("PORT", "5000"))
 SYMBOL = os.environ.get("QD_SYMBOL", "BTC_USDT")
 WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
 
-# Feed config
-DEPTH_N = int(os.environ.get("QD_DEPTH_N", "200"))  # per side
-TAPE_MAX = int(os.environ.get("QD_TAPE_MAX", "200"))
+# Render controls (minimal)
+RENDER_FPS = float(os.environ.get("QD_RENDER_FPS", "8"))
 
-# Render / stream config
-STREAM_FPS = float(os.environ.get("QD_STREAM_FPS", "12"))  # ws snapshots to UI
-RAW_EXCERPT_MAX = 1200
+# Heatmap (resting liquidity) layer — FIX17
+# We maintain decayed intensity per price level (separately for bid/ask sides)
+# so liquidity "bands" persist briefly, similar to Bookmap's heat shading.
+HEAT_HALFLIFE_S = float(os.environ.get("QD_HEAT_HALFLIFE_S", "12.0"))  # decay half-life
+HEAT_MAX_KEYS = int(os.environ.get("QD_HEAT_MAX_KEYS", "4000"))         # safety cap for dict size
+HEAT_ALPHA = float(os.environ.get("QD_HEAT_ALPHA", "0.55"))             # max opacity for heat overlay (0..1)
+RENDER_LEVELS = int(os.environ.get("QD_LEVELS", "140"))   # visible rows
+RENDER_STEP = float(os.environ.get("QD_STEP", "0.1"))      # price tick for ladder rows
+ANCHOR_ALPHA = float(os.environ.get("QD_ANCHOR_ALPHA", "0.25"))  # smoothing factor
+ANCHOR_HISTORY_SEC = float(os.environ.get("QD_ANCHOR_HISTORY_SEC", "90"))  # overlay window seconds
 
-# Health freshness
-STALE_S = float(os.environ.get("QD_STALE_S", "5.0"))
+# Book bounds (avoid unbounded growth)
+MAX_LEVELS_PER_SIDE = int(os.environ.get("QD_MAX_LEVELS_PER_SIDE", "1200"))
 
-# ----------------------------
-# Utilities
-# ----------------------------
+BOOTLOG_PATH = "/tmp/qd_bootlog.txt"
 
-BOOTLOG: Deque[str] = deque(maxlen=400)
 
-def bootlog(s: str) -> None:
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-    BOOTLOG.append(f"[{ts}Z] {s}")
-
-def now() -> float:
+def _now() -> float:
     return time.time()
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
 
-def _safe_float(x: Any) -> Optional[float]:
+def bootlog(msg: str) -> None:
     try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        line = f"[{ts}Z] {msg}"
+        with open(BOOTLOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Never crash because of logging
+        pass
+
+
+def _as_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
         return float(x)
     except Exception:
         return None
 
-def _safe_int(x: Any) -> Optional[int]:
+
+def _as_int(x: Any) -> Optional[int]:
     try:
+        if x is None:
+            return None
         return int(x)
     except Exception:
         return None
 
+
 # ----------------------------
-# Canonical state
+# Canonical Book + Tape
 # ----------------------------
+
+@dataclass
+class Book:
+    bids: Dict[float, float] = field(default_factory=dict)  # price -> qty
+    asks: Dict[float, float] = field(default_factory=dict)  # price -> qty
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    bid_qty_total: float = 0.0
+    ask_qty_total: float = 0.0
+    version: int = 0
+    last_update_ts: float = 0.0
+
+    def recompute(self) -> None:
+        self.best_bid = max(self.bids) if self.bids else None
+        self.best_ask = min(self.asks) if self.asks else None
+        self.bid_qty_total = float(sum(self.bids.values())) if self.bids else 0.0
+        self.ask_qty_total = float(sum(self.asks.values())) if self.asks else 0.0
+        # version is used as a monotonic local counter (not exchange seq)
+        self.version += 1
+        self.last_update_ts = _now()
+
 
 @dataclass
 class Trade:
     ts: float
-    price: float
+    px: float
     qty: float
-    side: str  # "buy" or "sell"
+    side: str  # "buy" | "sell" | "unknown"
+
 
 @dataclass
-class AppState:
-    status: str = "BOOTING"
-    started_ts: float = field(default_factory=now)
-
-    # Canonical book: price->qty (float). We store full levels we see; UI uses top N.
-    bids: Dict[float, float] = field(default_factory=dict)
-    asks: Dict[float, float] = field(default_factory=dict)
-
-    best_bid: float = 0.0
-    best_ask: float = 0.0
-    last_update_ts: float = 0.0
-
-    # Tape
-    tape: Deque[Trade] = field(default_factory=lambda: deque(maxlen=TAPE_MAX))
-
-    # Telemetry
-    ws_msgs: int = 0
-    ws_reconnects: int = 0
+class State:
+    status: str = "INIT"  # INIT | CONNECTING | CONNECTED | ERROR
+    last_error: Optional[str] = None
+    reconnects: int = 0
     frames: int = 0
-    errors: int = 0
+    last_event_ts: Optional[float] = None
 
-    # Last raw excerpt for debugging
-    last_raw: str = ""
+    # Canonical state
+    book: Book = field(default_factory=Book)
+    trades: Deque[Trade] = field(default_factory=lambda: deque(maxlen=500))
 
-STATE = AppState()
+    # Render anchor + history (time window)
+    anchor_px: Optional[float] = None
+    anchor_hist: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=5000))
 
-# ----------------------------
-# Book merge (parity-safe)
-# ----------------------------
+    # Heatmap (FIX17): decayed resting liquidity intensity per price
+    heat_bid: Dict[float, float] = field(default_factory=dict)
+    heat_ask: Dict[float, float] = field(default_factory=dict)
+    heat_last_ts: Optional[float] = None
 
-def _apply_side(side: Dict[float, float], updates: List[List[Any]]) -> None:
+    # Debug
+    last_raw: Optional[Dict[str, Any]] = None
+
+    # Counters
+    depth_msgs: int = 0
+    trade_msgs: int = 0
+    depth_updates_applied: int = 0
+    snapshots_seen: int = 0
+
+
+STATE = State()
+
+
+def _mid_px() -> Optional[float]:
+    bb = STATE.book.best_bid
+    ba = STATE.book.best_ask
+    if bb is not None and ba is not None:
+        return (bb + ba) / 2.0
+    # fallback to last trade
+    if STATE.trades:
+        return STATE.trades[-1].px
+    return bb or ba
+
+
+def _update_anchor() -> Optional[float]:
+    """Price-travel anchor: smoothed mid (or last trade)."""
+    target = _mid_px()
+    if target is None:
+        return STATE.anchor_px
+    if STATE.anchor_px is None:
+        STATE.anchor_px = float(target)
+    else:
+        # Exponential smoothing to reduce jitter while still allowing travel
+        a = max(0.02, min(0.95, ANCHOR_ALPHA))
+        STATE.anchor_px = (1.0 - a) * STATE.anchor_px + a * float(target)
+
+    # Maintain history (time window)
+    ts = _now()
+    STATE.anchor_hist.append((ts, float(STATE.anchor_px)))
+    # Trim old points (by time)
+    cutoff = ts - max(10.0, ANCHOR_HISTORY_SEC)
+    while STATE.anchor_hist and STATE.anchor_hist[0][0] < cutoff:
+        STATE.anchor_hist.popleft()
+    return STATE.anchor_px
+
+
+def _apply_side_updates(side: Dict[float, float], raw_levels: Any) -> int:
+    """Apply incremental updates to a side dict.
+
+    For each level:
+      - qty <= 0 => delete level
+      - qty > 0  => set level
+    Returns number of levels touched.
     """
-    MEXC contract depth format observed in prior FIX:
-      depth updates contain lists of [price, qty]
-    Rules:
-      qty <= 0 -> delete
-      qty > 0  -> set
-    """
-    for lvl in updates:
-        if not isinstance(lvl, list) or len(lvl) < 2:
+    if raw_levels is None:
+        return 0
+    touched = 0
+
+    # normalize to iterable
+    if isinstance(raw_levels, dict):
+        # sometimes exchanges send {price: qty, ...}
+        items = list(raw_levels.items())
+    else:
+        items = raw_levels
+
+    if not isinstance(items, (list, tuple)):
+        return 0
+
+    for lvl in items:
+        px = None
+        qty = None
+        if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+            px = _as_float(lvl[0])
+            qty = _as_float(lvl[1])
+        elif isinstance(lvl, dict):
+            px = _as_float(lvl.get("price") or lvl.get("p"))
+            qty = _as_float(lvl.get("quantity") or lvl.get("q"))
+        if px is None or qty is None:
             continue
-        p = _safe_float(lvl[0]); q = _safe_float(lvl[1])
-        if p is None or q is None:
-            continue
-        if q <= 0:
-            side.pop(p, None)
+        touched += 1
+        if qty <= 0:
+            side.pop(px, None)
         else:
-            side[p] = q
+            side[px] = qty
+    return touched
 
-def _recompute_best() -> None:
-    if STATE.bids:
-        STATE.best_bid = max(STATE.bids.keys())
-    else:
-        STATE.best_bid = 0.0
-    if STATE.asks:
-        STATE.best_ask = min(STATE.asks.keys())
-    else:
-        STATE.best_ask = 0.0
 
-def _book_ok() -> bool:
-    if STATE.best_bid <= 0 or STATE.best_ask <= 0:
+def _trim_book() -> None:
+    """Bound book size to avoid unbounded growth if we only merge updates."""
+    n = max(200, MAX_LEVELS_PER_SIDE)
+    if len(STATE.book.bids) > n:
+        # keep top-n highest bids
+        keep = dict(sorted(STATE.book.bids.items(), key=lambda kv: kv[0], reverse=True)[:n])
+        STATE.book.bids = keep
+    if len(STATE.book.asks) > n:
+        # keep top-n lowest asks
+        keep = dict(sorted(STATE.book.asks.items(), key=lambda kv: kv[0])[:n])
+        STATE.book.asks = keep
+
+
+# ----------------------------
+# MEXC WS parsing
+# ----------------------------
+
+def _handle_depth(obj: Dict[str, Any], ts: float) -> bool:
+    """Parity-safe incremental depth merge.
+
+    FIX14 failure cause was side wipeout when messages were partial.
+    FIX15 keeps the FIX14 rules:
+      - If a message omits bids or asks, that side is NOT cleared.
+      - qty <= 0 deletes
+      - qty > 0 sets
+    """
+    try:
+        data = obj.get("data", obj)
+        bids_raw = data.get("bids") if isinstance(data, dict) else None
+        asks_raw = data.get("asks") if isinstance(data, dict) else None
+
+        touched = 0
+        if bids_raw is not None:
+            touched += _apply_side_updates(STATE.book.bids, bids_raw)
+        if asks_raw is not None:
+            touched += _apply_side_updates(STATE.book.asks, asks_raw)
+
+        if touched <= 0:
+            return False
+
+        STATE.depth_updates_applied += touched
+        STATE.depth_msgs += 1
+        _trim_book()
+        STATE.book.recompute()
+        STATE.last_event_ts = ts
+        return True
+    except Exception as e:
+        STATE.last_error = f"depth_parse_error: {e}"
         return False
-    return STATE.best_bid < STATE.best_ask
 
-def _book_snapshot(top_n: int) -> Dict[str, Any]:
-    bids = sorted(STATE.bids.items(), key=lambda x: x[0], reverse=True)[:top_n]
-    asks = sorted(STATE.asks.items(), key=lambda x: x[0])[:top_n]
-    bid_qty = sum(q for _, q in bids)
-    ask_qty = sum(q for _, q in asks)
-    return {
-        "service": SERVICE,
-        "build": BUILD,
-        "symbol": SYMBOL,
-        "best_bid": STATE.best_bid,
-        "best_ask": STATE.best_ask,
-        "depth_counts": {"bids": len(bids), "asks": len(asks)},
-        "totals": {"bid_qty": bid_qty, "ask_qty": ask_qty},
-        "last_update_ts": STATE.last_update_ts,
-        "bids": [[p, q] for p, q in bids],
-        "asks": [[p, q] for p, q in asks],
-    }
 
-def _tape_snapshot() -> Dict[str, Any]:
-    return {
-        "service": SERVICE,
-        "build": BUILD,
-        "symbol": SYMBOL,
-        "tape": [{"ts": t.ts, "price": t.price, "qty": t.qty, "side": t.side} for t in list(STATE.tape)],
-    }
+def _extract_trade_side(d: Dict[str, Any]) -> str:
+    # Known variants:
+    # - "S": 1 buy, 2 sell (common)
+    # - "side": "buy"/"sell"
+    # - "T"/"m" maker-taker flags; we avoid guessing if unclear
+    s = d.get("S") if isinstance(d, dict) else None
+    if s in (1, "1", "buy", "BUY"):
+        return "buy"
+    if s in (2, "2", "sell", "SELL"):
+        return "sell"
+    side = d.get("side") if isinstance(d, dict) else None
+    if isinstance(side, str):
+        side_l = side.lower()
+        if "buy" in side_l:
+            return "buy"
+        if "sell" in side_l:
+            return "sell"
+    return "unknown"
 
-def _estimate_tick_from_book() -> float:
-    """
-    Best-effort tick estimate from top-of-book levels (robust enough for UI binning).
-    We compute the minimum positive price difference among top levels.
-    """
-    pxs: List[float] = []
-    for p, _ in sorted(STATE.bids.items(), key=lambda x: x[0], reverse=True)[:30]:
-        pxs.append(p)
-    for p, _ in sorted(STATE.asks.items(), key=lambda x: x[0])[:30]:
-        pxs.append(p)
-    pxs = sorted(set(pxs))
-    mind = None
-    for i in range(1, len(pxs)):
-        d = pxs[i] - pxs[i-1]
-        if d > 0:
-            if mind is None or d < mind:
-                mind = d
-    if mind is None or mind <= 0:
-        return 0.1
-    # normalize to a "nice" tick (avoid floating noise)
-    # keep 1, 0.5, 0.1, 0.05, 0.01, 0.001 etc.
-    # Here we round to 1e-6.
-    return max(1e-6, round(mind, 6))
+
+def _handle_trades(obj: Dict[str, Any], ts: float) -> int:
+    """Parse trade push messages; store in tape."""
+    try:
+        data = obj.get("data")
+        if data is None:
+            return 0
+
+        events: List[Dict[str, Any]] = []
+        if isinstance(data, dict):
+            events = [data]
+        elif isinstance(data, list):
+            events = [x for x in data if isinstance(x, dict)]
+        else:
+            return 0
+
+        added = 0
+        for d in events:
+            px = _as_float(d.get("p") or d.get("price"))
+            qty = _as_float(d.get("v") or d.get("qty") or d.get("volume"))
+            if px is None or qty is None:
+                continue
+            side = _extract_trade_side(d)
+            STATE.trades.append(Trade(ts=ts, px=float(px), qty=float(qty), side=side))
+            added += 1
+
+        if added:
+            STATE.trade_msgs += 1
+            STATE.last_event_ts = ts
+        return added
+    except Exception as e:
+        STATE.last_error = f"trade_parse_error: {e}"
+        return 0
+
+
+def _route_message(obj: Dict[str, Any]) -> None:
+    # Persist last raw for debugging (small excerpt)
+    try:
+        STATE.last_raw = {"ts": _now(), "obj": obj}
+    except Exception:
+        STATE.last_raw = None
+
+    ts = _now()
+    method = obj.get("channel") or obj.get("c") or obj.get("method") or obj.get("event")
+
+    # MEXC contract WS often uses:
+    # - "push.depth" or "depth" style channels
+    # - "push.deal"  for trades
+    if isinstance(method, str):
+        m = method.lower()
+    else:
+        m = ""
+
+    if "depth" in m:
+        _handle_depth(obj, ts)
+        return
+    if "deal" in m or "trade" in m:
+        _handle_trades(obj, ts)
+        return
+
+    # Some messages may carry data without channel hints; attempt depth heuristic
+    data = obj.get("data")
+    if isinstance(data, dict) and ("bids" in data or "asks" in data):
+        _handle_depth(obj, ts)
+        return
+
 
 # ----------------------------
-# WS connector
+# Connector loop (resilient)
 # ----------------------------
 
-async def _ws_loop() -> None:
+async def _connector_loop() -> None:
+    """Maintain a resilient WS connection to MEXC contract market stream.
+
+    IMPORTANT: MEXC requires an *application-level* ping (method: ping) at least once per minute,
+    otherwise the server closes the connection (often with close code 1005 / no status).
+    """
     backoff = 1.0
     while True:
+        ping_task = None
         try:
             STATE.status = "CONNECTING"
-            bootlog(f"CONNECTING {WS_URL} symbol=__SYMBOL__")
-            async with websockets.connect(WS_URL, ping_interval=15, ping_timeout=15, close_timeout=5) as ws:
-                # Subscribe to depth + trades (known working format from prior FIXes)
-                sub_depth = {"method": "sub.depth", "param": {"symbol": SYMBOL, "depth": DEPTH_N}}
-                sub_trade = {"method": "sub.deal", "param": {"symbol": SYMBOL}}
-                await ws.send(json.dumps(sub_depth))
-                await ws.send(json.dumps(sub_trade))
+            STATE.last_error = None
+            bootlog(f"CONNECTING ws={WS_URL} symbol={SYMBOL}")
+
+            async with websockets.connect(
+                WS_URL,
+                ping_interval=None,   # we do app-level ping; avoid double-ping behavior
+                ping_timeout=None,
+                close_timeout=5,
+                max_queue=2048,
+            ) as ws:
+
+                async def _app_ping_loop() -> None:
+                    # Ping more frequently than the 60s requirement to be safe.
+                    while True:
+                        try:
+                            await ws.send(json.dumps({"method": "ping"}))
+                        except Exception:
+                            return
+                        await asyncio.sleep(15)
+
+                ping_task = asyncio.create_task(_app_ping_loop())
+
+                # Subscribe to depth + trades (docs: sub.depth / sub.deal with param.symbol)
+                await ws.send(json.dumps({"method": "sub.depth", "param": {"symbol": SYMBOL}}))
+                await ws.send(json.dumps({"method": "sub.deal", "param": {"symbol": SYMBOL}}))
 
                 STATE.status = "CONNECTED"
                 backoff = 1.0
                 bootlog("CONNECTED")
 
                 async for msg in ws:
-                    STATE.ws_msgs += 1
-                    if isinstance(msg, str):
-                        STATE.last_raw = msg[-RAW_EXCERPT_MAX:]
-                        try:
-                            obj = json.loads(msg)
-                        except Exception:
-                            continue
-                    else:
+                    try:
+                        obj = json.loads(msg)
+                    except Exception:
                         continue
 
-                    # Depth updates
-                    try:
-                        # Typical shape:
-                        # {"channel":"push.depth","data":{"bids":[[p,q],...],"asks":[[p,q],...]...}}
-                        if isinstance(obj, dict) and obj.get("channel") == "push.depth":
-                            data = obj.get("data") or {}
-                            bids = data.get("bids") or []
-                            asks = data.get("asks") or []
-                            if isinstance(bids, list):
-                                _apply_side(STATE.bids, bids)
-                            if isinstance(asks, list):
-                                _apply_side(STATE.asks, asks)
-                            _recompute_best()
-                            STATE.last_update_ts = now()
-                            continue
-                    except Exception:
-                        STATE.errors += 1
+                    # Some servers respond to ping with a pong payload; ignore safely.
+                    ch = obj.get("channel") if isinstance(obj, dict) else None
+                    if ch in ("pong", "rs.pong") or obj.get("method") == "pong":
+                        continue
 
-                    # Trades
-                    try:
-                        if isinstance(obj, dict) and obj.get("channel") == "push.deal":
-                            data = obj.get("data") or []
-                            # observed: list of trades; each trade dict {p,q,T, ...}
-                            if isinstance(data, list):
-                                for td in data[-10:]:
-                                    if not isinstance(td, dict):
-                                        continue
-                                    p = _safe_float(td.get("p") or td.get("price"))
-                                    q = _safe_float(td.get("q") or td.get("vol") or td.get("qty"))
-                                    side = td.get("S") or td.get("side") or ""
-                                    if p is None or q is None:
-                                        continue
-                                    s = "buy" if str(side).lower() in ("1", "buy", "b") else "sell"
-                                    STATE.tape.append(Trade(ts=now(), price=p, qty=q, side=s))
-                            continue
-                    except Exception:
-                        STATE.errors += 1
+                    _route_message(obj)
 
         except Exception as e:
+            STATE.status = "ERROR"
+            STATE.last_error = f"{type(e).__name__}: {e}"
             STATE.ws_reconnects += 1
-            STATE.status = "RECONNECTING"
-            bootlog(f"WS_ERROR: {type(e).__name__}: {e}")
-            await asyncio.sleep(backoff)
-            backoff = min(30.0, backoff * 1.7)
+            bootlog(f"WS ERROR: {STATE.last_error}")
+        finally:
+            if ping_task is not None:
+                try:
+                    ping_task.cancel()
+                except Exception:
+                    pass
+
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 1.5, 30.0)
+
+
 
 # ----------------------------
-# FastAPI
+# FastAPI app
 # ----------------------------
 
-app = FastAPI()
+app = FastAPI(title="QuantDesk Bookmap", version=BUILD)
+
 
 @app.on_event("startup")
 async def _startup() -> None:
-    bootlog(f"BOOT {SERVICE} __BUILD__ PORT={PORT}")
-    asyncio.create_task(_ws_loop())
-    STATE.status = "WARMING"
+    bootlog(f"Starting {SERVICE} {BUILD} on {HOST}:{PORT}")
+    asyncio.create_task(_connector_loop())
+
 
 @app.get("/bootlog.txt")
-async def _bootlog_txt() -> PlainTextResponse:
-    return PlainTextResponse("\n".join(list(BOOTLOG)))
+async def bootlog_txt() -> PlainTextResponse:
+    try:
+        with open(BOOTLOG_PATH, "r", encoding="utf-8") as f:
+            return PlainTextResponse(f.read())
+    except Exception:
+        return PlainTextResponse("bootlog unavailable", status_code=404)
 
-@app.get("/raw.json")
-async def _raw_json() -> JSONResponse:
-    return JSONResponse({"service": SERVICE, "build": BUILD, "symbol": SYMBOL, "last_raw": STATE.last_raw})
-
-@app.get("/book.json")
-async def book_json() -> JSONResponse:
-    return JSONResponse(_book_snapshot(DEPTH_N))
-
-@app.get("/tape.json")
-async def tape_json() -> JSONResponse:
-    return JSONResponse(_tape_snapshot())
-
-@app.get("/telemetry.json")
-async def telemetry_json() -> JSONResponse:
-    tick = _estimate_tick_from_book()
-    return JSONResponse({
-        "service": SERVICE,
-        "build": BUILD,
-        "symbol": SYMBOL,
-        "status": STATE.status,
-        "ws_msgs": STATE.ws_msgs,
-        "ws_reconnects": STATE.ws_reconnects,
-        "frames": STATE.frames,
-        "errors": STATE.errors,
-        "best_bid": STATE.best_bid,
-        "best_ask": STATE.best_ask,
-        "tick_est": tick,
-        "last_update_ts": STATE.last_update_ts,
-        "uptime_s": now() - STATE.started_ts,
-    })
 
 @app.get("/health.json")
 async def health_json() -> JSONResponse:
-    fresh = (now() - STATE.last_update_ts) <= STALE_S
-    ok = _book_ok()
-    if STATE.status in ("CONNECTED", "WARMING") and fresh and ok:
-        health = "GREEN"
-    elif STATE.status in ("CONNECTED", "WARMING"):
-        health = "YELLOW"
-    else:
-        health = "RED"
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
+    return JSONResponse({"service": SERVICE, "build": BUILD, "health": frame["health"], "connector": frame["connector"], "book": frame["book"]})
+
+
+@app.get("/telemetry.json")
+async def telemetry_json() -> JSONResponse:
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
+    return JSONResponse(frame)
+
+
+@app.get("/book.json")
+async def book_json() -> JSONResponse:
+    b = STATE.book
     return JSONResponse({
-        "service": SERVICE,
+        "ts": _now(),
         "build": BUILD,
         "symbol": SYMBOL,
-        "health": health,
-        "status": STATE.status,
-        "fresh": fresh,
-        "book_ok": ok,
-        "best_bid": STATE.best_bid,
-        "best_ask": STATE.best_ask,
-        "last_update_ts": STATE.last_update_ts,
+        "best_bid": b.best_bid,
+        "best_ask": b.best_ask,
+        "depth_counts": {"bids": len(b.bids), "asks": len(b.asks)},
+        "totals": {"bid_qty": b.bid_qty_total, "ask_qty": b.ask_qty_total},
+        "version": b.version,
+        "last_update_ts": b.last_update_ts,
     })
 
-# ----------------------------
-# Render WS: send book snapshots for client-side Bookmap renderer
-# ----------------------------
 
-async def _ws_recv_loop(ws: WebSocket, view: Dict[str, Any]) -> None:
-    """
-    Receives client control messages. Server does not render, but we keep
-    last view for telemetry/debug and future extensions.
-    """
-    while True:
-        try:
-            msg = await ws.receive_text()
-        except Exception:
-            return
-        try:
-            obj = json.loads(msg)
-        except Exception:
-            continue
-        if isinstance(obj, dict) and obj.get("cmd") == "set_view":
-            # store a minimal sanitized view snapshot
-            view["ts"] = now()
-            for k in ("center_idx","price_span_bins","time_offset_cols","time_scale_s","auto_follow"):
-                if k in obj:
-                    view[k] = obj[k]
+@app.get("/tape.json")
+async def tape_json() -> JSONResponse:
+    return JSONResponse({
+        "ts": _now(),
+        "build": BUILD,
+        "symbol": SYMBOL,
+        "trades_seen": len(STATE.trades),
+        "items": [{"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side} for t in list(STATE.trades)[-120:]],
+    })
+
+
+@app.get("/raw.json")
+async def raw_json() -> JSONResponse:
+    return JSONResponse({"ts": _now(), "build": BUILD, "last_raw": STATE.last_raw})
+
+
+@app.get("/render.json")
+async def render_json() -> JSONResponse:
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
+    return JSONResponse(frame["render"])
+
 
 @app.websocket("/render.ws")
 async def render_ws(ws: WebSocket) -> None:
+    """
+    Bidirectional render bridge:
+      - Server -> client: continuous render frames (JSON)
+      - Client -> server: {"cmd":"set_view","levels":..,"step":..,"pan_ticks":..}
+    FIX16_P03:
+      - Reliable receive loop (timeout=0.0 caused control messages to be missed)
+    """
     await ws.accept()
-    view: Dict[str, Any] = {}
-    recv_task = asyncio.create_task(_ws_recv_loop(ws, view))
-    interval = 1.0 / max(1.0, float(STREAM_FPS))
-    try:
+
+    # Per-connection interactive view state (mutable)
+    view_state = {
+        "levels": int(RENDER_LEVELS),
+        "step": float(RENDER_STEP),
+        "pan_ticks": 0.0,
+    }
+
+    def _apply_view(payload: dict) -> None:
+        try:
+            if "levels" in payload:
+                lv = int(payload["levels"])
+                if 40 <= lv <= 800:
+                    view_state["levels"] = lv
+            if "step" in payload:
+                st = float(payload["step"])
+                # Clamp to avoid degenerate windows
+                if st > 0:
+                    view_state["step"] = max(1e-6, min(st, 1e6))
+            if "pan_ticks" in payload:
+                pt = float(payload["pan_ticks"])
+                view_state["pan_ticks"] = max(-2000.0, min(pt, 2000.0))
+        except Exception:
+            # ignore malformed values
+            return
+
+    async def _recv_loop() -> None:
         while True:
-            tick = _estimate_tick_from_book()
-            snap = _book_snapshot(DEPTH_N)
-            # enrich for UI
-            snap["ts"] = now()
-            snap["tick"] = tick
-            # last trade
-            if STATE.tape:
-                lt = STATE.tape[-1]
-                snap["last_trade"] = {"ts": lt.ts, "price": lt.price, "qty": lt.qty, "side": lt.side}
-            else:
-                snap["last_trade"] = None
-            # include client view echo (debug)
-            snap["client_view"] = view
-            await ws.send_text(json.dumps(snap))
+            try:
+                msg = await ws.receive_text()
+            except Exception:
+                return
+            try:
+                payload = json.loads(msg)
+                if isinstance(payload, dict) and payload.get("cmd") == "set_view":
+                    _apply_view(payload)
+            except Exception:
+                # ignore malformed control messages
+                pass
+
+    recv_task = asyncio.create_task(_recv_loop())
+    try:
+        interval = 1.0 / max(1.0, float(RENDER_FPS))
+        while True:
+            frame = _render_frame(
+                int(view_state["levels"]),
+                float(view_state["step"]),
+                pan_ticks=float(view_state["pan_ticks"]),
+            )
             STATE.frames += 1
+            await ws.send_text(json.dumps(frame))
             await asyncio.sleep(interval)
     except Exception:
-        pass
+        return
     finally:
         try:
             recv_task.cancel()
         except Exception:
             pass
 
-# ----------------------------
-# UI: strict Bookmap coordinate renderer (client-side)
-# ----------------------------
 
 def _ui_html() -> str:
-    html = """<!doctype html>
+    # Minimal bridge demo:
+    # - Canvas ladder view
+    # - Price axis corrected: higher prices at top
+    # - Time-window overlay: anchor history line
+    return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
-  <title>QuantDesk Bookmap — __BUILD__</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QuantDesk Bookmap</title>
   <style>
-    body {{
-      margin:0; padding:0;
-      font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-      background:#0b0f14; color:#e6eef6;
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }}
+    .top {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
+    .pill {{ padding:6px 10px; border-radius:999px; border:1px solid #ddd; font-weight:600; }}
+    .pill.green {{ border-color:#2e7d32; color:#2e7d32; }}
+    .pill.yellow {{ border-color:#f9a825; color:#8a6d00; }}
+    .pill.red {{ border-color:#c62828; color:#c62828; }}
+    .muted {{ color:#666; }}
+    .grid {{ display:grid; grid-template-columns: 1fr; gap:14px; margin-top:16px; max-width: 1100px; }}
+    @media (min-width: 980px) {{
+      .grid {{ grid-template-columns: 1.2fr 0.8fr; }}
     }}
-    .wrap {{ padding: 14px; max-width: 1100px; margin: 0 auto; }}
-    .row {{ display:flex; gap:12px; flex-wrap: wrap; align-items: stretch; }}
-    .card {{
-      background:#101723;
-      border:1px solid rgba(255,255,255,0.08);
-      border-radius:14px;
-      padding:12px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-    }}
-    .muted {{ color:#9bb0c7; }}
-    .small {{ font-size: 12px; line-height: 1.4; }}
-    .pill {{
-      display:inline-block; padding: 2px 8px; border-radius:999px;
-      border:1px solid rgba(255,255,255,0.18); font-size:12px;
-    }}
-    canvas {{
-      width: 100%;
-      height: auto;
-      background:#070a10;
-      border-radius:12px;
-      border:1px solid rgba(255,255,255,0.10);
-      touch-action: none; /* critical: allow our touch gestures */
-      user-select: none;
-      -webkit-user-select: none;
-    }}
-    .grid {{
-      display:grid; grid-template-columns: 1fr; gap:10px;
-    }}
-    .legend {{
-      display:flex; gap:10px; flex-wrap: wrap; align-items:center;
-    }}
-    .legend > span {{ opacity:0.9; }}
-    .k {{
-      display:flex; gap:10px; flex-wrap:wrap; align-items: center;
-    }}
-    .k b {{ color:#fff; }}
-    a {{ color:#9ad1ff; text-decoration:none; }}
+    .card {{ border:1px solid #eee; border-radius:12px; padding:12px; box-shadow: 0 1px 8px rgba(0,0,0,0.04); }}
+    canvas {{ width:100%; height:520px; border:1px solid #eee; border-radius:12px; background:#fff; touch-action:none; user-select:none; -webkit-user-select:none; }}
+    .small {{ font-size: 12px; }}
+    a {{ color: inherit; }}
+    .endpoints a {{ display:inline-block; margin-right:12px; }}
+    pre {{ white-space: pre-wrap; word-break: break-word; }}
   </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="row">
-    <div class="card" style="flex: 1 1 680px;">
-      <div class="k">
-        <b>QuantDesk Bookmap</b>
-        <span class="pill">__BUILD__</span>
-        <span class="pill" id="pillHealth">HEALTH</span>
-        <span class="pill" id="pillMode">LIVE</span>
-        <span class="pill" id="pillScale">t=1.0s/col</span>
-      </div>
-      <div class="muted small" style="margin-top:6px;">
-        STRICT Bookmap parity: absolute price axis, time scrolls left→right, liquidity bands pinned to price.
-        <br/>Gestures: 1-finger drag = price pan. Pinch = price zoom. 2-finger horiz drag = time scrub. 2-finger vert drag = time scale.
-      </div>
+  <h1>QuantDesk Bookmap</h1>
+  <div class="top">
+    <div id="health" class="pill yellow">HEALTH: YELLOW</div>
+    <div><b>Build:</b> {BUILD}</div>
+    <div><b>Symbol:</b> {SYMBOL}</div>
+    <div class="muted small">WS: {WS_URL}</div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="muted">This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a moving anchored ladder (price travel) with interactive pan/zoom (FIX16) + heatmap density (FIX17). It is not a full Bookmap renderer yet.</div>
       <div style="height:10px"></div>
-      <canvas id="cv" width="1024" height="560"></canvas>
-      <div class="muted small" style="margin-top:8px;">
-        If you scrub left (history), mode switches to HISTORY. Return to LIVE by scrubbing fully right.
-      </div>
+      <canvas id="cv" width="980" height="520"></canvas>
+      <div class="muted small" style="margin-top:8px;">Ladder: green = bids, red = asks. Axis: higher prices at top. Mid line shows anchor. Wheel/pinch = zoom, drag = pan.</div>
     </div>
-    <div class="card" style="flex: 0 1 360px;">
-      <div><b>Status</b></div>
-      <div class="small muted" id="status" style="margin-top:6px;">Connecting…</div>
-      <div style="height:10px"></div>
-      <div class="legend small">
-        <span>Heat colors: blue→cyan→yellow→red/white (higher intensity)</span>
+
+    <div class="card">
+      <div><b>Endpoints</b></div>
+      <div class="endpoints small" style="margin-top:6px;">
+        <a href="/health.json">/health.json</a>
+        <a href="/telemetry.json">/telemetry.json</a>
+        <a href="/book.json">/book.json</a>
+        <a href="/tape.json">/tape.json</a>
+        <a href="/render.json">/render.json</a>
+        <a href="/raw.json">/raw.json</a>
+        <a href="/bootlog.txt">/bootlog.txt</a>
       </div>
       <div style="height:10px"></div>
-      <div class="small muted">
-        Endpoints: <a href="/health.json">/health.json</a> · <a href="/telemetry.json">/telemetry.json</a> · <a href="/book.json">/book.json</a>
-      </div>
+      <div class="muted small"><b>Status</b> (auto-refresh)</div>
+      <pre id="status" class="small"></pre>
     </div>
   </div>
-</div>
 
 <script>
 (() => {{
   const cv = document.getElementById('cv');
-  const ctx = cv.getContext('2d', {{ alpha: false }});
+  const ctx = cv.getContext('2d');
+  const healthEl = document.getElementById('health');
   const statusEl = document.getElementById('status');
-  const pillHealth = document.getElementById('pillHealth');
-  const pillMode = document.getElementById('pillMode');
-  const pillScale = document.getElementById('pillScale');
 
-  // --- Colormap LUT (256) : blue -> cyan -> yellow -> red -> white ---
-  function makeLUT() {{
-    const lut = new Uint8ClampedArray(256*3);
-    function lerp(a,b,t) {{ return a + (b-a)*t; }}
-    // stops in RGB
-    const stops = [
-      [0,   10, 25, 55],   // deep blue
-      [80,  20, 200, 255], // cyan
-      [160, 245, 230, 80], // yellow-ish
-      [220, 255, 80, 40],  // red-ish
-      [255, 255, 255, 255] // white
-    ];
-    for (let i=0;i<256;i++) {{
-      let s0 = stops[0], s1 = stops[stops.length-1];
-      for (let k=1;k<stops.length;k++) {{
-        if (i <= stops[k][0]) {{ s0 = stops[k-1]; s1 = stops[k]; break; }}
-      }}
-      const t = (i - s0[0]) / Math.max(1, (s1[0]-s0[0]));
-      const r = Math.round(lerp(s0[1], s1[1], t));
-      const g = Math.round(lerp(s0[2], s1[2], t));
-      const b = Math.round(lerp(s0[3], s1[3], t));
-      lut[i*3+0]=r; lut[i*3+1]=g; lut[i*3+2]=b;
-    }}
-    return lut;
-  }}
-  const LUT = makeLUT();
+  // Interactive view state (FIX16):
+  // - wheel / pinch zoom changes step
+  // - drag pans ladder in price ticks
+  let view = {{ levels: null, baseStep: null, step: null, zoom: 1.0, panTicks: 0.0 }};
+  let wsRef = null;
 
-  // --- World (absolute price space) ---
-  let tick = 0.1;
-  let minIdxSeen = null; // inclusive
-  let maxIdxSeen = null; // inclusive
-
-  // --- Time ring buffer ---
-  const COLS = cv.width; // 1 column per pixel for simplicity
-  const colMaps = new Array(COLS); // sparse: Map<priceIdx, uint8 intensity>
-  const midIdxCols = new Int32Array(COLS); // price path per column (absolute idx)
-  for (let i=0;i<COLS;i++) {{ colMaps[i] = new Map(); midIdxCols[i]=0; }}
-  let headCol = 0; // newest column index in ring buffer
-  let lastColTs = 0;
-
-  // --- Viewport camera ---
-  let centerIdx = null;        // absolute price idx at center of screen
-  let priceSpanBins = 900;     // number of price bins visible (zoom)
-  let autoFollow = true;
-
-  // Time view
-  let timeOffsetCols = 0;      // 0 = LIVE (newest at right); >0 view history
-  let timeScaleS = 1.0;        // seconds per column (time zoom)
-  const timeScaleMin = 0.12;
-  const timeScaleMax = 8.0;
-
-  // Gesture state
-  let pointers = new Map(); // pointerId -> {x,y,type}
-  let lastOneFinger = null; // {x,y,centerIdx0}
-  let lastTwoFinger = null; // {cx,cy,dx,dy, timeOffset0, timeScale0}
-  let lastPinch = null;     // {dist, span0}
-  let lastSnapshot = null;
-  let ws = null;
-
-  function setHealthPill(health) {{
-    pillHealth.textContent = 'HEALTH ' + (health || '?');
-    let bg = 'rgba(255,255,255,0.10)';
-    if (health === 'GREEN') bg = 'rgba(40,200,120,0.25)';
-    if (health === 'YELLOW') bg = 'rgba(240,200,60,0.25)';
-    if (health === 'RED') bg = 'rgba(240,80,60,0.25)';
-    pillHealth.style.background = bg;
-  }}
-
-  function setModePill() {{
-    if (timeOffsetCols === 0) {{
-      pillMode.textContent = 'LIVE';
-      pillMode.style.background = 'rgba(40,200,120,0.20)';
-    }} else {{
-      pillMode.textContent = 'HISTORY';
-      pillMode.style.background = 'rgba(240,200,60,0.18)';
-    }}
-  }}
-
-  function setScalePill() {{
-    pillScale.textContent = 't=' + timeScaleS.toFixed(2) + 's/col';
-    pillScale.style.background = 'rgba(255,255,255,0.10)';
-  }}
-
-  function priceToIdx(p) {{
-    return Math.round(p / tick);
-  }}
-  function idxToPrice(idx) {{
-    return idx * tick;
-  }}
-
-  function updateWorldRangeFromBook(bids, asks) {{
-    // Expand min/max indices based on received levels
-    if (!bids || !asks) return;
-    for (const [p,q] of bids) {{
-      const idx = priceToIdx(p);
-      if (minIdxSeen === null || idx < minIdxSeen) minIdxSeen = idx;
-      if (maxIdxSeen === null || idx > maxIdxSeen) maxIdxSeen = idx;
-    }}
-    for (const [p,q] of asks) {{
-      const idx = priceToIdx(p);
-      if (minIdxSeen === null || idx < minIdxSeen) minIdxSeen = idx;
-      if (maxIdxSeen === null || idx > maxIdxSeen) maxIdxSeen = idx;
-    }}
-  }}
-
-  function maybeAutoFollow(midIdx) {{
-    if (!autoFollow) return;
-    if (timeOffsetCols !== 0) return;
-    if (centerIdx === null) {{ centerIdx = midIdx; return; }}
-    const half = Math.floor(priceSpanBins/2);
-    // If price drifts near edges, move camera; else keep stable.
-    const top = centerIdx + Math.floor(half*0.70);
-    const bot = centerIdx - Math.floor(half*0.70);
-    if (midIdx > top) centerIdx = Math.round(centerIdx + (midIdx - top)*0.35);
-    if (midIdx < bot) centerIdx = Math.round(centerIdx - (bot - midIdx)*0.35);
-  }}
-
-  // Build a new heatmap column (sparse) from the current book snapshot.
-  // Intensity is a log-scaled resting liquidity magnitude, normalized by a rolling p95 estimator.
-  const rollMax = [];
-  const rollMaxN = 240; // ~last 20s at 12fps (but columns are timeScaleS-based)
-  function p95(arr) {{
-    if (arr.length===0) return 1.0;
-    const a = arr.slice().sort((x,y)=>x-y);
-    const k = Math.floor(0.95*(a.length-1));
-    return a[Math.max(0, Math.min(a.length-1, k))];
-  }}
-
-  function buildColumn(bids, asks) {{
-    const m = new Map();
-    let colMax = 0;
-    function addSide(levels) {{
-      for (const [p,q] of levels) {{
-        const idx = priceToIdx(p);
-        // log scaling for magnitude compression
-        const v = Math.log1p(Math.max(0, q));
-        if (v > colMax) colMax = v;
-        m.set(idx, v); // store float temporarily
-      }}
-    }}
-    addSide(bids);
-    addSide(asks);
-
-    if (colMax <= 0) return new Map();
-
-    rollMax.push(colMax);
-    if (rollMax.length > rollMaxN) rollMax.shift();
-    const denom = Math.max(1e-6, p95(rollMax));
-
-    // Convert to 0..255 with gamma contrast and small noise floor
-    const out = new Map();
-    const gamma = 0.75;
-    const floor = 0.03;
-    for (const [idx, v] of m.entries()) {{
-      let x = v / denom;
-      x = Math.max(0, Math.min(2.0, x));
-      x = Math.max(0, x - floor);
-      x = Math.pow(x / (2.0 - floor), gamma);
-      const u = Math.max(0, Math.min(255, Math.round(x * 255)));
-      if (u > 0) out.set(idx, u);
-    }}
-    return out;
-  }}
-
-  function pushColumn(colMap, midIdx) {{
-    headCol = (headCol + 1) % COLS;
-    colMaps[headCol] = colMap;
-    midIdxCols[headCol] = midIdx;
-  }}
-
-  function draw() {{
-    // background
-    ctx.fillStyle = '#070a10';
-    ctx.fillRect(0,0,cv.width,cv.height);
-
-    if (centerIdx === null || minIdxSeen === null || maxIdxSeen === null) {{
-      ctx.fillStyle = '#9bb0c7';
-      ctx.font = '14px sans-serif';
-      ctx.fillText('Waiting for data…', 14, 24);
-      return;
-    }}
-
-    const W = cv.width, H = cv.height;
-
-    // Visible price bin range
-    const halfBins = Math.floor(priceSpanBins/2);
-    const pMin = centerIdx - halfBins;
-    const pMax = centerIdx + halfBins;
-
-    // pixels per bin (at least 1 bin per pixel row equivalence)
-    const bins = Math.max(10, pMax - pMin);
-    const pxPerBin = H / bins;
-
-    // Visible time window: newest on the right edge in LIVE mode.
-    // We'll map screen x to buffer column index considering timeOffsetCols.
-    const newest = headCol;
-    const offset = Math.max(0, Math.min(COLS-1, timeOffsetCols));
-    // rightmost column in view corresponds to (newest - offset)
-    const rightCol = (newest - offset + COLS) % COLS;
-
-    // Draw heatmap by sparse columns
-    // We draw from left->right in screen space, mapping to buffer columns.
-    // For each x, we get the buffer column and paint its sparse levels.
-    for (let x=0; x<W; x++) {{
-      // buffer column index for this screen x
-      // leftmost is W-1 columns behind right edge
-      const back = (W-1 - x);
-      let col = (rightCol - back) % COLS;
-      if (col < 0) col += COLS;
-      const cmap = colMaps[col];
-      if (!cmap) continue;
-      // paint sparse points
-      cmap.forEach((u, idx) => {{
-        if (idx < pMin || idx > pMax) return;
-        const y = Math.floor((pMax - idx) * pxPerBin); // higher price at top
-        const y2 = Math.floor((pMax - (idx+1)) * pxPerBin);
-        const h = Math.max(1, y2 - y);
-        const r = LUT[u*3+0], g = LUT[u*3+1], b = LUT[u*3+2];
-        ctx.fillStyle = `rgb(${{r}},${{g}},${{b}})`;
-        ctx.fillRect(x, y, 1, h);
-      }});
-    }}
-
-    // Draw price path (mid) as line
-    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-    ctx.lineWidth = 1.0;
-    ctx.beginPath();
-    let started = false;
-    for (let x=0; x<W; x++) {{
-      const back = (W-1 - x);
-      let col = (rightCol - back) % COLS; if (col<0) col += COLS;
-      const mid = midIdxCols[col];
-      if (!mid) continue;
-      if (mid < pMin || mid > pMax) continue;
-      const y = (pMax - mid) * pxPerBin;
-      if (!started) {{ ctx.moveTo(x, y); started = true; }}
-      else ctx.lineTo(x, y);
-    }}
-    ctx.stroke();
-
-    // HUD (top-left): prices and mode
-    ctx.fillStyle = 'rgba(0,0,0,0.45)';
-    ctx.fillRect(8, 8, 320, 64);
-    ctx.fillStyle = '#e6eef6';
-    ctx.font = '12px sans-serif';
-
-    const bid = lastSnapshot?.best_bid ?? 0;
-    const ask = lastSnapshot?.best_ask ?? 0;
-    const mid = (bid>0 && ask>0) ? (bid+ask)/2 : 0;
-    ctx.fillText(`__SYMBOL__  bid ${bid.toFixed(2)}  ask ${ask.toFixed(2)}  mid ${mid.toFixed(2)}`, 14, 26);
-
-    const topPrice = idxToPrice(pMax).toFixed(2);
-    const botPrice = idxToPrice(pMin).toFixed(2);
-    ctx.fillText(`Price span: ${topPrice} → ${botPrice}  (bins=${priceSpanBins})`, 14, 44);
-
-    const offS = (timeOffsetCols * timeScaleS).toFixed(1);
-    ctx.fillText(`Time: ${timeOffsetCols===0 ? "LIVE" : ("HISTORY  T-" + offS + "s")}`, 14, 62);
-
-    // right-side price labels (sparse)
-    ctx.fillStyle = 'rgba(155,176,199,0.95)';
-    ctx.font = '11px sans-serif';
-    const steps = 7;
-    for (let i=0;i<=steps;i++) {{
-      const frac = i/steps;
-      const idx = Math.round(pMax - frac*bins);
-      const y = Math.round(frac*H);
-      const label = idxToPrice(idx).toFixed(2);
-      ctx.fillText(label, W-70, y+4);
-    }}
-  }}
+  function clamp(x, a, b) {{ return Math.max(a, Math.min(b, x)); }}
 
   function sendView() {{
-    if (!ws || ws.readyState !== 1) return;
+    if (!wsRef || wsRef.readyState !== 1) return;
     const payload = {{
       cmd: "set_view",
-      center_idx: centerIdx,
-      price_span_bins: priceSpanBins,
-      time_offset_cols: timeOffsetCols,
-      time_scale_s: timeScaleS,
-      auto_follow: autoFollow
+      levels: view.levels,
+      step: view.step,
+      pan_ticks: view.panTicks
     }};
-    try {{ ws.send(JSON.stringify(payload)); }} catch (e) {{}}
+    try {{ wsRef.send(JSON.stringify(payload)); }} catch(e) {{}}
   }}
 
-  function onSnapshot(snap) {{
-    lastSnapshot = snap;
-    // health from endpoint data (if provided)
-    // We'll derive health from freshness/book_ok quickly
-    const fresh = (Date.now()/1000 - (snap.last_update_ts||0)) <= {STALE_S};
-    const bookOk = (snap.best_bid||0) > 0 && (snap.best_ask||0) > 0 && (snap.best_bid < snap.best_ask);
-    setHealthPill((fresh && bookOk) ? 'GREEN' : (bookOk ? 'YELLOW' : 'RED'));
 
-    if (snap.tick && snap.tick > 0) tick = snap.tick;
+  function setHealth(h) {{
+    healthEl.classList.remove('green','yellow','red');
+    if (h === 'GREEN') healthEl.classList.add('green');
+    else if (h === 'RED') healthEl.classList.add('red');
+    else healthEl.classList.add('yellow');
+    healthEl.textContent = 'HEALTH: ' + h;
+  }}
 
-    const bids = snap.bids || [];
-    const asks = snap.asks || [];
-    updateWorldRangeFromBook(bids, asks);
+  function fmt(x) {{
+    if (x === null || x === undefined) return 'null';
+    if (typeof x === 'number') {{
+      if (Math.abs(x) >= 1000) return x.toFixed(1);
+      return x.toFixed(2);
+    }}
+    return String(x);
+  }}
 
-    const bid = snap.best_bid || 0;
-    const ask = snap.best_ask || 0;
-    if (bid>0 && ask>0) {{
-      const mid = (bid+ask)/2;
-      const midIdx = priceToIdx(mid);
-      maybeAutoFollow(midIdx);
+  function draw(frame) {{
+    const W = cv.width, H = cv.height;
+    ctx.clearRect(0,0,W,H);
 
-      // advance time columns according to timeScaleS
-      const t = snap.ts || (Date.now()/1000);
-      if (lastColTs === 0) lastColTs = t;
+    const r = frame.render;
+    // Update client-side view defaults from server frame
+    if (view.levels === null) view.levels = r.levels || 220;
+    if (view.baseStep === null) view.baseStep = r.base_step || r.step || 0.1;
+    if (view.step === null) view.step = r.step || view.baseStep;
+    const prices = r.prices || [];
+    const bids = r.bid_qty || [];
+    const asks = r.ask_qty || [];
+    const heatB = r.heat_bid || [];
+    const heatA = r.heat_ask || [];
 
-      if (t - lastColTs >= timeScaleS) {{
-        // Add as many columns as needed to catch up (bounded)
-        let steps = Math.min(8, Math.floor((t - lastColTs) / timeScaleS));
-        for (let k=0;k<steps;k++) {{
-          const col = buildColumn(bids, asks);
-          pushColumn(col, midIdx);
-          lastColTs += timeScaleS;
-        }}
-        // If we are LIVE, keep timeOffset at 0. If in HISTORY, keep offset.
-        setModePill();
-        setScalePill();
-        sendView();
+    const levels = prices.length;
+
+    // Layout
+    const padL = 84;
+    const padR = 18;
+    const axisX = padL;
+    const midX = Math.floor(W*0.52);
+    const bidX0 = padL + 10;
+    const bidX1 = midX - 8;
+    const askX0 = midX + 8;
+    const askX1 = W - padR;
+
+    // Scaling for bars
+    let maxQty = 1.0;
+    for (let i=0;i<levels;i++) {{
+      maxQty = Math.max(maxQty, bids[i]||0, asks[i]||0);
+    }}
+    const bidW = Math.max(10, bidX1 - bidX0);
+    const askW = Math.max(10, askX1 - askX0);
+
+    // Row height (fit canvas)
+    const rowH = Math.max(3, Math.floor((H-20) / Math.max(1, levels)));
+    const top = 10;
+
+    // Helper: map index to Y with correct price orientation:
+    // prices array is low->high, but screen Y increases downward.
+    // So high price should be near top => invert index.
+    function yForIndex(i) {{
+      const inv = (levels - 1 - i);
+      return top + inv * rowH;
+    }}
+
+    // Price labels + grid
+    ctx.font = '12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.fillStyle = '#444';
+    ctx.strokeStyle = '#eee';
+
+    for (let i=0;i<levels;i++) {{
+      const y = yForIndex(i);
+      if (i % 10 === 0) {{
+        // horizontal grid line
+        ctx.beginPath();
+        ctx.moveTo(padL, y+0.5);
+        ctx.lineTo(W-padR, y+0.5);
+        ctx.stroke();
+
+        // price label
+        ctx.fillText(fmt(prices[i]), 8, y + 10);
       }}
     }}
 
-    draw();
+    
+    // Heatmap background (FIX17): draw decayed liquidity intensity per price level
+    // Values are normalized 0..1 server-side.
+    const heatMaxAlpha = clamp((frame.render && frame.render.heat_alpha) ? frame.render.heat_alpha : 0.55, 0.0, 1.0);
+    for (let i=0;i<levels;i++) {{
+      const y = yForIndex(i);
+      const hb = heatB[i] || 0;
+      const ha = heatA[i] || 0;
+      if (hb > 0.001) {{
+        const a = Math.min(heatMaxAlpha, hb * heatMaxAlpha);
+        ctx.fillStyle = 'rgba(46,125,50,' + (0.06 + 0.34*a).toFixed(3) + ')';
+        ctx.fillRect(bidX0, y, bidX1 - bidX0, rowH-1);
+      }}
+      if (ha > 0.001) {{
+        const a = Math.min(heatMaxAlpha, ha * heatMaxAlpha);
+        ctx.fillStyle = 'rgba(198,40,40,' + (0.06 + 0.34*a).toFixed(3) + ')';
+        ctx.fillRect(askX0, y, askX1 - askX0, rowH-1);
+      }}
+    }}
+
+// Draw bids/asks
+    for (let i=0;i<levels;i++) {{
+      const y = yForIndex(i);
+      const bq = bids[i] || 0;
+      const aq = asks[i] || 0;
+
+      // bid bar
+      const bw = Math.min(bidW, (bq / maxQty) * bidW);
+      if (bw > 0.5) {{
+        ctx.fillStyle = 'rgba(46,125,50,0.35)';
+        ctx.fillRect(bidX1 - bw, y, bw, rowH-1);
+      }}
+
+      // ask bar
+      const aw = Math.min(askW, (aq / maxQty) * askW);
+      if (aw > 0.5) {{
+        ctx.fillStyle = 'rgba(198,40,40,0.35)';
+        ctx.fillRect(askX0, y, aw, rowH-1);
+      }}
+    }}
+
+    // Mid/anchor line (center of ladder)
+    if (r.anchor_px !== null && r.anchor_px !== undefined) {{
+      // anchor index nearest to anchor_px
+      const step = r.step || 0.1;
+      const anchor = r.anchor_px;
+      // find closest index by rounding
+      const center = Math.round(anchor / step) * step;
+      // find index of center in array (prices[i] == center)
+      let idx = -1;
+      for (let i=0;i<levels;i++) {{
+        if (Math.abs((prices[i]||0) - center) < (step/2 + 1e-9)) {{ idx = i; break; }}
+      }}
+      if (idx >= 0) {{
+        const y = yForIndex(idx) + Math.floor(rowH/2);
+        ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+        ctx.beginPath();
+        ctx.moveTo(padL, y+0.5);
+        ctx.lineTo(W-padR, y+0.5);
+        ctx.stroke();
+        ctx.fillStyle = '#111';
+        ctx.fillText('anchor ' + fmt(anchor), padL+6, y-4);
+      }}
+    }}
+
+    // Time-window overlay (anchor history as a line on the far right)
+    const hist = r.anchor_hist || [];
+    if (hist.length >= 2 && levels > 0) {{
+      // map px -> y using ladder window
+      const pMin = prices[0];
+      const pMax = prices[levels-1];
+      const tMin = hist[0].ts;
+      const tMax = hist[hist.length-1].ts;
+      const x0 = W - 180;
+      const x1 = W - 20;
+
+      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+      ctx.beginPath();
+      for (let k=0;k<hist.length;k++) {{
+        const t = hist[k].ts;
+        const px = hist[k].px;
+        const x = x0 + (t - tMin) / Math.max(1e-9, (tMax - tMin)) * (x1 - x0);
+        // price to y: higher price -> smaller y
+        const y = top + (pMax - px) / Math.max(1e-9, (pMax - pMin)) * (levels*rowH);
+        if (k===0) ctx.moveTo(x,y);
+        else ctx.lineTo(x,y);
+      }}
+      ctx.stroke();
+
+      ctx.fillStyle = '#666';
+      ctx.fillText('anchor history', x0, 18);
+    }}
+
+    // Status panel
+    try {{
+      statusEl.textContent = JSON.stringify({{
+        service: frame.service,
+        build: frame.build,
+        symbol: frame.symbol,
+        connector: frame.connector,
+        book: frame.book,
+        render: {{
+          levels: r.levels,
+          step: r.step,
+          anchor_px: r.anchor_px
+        }}
+      }}, null, 2);
+    }} catch(e) {{}}
   }}
 
   function connect() {{
-    const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-    const url = proto + '//' + location.host + '/render.ws';
-    statusEl.textContent = 'Connecting WS…';
-    ws = new WebSocket(url);
-    ws.onopen = () => {{ statusEl.textContent = 'WS connected'; }};
-    ws.onclose = () => {{
-      statusEl.textContent = 'WS disconnected — retrying…';
-      setTimeout(connect, 700);
-    }};
-    ws.onerror = () => {{}};
+    const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+    const ws = new WebSocket(proto + '://' + location.host + '/render.ws');
+    wsRef = ws;
     ws.onmessage = (ev) => {{
       try {{
-        const snap = JSON.parse(ev.data);
-        onSnapshot(snap);
-      }} catch (e) {{
-        // ignore
-      }}
+        const frame = JSON.parse(ev.data);
+        setHealth(frame.health || 'YELLOW');
+        draw(frame);
+      }} catch(e) {{}}
     }};
-  }}
 
-  // --- Pointer / touch gestures ---
-  function getTwoFingerMetrics() {{
-    const pts = Array.from(pointers.values());
-    if (pts.length !== 2) return null;
-    const a = pts[0], b = pts[1];
-    const cx = (a.x + b.x)/2;
-    const cy = (a.y + b.y)/2;
-    const dx = (b.x - a.x);
-    const dy = (b.y - a.y);
-    const dist = Math.hypot(dx, dy);
-    return {{cx, cy, dx, dy, dist}};
-  }}
-
-  cv.addEventListener('pointerdown', (e) => {{
-    e.preventDefault();
-    cv.setPointerCapture(e.pointerId);
-    pointers.set(e.pointerId, {{x:e.offsetX, y:e.offsetY, type:e.pointerType}});
-    if (pointers.size === 1) {{
-      lastOneFinger = {{x:e.offsetX, y:e.offsetY, centerIdx0: centerIdx, span0: priceSpanBins}};
-      lastPinch = null;
-    }} else if (pointers.size === 2) {{
-      const m = getTwoFingerMetrics();
-      if (m) {{
-        lastTwoFinger = {{cx:m.cx, cy:m.cy, dx:m.dx, dy:m.dy, timeOffset0: timeOffsetCols, timeScale0: timeScaleS, centerIdx0: centerIdx, span0: priceSpanBins, dist0: m.dist}};
-        lastPinch = {{dist:m.dist, span0: priceSpanBins}}; // allow pinch->price zoom
+    ws.onopen = () => {{
+      // Push current view to server
+      if (view.baseStep !== null) {{
+        view.step = view.baseStep * view.zoom;
       }}
-    }}
-  }}, {{passive:false}});
-
-  cv.addEventListener('pointermove', (e) => {{
-    if (!pointers.has(e.pointerId)) return;
-    e.preventDefault();
-    pointers.set(e.pointerId, {{x:e.offsetX, y:e.offsetY, type:e.pointerType}});
-
-    if (pointers.size === 1 && lastOneFinger && centerIdx !== null) {{
-      // 1-finger vertical pan in price space
-      const dy = e.offsetY - lastOneFinger.y;
-      // Convert pixels to bins using current visible bins
-      const bins = Math.max(10, priceSpanBins);
-      const pxPerBin = cv.height / bins;
-      const dBins = -dy / Math.max(1e-6, pxPerBin);
-      centerIdx = Math.round(lastOneFinger.centerIdx0 + dBins);
-      autoFollow = false;
       sendView();
-      draw();
-      return;
-    }}
+    }};
 
-    if (pointers.size === 2 && lastTwoFinger) {{
-      const m = getTwoFingerMetrics();
-      if (!m) return;
-
-      const dCx = m.cx - lastTwoFinger.cx;
-      const dCy = m.cy - lastTwoFinger.cy;
-      const dDist = m.dist - lastTwoFinger.dist0;
-
-      // 1) Pinch = PRICE ZOOM (Bookmap parity)
-      // We treat pinch as dominant when distance change is meaningful and exceeds translation.
-      if (Math.abs(dDist) > 6 && Math.abs(dDist) > (Math.abs(dCx) + Math.abs(dCy)) * 0.80) {{
-        const kPinch = 0.008;
-        const factor = Math.exp(-dDist * kPinch); // pinch-out (dDist>0) => zoom-in price (smaller span)
-        priceSpanBins = Math.round(clamp(lastTwoFinger.span0 * factor, 120, 20000));
-        autoFollow = false;
-        sendView();
-        draw();
-        return;
-      }}
-
-      // 2) Two-finger horizontal drag -> TIME SCRUB
-      if (Math.abs(dCx) >= Math.abs(dCy)) {{
-        const dCols = Math.round(-dCx); // drag left => positive offset (history)
-        timeOffsetCols = Math.max(0, Math.min(COLS-1, lastTwoFinger.timeOffset0 + dCols));
-        if (timeOffsetCols !== 0) autoFollow = false;
-        setModePill();
-        sendView();
-        draw();
-        return;
-      }}
-
-      // 3) Two-finger vertical drag -> TIME SCALE (seconds per column)
-      const k = 0.012;
-      const factor = Math.exp(dCy * k); // drag down => zoom out time (bigger seconds/col)
-      timeScaleS = clamp(lastTwoFinger.timeScale0 * factor, timeScaleMin, timeScaleMax);
-      setScalePill();
-      sendView();
-      draw();
-      return;
-    }}
-  }}, {{passive:false}});
-
-  function endPointer(e) {{
-    try {{ pointers.delete(e.pointerId); }} catch(_) {{}}
-    if (pointers.size === 0) {{
-      lastOneFinger = null; lastTwoFinger = null; lastPinch = null;
-      return;
-    }}
-    if (pointers.size === 1) {{
-      // keep remaining pointer as 1-finger baseline
-      const pt = Array.from(pointers.values())[0];
-      lastOneFinger = {{x:pt.x, y:pt.y, centerIdx0:centerIdx, span0:priceSpanBins}};
-      lastTwoFinger = null; lastPinch = null;
-    }}
+    ws.onclose = () => setTimeout(connect, 600);
   }}
 
-  cv.addEventListener('pointerup', endPointer, {{passive:false}});
-  cv.addEventListener('pointercancel', endPointer, {{passive:false}});
-  cv.addEventListener('pointerout', endPointer, {{passive:false}});
-  cv.addEventListener('pointerleave', endPointer, {{passive:false}});
 
-  // Pinch to zoom price span (iPad: we emulate pinch via 2 pointers distance change)
-  // We handle it on pointermove when two pointers exist by comparing dist, but we reserved two-finger gestures
-  // for time scrub/scale. So pinch is handled as iOS native gesture isn't available under pointer events.
-  // Instead: use wheel on desktop + double-tap? We'll implement wheel + optional 3-finger pinch later.
-  // For now: wheel/trackpad zoom still supported.
-  cv.addEventListener('wheel', (e) => {{
-    e.preventDefault();
-    if (centerIdx === null) return;
-    const factor = Math.exp(e.deltaY * 0.001);
-    priceSpanBins = Math.round(clamp(priceSpanBins * factor, 120, 20000));
-    autoFollow = false;
+  // ----------------------------
+  // Interaction handlers (FIX16)
+  // ----------------------------
+  let dragging = false;
+  let lastY = 0;
+
+  cv.addEventListener('wheel', (ev) => {{
+    ev.preventDefault();
+    if (view.baseStep === null) return;
+    const delta = ev.deltaY;
+    // Zoom: wheel up = zoom in (smaller step)
+    const factor = (delta > 0) ? 1.15 : 0.87;
+    view.zoom = clamp(view.zoom * factor, 0.25, 8.0);
+    view.step = view.baseStep * view.zoom;
     sendView();
-    draw();
-  }}, {{passive:false}});
+  }}, {{ passive: false }});
 
-  // Minimal toggle: double tap to return to LIVE + autoFollow
-  let lastTap = 0;
-  cv.addEventListener('touchend', (e) => {{
-    const t = Date.now();
-    if (t - lastTap < 280) {{
-      timeOffsetCols = 0;
-      autoFollow = true;
-      setModePill();
-      sendView();
-      draw();
+    // Pointer pan (mouse + touch) — works reliably on iPad
+  let pointerActive = false;
+  let pointerId = null;
+
+  cv.addEventListener('pointerdown', (ev) => {{
+    // Ensure the page does not scroll/zoom on touch interactions
+    ev.preventDefault();
+    pointerActive = true;
+    pointerId = ev.pointerId;
+    lastY = ev.clientY;
+    try {{ cv.setPointerCapture(pointerId); }} catch (e) {{}}
+  }}, {{ passive: false }});
+
+  cv.addEventListener('pointermove', (ev) => {{
+    if (!pointerActive) return;
+    if (pointerId !== null && ev.pointerId !== pointerId) return;
+    ev.preventDefault();
+    const dy = ev.clientY - lastY;
+    lastY = ev.clientY;
+    const approxRowH = 6;
+    view.panTicks = clamp(view.panTicks + (-dy / approxRowH), -2000.0, 2000.0);
+    sendView();
+  }}, {{ passive: false }});
+
+  function endPointer(ev) {{
+    if (pointerId !== null && ev.pointerId !== pointerId) return;
+    pointerActive = false;
+    pointerId = null;
+    try {{ cv.releasePointerCapture(ev.pointerId); }} catch (e) {{}}
+  }}
+
+  cv.addEventListener('pointerup', endPointer, {{ passive: true }});
+  cv.addEventListener('pointercancel', endPointer, {{ passive: true }});
+
+
+  // Touch support (iPad): one-finger drag = pan, two-finger pinch = zoom
+  let touchMode = null;
+  let pinchStartDist = 0;
+  let pinchStartZoom = 1.0;
+
+  function dist(t1, t2) {{
+    const dx = t1.clientX - t2.clientX;
+    const dy = t1.clientY - t2.clientY;
+    return Math.sqrt(dx*dx + dy*dy);
+  }}
+
+  cv.addEventListener('touchstart', (ev) => {{
+    ev.preventDefault();
+    if (ev.touches.length === 1) {{
+      touchMode = 'pan';
+      lastY = ev.touches[0].clientY;
+    }} else if (ev.touches.length === 2) {{
+      touchMode = 'pinch';
+      pinchStartDist = dist(ev.touches[0], ev.touches[1]);
+      pinchStartZoom = view.zoom;
     }}
-    lastTap = t;
-  }}, {{passive:true}});
+  }}, {{ passive: false }});
 
-  setModePill();
-  setScalePill();
+  cv.addEventListener('touchmove', (ev) => {{
+    if (view.baseStep === null) return;
+    if (touchMode === 'pan' && ev.touches.length === 1) {{
+      const y = ev.touches[0].clientY;
+      const dy = y - lastY;
+      lastY = y;
+      const approxRowH = 6;
+      view.panTicks = clamp(view.panTicks + (-dy / approxRowH), -2000.0, 2000.0);
+      sendView();
+    }} else if (touchMode === 'pinch' && ev.touches.length === 2) {{
+      const d = dist(ev.touches[0], ev.touches[1]);
+      if (pinchStartDist > 1) {{
+        const ratio = pinchStartDist / d; // closer fingers => zoom in
+        view.zoom = clamp(pinchStartZoom * ratio, 0.25, 8.0);
+        view.step = view.baseStep * view.zoom;
+        sendView();
+      }}
+    }}
+  }}, {{ passive: true }});
+
+  cv.addEventListener('touchend', () => {{ touchMode = null; }}, {{ passive: true }});
+
   connect();
-
-  // redraw loop safety
-  setInterval(() => {{
-    if (lastSnapshot) draw();
-  }}, 120);
-
 }})();
 </script>
 </body>
 </html>"""
-    return html.replace("{{","{").replace("}}","}").replace("__BUILD__", BUILD).replace("__SYMBOL__", SYMBOL)
+
+
 @app.get("/")
 async def index() -> HTMLResponse:
     return HTMLResponse(_ui_html())
+
 
 # ----------------------------
 # Entrypoint
@@ -1029,4 +1027,5 @@ if __name__ == "__main__":
     except Exception as e:
         bootlog(f"FATAL: uvicorn import failed: {e}")
         raise
+
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
