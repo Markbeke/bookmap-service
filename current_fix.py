@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX20/P10_1"
+BUILD = "FIX20/P01"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -69,26 +69,11 @@ ANCHOR_HISTORY_SEC = float(os.environ.get("QD_ANCHOR_HISTORY_SEC", "90"))  # ove
 # Absolute price grid + horizontal time ring buffer + camera viewport.
 BM_BASE_COL_DT = float(os.environ.get("QD_BM_BASE_COL_DT", "0.25"))   # seconds per base column (producer cadence)
 BM_MAX_COLS = int(os.environ.get("QD_BM_MAX_COLS", "1200"))           # ring buffer width (columns)
-
-# Fixed, instrument-specific price universe (camera can move into empty space)
-BM_GLOBAL_MIN_PRICE = float(os.environ.get("QD_BM_GLOBAL_MIN_PRICE", "0"))
-BM_GLOBAL_MAX_PRICE = float(os.environ.get("QD_BM_GLOBAL_MAX_PRICE", "200000"))
 BM_DEFAULT_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_PRICE_SPAN_BINS", "700"))  # visible price bins (zoom)
-
-# Instrument-specific price universe (Bookmap-like: pan/zoom across wide absolute ranges).
-# For BTC_USDT we default to a generous universe so you can jump/pan to 95k/120k etc.
-# This is a VIEW constraint only; it does not invent data (empty space remains empty).
-BM_UNIVERSE_MIN_PRICE = float(os.getenv("QD_BM_UNIVERSE_MIN_PRICE", "0"))
-BM_UNIVERSE_MAX_PRICE = float(os.getenv("QD_BM_UNIVERSE_MAX_PRICE", "200000"))
-
-# Price LOD: keep per-column point counts bounded when zoomed out massively.
-# We aggregate intensities into coarser bins when the visible span is very large.
-BM_PRICE_LOD_TARGET_BINS = int(os.getenv("QD_BM_PRICE_LOD_TARGET_BINS", "2200"))  # ~points/col max
-
 BM_DEFAULT_TIME_WINDOW_S = float(os.environ.get("QD_BM_TIME_WINDOW_S", "90"))     # target visible time span in seconds at default scale
 BM_MAX_DOWNSAMPLE = int(os.environ.get("QD_BM_MAX_DOWNSAMPLE", "64"))             # max column skip factor at extreme zoom-out
 BM_MIN_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_MIN_PRICE_SPAN_BINS", "80"))
-BM_MAX_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_MAX_PRICE_SPAN_BINS", "400000"))
+BM_MAX_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_MAX_PRICE_SPAN_BINS", "6000"))
 
 # Book bounds (avoid unbounded growth)
 MAX_LEVELS_PER_SIDE = int(os.environ.get("QD_MAX_LEVELS_PER_SIDE", "1200"))
@@ -188,11 +173,6 @@ class State:
     bm_tick: float = 0.1  # inferred/overridden tick size for price binning
     bm_min_idx_seen: Optional[int] = None
     bm_max_idx_seen: Optional[int] = None
-
-    bm_global_min_price: float = BM_GLOBAL_MIN_PRICE
-    bm_global_max_price: float = BM_GLOBAL_MAX_PRICE
-    bm_intensity: Dict[int, float] = field(default_factory=dict)
-    bm_prev_qty: Dict[int, float] = field(default_factory=dict)
     bm_tape: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=BM_MAX_COLS))
     bm_last_col_ts: Optional[float] = None
 
@@ -463,16 +443,7 @@ async def _connector_loop() -> None:
                     _route_message(obj)
 
         except Exception as e:
-            # transient failures should not hard-flip UI to RED immediately
-            now = time.time()
-            if now - getattr(STATE, "last_err_ts", 0.0) > 60.0:
-              STATE.err_count = 0
-            STATE.err_count = getattr(STATE, "err_count", 0) + 1
-            STATE.last_err_ts = now
-            if STATE.err_count >= 3:
-              STATE.status = "ERROR"
-            else:
-              STATE.status = "DISCONNECTED"
+            STATE.status = "ERROR"
             STATE.last_error = str(e)
             STATE.reconnects += 1
             bootlog(f"WS ERROR: {e} (reconnects={STATE.reconnects})")
@@ -620,33 +591,6 @@ def _infer_tick_from_book() -> float:
         return float(tick)
     except Exception:
         return float(STATE.bm_tick)
-def _update_universe_idx(tick: float) -> None:
-    """Update absolute price-universe bounds in index space (depends on tick)."""
-    try:
-        if tick is None or not math.isfinite(tick) or tick <= 0:
-            return
-        sym = str(getattr(STATE, "symbol", "") or os.getenv("QD_SYMBOL", "BTC_USDT"))
-
-        umin = BM_UNIVERSE_MIN_PRICE
-        umax = BM_UNIVERSE_MAX_PRICE
-
-        if getattr(STATE, "bm_universe_min_price", None) is not None:
-            umin = float(STATE.bm_universe_min_price)
-        if getattr(STATE, "bm_universe_max_price", None) is not None:
-            umax = float(STATE.bm_universe_max_price)
-
-        if not math.isfinite(umin):
-            umin = 0.0
-        if not math.isfinite(umax):
-            umax = 200000.0
-        if umax <= umin:
-            umax = umin + (200000.0 if "BTC" in sym else 10000.0)
-
-        STATE.bm_min_idx_universe = int(round(umin / tick))
-        STATE.bm_max_idx_universe = int(round(umax / tick))
-    except Exception:
-        return
-
 
 
 def _price_to_idx(price: float, tick: float) -> int:
@@ -658,60 +602,30 @@ def _idx_to_price(idx: int, tick: float) -> float:
 
 
 def _build_bm_column(tick: float) -> Dict[str, Any]:
+    """Build a sparse column from current book state."""
     ts = _now()
-
-    # Simple, Bookmap-like significance accumulation (FIX20_P02)
-    halflife_s = float(os.environ.get("QD_BM_INT_HALFLIFE_S", "18"))
-    accum_gain = float(os.environ.get("QD_BM_ACCUM_GAIN", "1.0"))
-    remove_gain = float(os.environ.get("QD_BM_REMOVE_GAIN", "1.75"))
-    prune_floor = float(os.environ.get("QD_BM_PRUNE_FLOOR", "0.02"))
-
-    dt = max(1e-3, BM_BASE_COL_DT)
-    decay = 0.5 ** (dt / max(1e-6, halflife_s))
-
-    def sig(q: float) -> float:
-        return math.log1p(max(0.0, float(q)))
-
+    col: Dict[int, float] = {}
+    # sample limited depth for performance; keep closest liquidity
     bids = sorted(STATE.book.bids.items(), key=lambda kv: kv[0], reverse=True)[:MAX_LEVELS_PER_SIDE]
     asks = sorted(STATE.book.asks.items(), key=lambda kv: kv[0])[:MAX_LEVELS_PER_SIDE]
 
-    seen: Dict[int, float] = {}
-    for px, qty in bids:
-        if qty <= 0: 
-            continue
-        idx = _price_to_idx(float(px), tick)
-        seen[idx] = seen.get(idx, 0.0) + float(qty)
-        if STATE.bm_min_idx_seen is None or idx < STATE.bm_min_idx_seen:
-            STATE.bm_min_idx_seen = idx
-        if STATE.bm_max_idx_seen is None or idx > STATE.bm_max_idx_seen:
-            STATE.bm_max_idx_seen = idx
-    for px, qty in asks:
+    def add(px: float, qty: float) -> None:
         if qty <= 0:
-            continue
-        idx = _price_to_idx(float(px), tick)
-        seen[idx] = seen.get(idx, 0.0) + float(qty)
+            return
+        idx = _price_to_idx(px, tick)
+        # intensity: log scaling for stability across regimes
+        v = math.log1p(float(qty))
+        col[idx] = col.get(idx, 0.0) + v
         if STATE.bm_min_idx_seen is None or idx < STATE.bm_min_idx_seen:
             STATE.bm_min_idx_seen = idx
         if STATE.bm_max_idx_seen is None or idx > STATE.bm_max_idx_seen:
             STATE.bm_max_idx_seen = idx
 
-    # decay
-    for k in list(STATE.bm_intensity.keys()):
-        STATE.bm_intensity[k] = float(STATE.bm_intensity[k]) * decay
-        if STATE.bm_intensity[k] < prune_floor:
-            STATE.bm_intensity.pop(k, None)
+    for px, qty in bids:
+        add(float(px), float(qty))
+    for px, qty in asks:
+        add(float(px), float(qty))
 
-    # accumulate + removal penalty
-    for idx, qty in seen.items():
-        prev_i = float(STATE.bm_intensity.get(idx, 0.0))
-        prev_qty = float(STATE.bm_prev_qty.get(idx, 0.0))
-        new_i = prev_i + accum_gain * sig(qty) * dt
-        if prev_qty > 0.0 and qty < prev_qty:
-            new_i = max(0.0, new_i - remove_gain * sig(prev_qty - qty) * dt)
-        STATE.bm_intensity[idx] = new_i
-        STATE.bm_prev_qty[idx] = float(qty)
-
-    col = {int(k): float(v) for (k, v) in STATE.bm_intensity.items() if float(v) >= prune_floor}
     return {"ts": ts, "col": col}
 
 
@@ -810,7 +724,6 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0, *, bm_center
 
     bm_view = {
         "tick": tick,
-        "basePrice": 0.0,
         "center_idx": bm_center_idx,
         "price_span_bins": bm_price_span_bins,
         "time_offset_cols": bm_time_offset_cols,
@@ -831,25 +744,6 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0, *, bm_center
         bm_view["min_idx"] = int(min_idx)
         bm_view["max_idx"] = int(max_idx)
 
-        # Clamp to instrument universe so user can pan/jump across the full range (Bookmap-like),
-        # while still allowing empty space where no data exists.
-        umin = getattr(STATE, "bm_min_idx_universe", None)
-        umax = getattr(STATE, "bm_max_idx_universe", None)
-        if umin is None or umax is None:
-            # Fallback to observed range if universe not ready yet
-            umin = getattr(STATE, "bm_min_idx_seen", None)
-            umax = getattr(STATE, "bm_max_idx_seen", None)
-        if umin is not None and umax is not None:
-            if min_idx < umin:
-                min_idx = umin
-                max_idx = min_idx + bm_price_span_bins
-            if max_idx > umax:
-                max_idx = umax
-                min_idx = max_idx - bm_price_span_bins
-            bm_view["min_idx"] = int(min_idx)
-            bm_view["max_idx"] = int(max_idx)
-
-
         # Determine which columns to show
         # We keep a target visible time span; downsample controls scale.
         target_cols = max(120, min(900, int(BM_DEFAULT_TIME_WINDOW_S / (BM_BASE_COL_DT * bm_time_downsample))))
@@ -864,30 +758,7 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0, *, bm_center
             c = bm_tape_list[j]
             sparse = c.get("col", {})
             # Filter to viewport
-
-            # Filter to viewport with price LOD aggregation when zoomed out massively
-            span_bins = max(1, int(max_idx - min_idx))
-            lod = 1
-            if span_bins > BM_PRICE_LOD_TARGET_BINS:
-                lod = int(math.ceil(span_bins / float(BM_PRICE_LOD_TARGET_BINS)))
-            agg = {}
-            for (k, v) in sparse.items():
-                try:
-                    ik = int(k)
-                except Exception:
-                    continue
-                if ik < min_idx or ik > max_idx:
-                    continue
-                if lod > 1:
-                    b = int((ik - min_idx) // lod)
-                    ik2 = int(min_idx + b * lod)
-                else:
-                    ik2 = ik
-                fv = float(v)
-                prev = agg.get(ik2)
-                if prev is None or fv > prev:
-                    agg[ik2] = fv
-            pts = [[int(k), float(v)] for (k, v) in agg.items()]
+            pts = [[int(k), float(v)] for (k, v) in sparse.items() if min_idx <= int(k) <= max_idx]
             cols.append({"ts": float(c.get("ts", ts)), "pts": pts})
         bm_view["cols"] = cols
         bm_view["live"] = (bm_time_offset_cols == 0)
@@ -1190,34 +1061,6 @@ def _ui_html() -> str:
 (() => {{
   const cv = document.getElementById('cv');
   const ctx = cv.getContext('2d', {{ alpha: false }});
-
-  // --- render coalescing (gesture-smooth) ---
-  let latestFrame = null;
-  let dirty = false;
-  let animating = false;
-  let lastRenderMs = 0;
-  const RENDER_MIN_DT_MS = 33; // ~30fps cap (mobile-friendly)
-
-  function scheduleRender() {{
-    if (animating) return;
-    animating = true;
-    requestAnimationFrame(renderLoop);
-  }}
-
-  function renderLoop(ts) {{
-    const now = performance.now();
-    if (dirty && latestFrame && (now - lastRenderMs) >= RENDER_MIN_DT_MS) {{
-      lastRenderMs = now;
-      dirty = false;
-      draw(latestFrame);
-    }}
-    if (dirty) {{
-      requestAnimationFrame(renderLoop);
-    }} else {{
-      animating = false;
-    }}
-  }}
-
   const healthEl = document.getElementById('health');
   const modeEl = document.getElementById('mode');
   const scaleEl = document.getElementById('scale');
@@ -1249,29 +1092,12 @@ def _ui_html() -> str:
   }}
 
   function setHealth(h) {{
-    // Debounce short flips to reduce confusing GREEN↔YELLOW↔RED oscillations.
-    const now = performance.now();
-    if (!window.__qdHealth) {{
-        window.__qdHealth = {{ shown: "YELLOW", pending: null, pendingTs: 0 }};
-    }}
-    const st = window.__qdHealth;
-    if (h === st.shown) return;
-    if (st.pending !== h) {{
-        st.pending = h;
-        st.pendingTs = now;
-        return;
-    }}
-    if (now - st.pendingTs < 800) return; // require ~0.8s stability before switching
-    st.shown = h;
-    st.pending = null;
-
     healthEl.classList.remove('green','yellow','red');
     if (h === 'GREEN') healthEl.classList.add('green');
     else if (h === 'RED') healthEl.classList.add('red');
     else healthEl.classList.add('yellow');
-    healthEl.textContent = `HEALTH: ${h}`;
-}}
-
+    healthEl.textContent = 'HEALTH: ' + (h || 'YELLOW');
+  }}
 
   function fmtTimeScale(sPerCol) {{
     if (!isFinite(sPerCol) || sPerCol <= 0) return '--';
@@ -1308,10 +1134,8 @@ def _ui_html() -> str:
     ws.onopen = () => {{ sendView(); }};
     ws.onmessage = (ev) => {{
       try {{
-        latestFrame = JSON.parse(ev.data);
-        dirty = true;
-        scheduleRender();
-        if (latestFrame && latestFrame.health) setHealth(latestFrame.health);
+        const frame = JSON.parse(ev.data);
+        draw(frame);
       }} catch(e) {{}}
     }};
     ws.onclose = () => {{
@@ -1332,109 +1156,122 @@ def _ui_html() -> str:
   }}
 
   function draw(frame) {{
-    if (!frame) return;
-    if (frame.health) setHealth(frame.health);
+    const W = cv.width, H = cv.height;
+    ctx.fillStyle = '#0b0f14';
+    ctx.fillRect(0,0,W,H);
+
+    setHealth(frame.health);
 
     const bm = frame.render && frame.render.bm ? frame.render.bm : null;
-    if (!bm || !bm.cols || bm.cols.length === 0) {{
-      ctx.fillStyle = '#0b0f14';
-      ctx.fillRect(0,0,cv.width,cv.height);
-      ctx.fillStyle = 'rgba(220,230,255,0.85)';
+    if (!bm || !bm.cols) {{
+      ctx.fillStyle = 'rgba(230,238,248,0.85)';
       ctx.font = '16px system-ui';
-      ctx.fillText('Warming...', 20, 40);
+      ctx.fillText('Warming up...', 16, 24);
       return;
     }}
 
-    // Screen background
-    ctx.fillStyle = '#0b0f14';
-    ctx.fillRect(0,0,cv.width,cv.height);
-
-    const padL = 90, padT = 8, padB = 30, padR = 8;
-    const plotX = padL, plotY = padT;
-    const plotW = Math.max(1, cv.width - padL - padR);
-    const plotH = Math.max(1, cv.height - padT - padB);
-
-    // Bins in view (price axis window)
-    const minIdx = bm.minIdx, maxIdx = bm.maxIdx;
-    const bins = Math.max(1, (maxIdx - minIdx + 1));
-    const pxPerBin = plotH / bins;
-
-    // LOD: when massively zoomed out (tiny pxPerBin), render at reduced res and scale up
-    let lod = 1.0;
-    if (pxPerBin < 0.60) lod = 0.5;
-    if ((plotW*plotH) > 1_400_000) lod = Math.min(lod, 0.5);
-
-    const bw = Math.max(1, Math.floor(plotW * lod));
-    const bh = Math.max(1, Math.floor(plotH * lod));
-
-    if (!window._qdOsc || window._qdBw !== bw || window._qdBh !== bh) {{
-      window._qdOsc = document.createElement('canvas');
-      window._qdOsc.width = bw;
-      window._qdOsc.height = bh;
-      window._qdOctx = window._qdOsc.getContext('2d', {{ alpha: true }});
-      window._qdImg = window._qdOctx.createImageData(bw, bh);
-      window._qdBuf = window._qdImg.data;
-      window._qdBw = bw; window._qdBh = bh;
+    // initialize centerIdx from server once
+    if (view.centerIdx === null && bm.center_idx !== null && bm.center_idx !== undefined) {{
+      view.centerIdx = bm.center_idx;
+      throttledSend();
     }}
 
-    const octx = window._qdOctx;
-    const img = window._qdImg;
-    const buf = window._qdBuf;
-    const W = window._qdBw, H = window._qdBh;
+    const live = !!bm.live && (view.timeOffset === 0);
+    modeEl.textContent = live ? 'LIVE' : 'HISTORY';
+    modeEl.className = 'pill' + (live ? ' green' : '');
 
-    // Clear offscreen buffer (transparent)
-    buf.fill(0);
+    scaleEl.textContent = 'TIME: ' + fmtTimeScale(bm.time_scale_s_per_col);
+    offsetEl.textContent = live ? 'OFFSET: 0s' : ('OFFSET: T-' + (bm.t_minus_s || 0).toFixed(1) + 's');
 
-    const colN = bm.cols.length;
-    const colW = Math.max(1, Math.floor(W / Math.max(1, colN)));
-    const pxPerBinL = (H / bins);
+    // Update auto-follow
+    if (live) view.autoFollow = true;
 
-    for (let i = 0; i < colN; i++) {{
-      const col = bm.cols[i];
-      if (!col || !col.pts) continue;
-      const x0 = Math.min(W-1, i*colW);
-      const x1 = Math.min(W, x0 + colW);
+    const cols = bm.cols;
+    const minIdx = bm.min_idx, maxIdx = bm.max_idx;
+    const tick = bm.tick || 0.1;
 
-      const pts = col.pts;
-      for (let k = 0; k < pts.length; k++) {{
-        const pt = pts[k];
-        const idx = pt[0];
-        const v = pt[1];
-        const y = Math.floor((maxIdx - idx) * pxPerBinL);
-        if (y < 0 || y >= H) continue;
+    // Layout
+    const leftPad = Math.floor(W * 0.08); // price labels area
+    const rightPad = 8;
+    const topPad = 8;
+    const botPad = 8;
+    const plotW = W - leftPad - rightPad;
+    const plotH = H - topPad - botPad;
 
-        const rgb = valToRGB(v);
-        const r = rgb[0], g = rgb[1], b = rgb[2];
+    // Determine vmax (robust): sample max across visible points
+    let vmax = 0;
+    for (let i=0;i<cols.length;i++) {{
+      const pts = cols[i].pts || [];
+      for (let j=0;j<pts.length;j++) {{
+        const v = pts[j][1];
+        if (v > vmax) vmax = v;
+      }}
+    }}
+    // soft cap for stability
+    vmax = Math.max(1e-9, vmax);
 
-        const rowOff = (y * W) * 4;
-        for (let x = x0; x < x1; x++) {{
-          const off = rowOff + x*4;
-          buf[off] = r;
-          buf[off+1] = g;
-          buf[off+2] = b;
-          buf[off+3] = 255;
-        }}
+    // Render columns
+    const colW = Math.max(1, Math.floor(plotW / Math.max(1, cols.length)));
+    const span = Math.max(1, (maxIdx - minIdx));
+    const pxPerBin = plotH / span;
+
+    for (let ci=0; ci<cols.length; ci++) {{
+      const x0 = leftPad + ci * colW;
+      const pts = cols[ci].pts || [];
+      for (let k=0; k<pts.length; k++) {{
+        const idx = pts[k][0];
+        const v = pts[k][1];
+        const y = topPad + (maxIdx - idx) * pxPerBin; // higher idx at top
+        const h = Math.max(1, Math.ceil(pxPerBin));
+        const rgb = valToRGB(v, vmax);
+        ctx.fillStyle = `rgb(${{rgb[0]}},${{rgb[1]}},${{rgb[2]}})`;
+        ctx.fillRect(x0, y, colW, h);
       }}
     }}
 
-    octx.putImageData(img, 0, 0);
+    // Draw price labels (few ticks)
+    ctx.fillStyle = 'rgba(230,238,248,0.80)';
+    ctx.font = (Math.max(10, Math.floor(H/48))) + 'px system-ui';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    const labelCount = 6;
+    for (let i=0;i<=labelCount;i++) {{
+      const t = i/labelCount;
+      const idx = Math.round(maxIdx - t*(maxIdx - minIdx));
+      const y = topPad + t*plotH;
+      const px = (idx * tick);
+      ctx.fillText(px.toFixed(1), leftPad - 8, y);
+      // grid line
+      ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+      ctx.beginPath();
+      ctx.moveTo(leftPad, y);
+      ctx.lineTo(W-rightPad, y);
+      ctx.stroke();
+    }}
 
-    // Blit to screen
-    ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(window._qdOsc, plotX, plotY, plotW, plotH);
+    // Price line (best bid/ask mid) overlay
+    if (frame.book && frame.book.best_bid !== null && frame.book.best_ask !== null) {{
+      const mid = (frame.book.best_bid + frame.book.best_ask)/2.0;
+      const midIdx = Math.round(mid / tick);
+      const y = topPad + (maxIdx - midIdx) * pxPerBin;
+      ctx.strokeStyle = 'rgba(255,255,255,0.70)';
+      ctx.beginPath();
+      ctx.moveTo(leftPad, y);
+      ctx.lineTo(W-rightPad, y);
+      ctx.stroke();
 
-    // Price labels (lightweight)
-    ctx.fillStyle = 'rgba(220,230,255,0.85)';
-    ctx.font = '16px system-ui';
-    for (let j = 0; j <= 4; j++) {{
-      const y = plotY + (plotH*j/4);
-      const idx = (maxIdx - (bins-1)*(j/4));
-      const p = bm.basePrice + idx*bm.tick;
-      ctx.fillText(p.toFixed(1), 8, y+6);
+      // auto-follow: keep mid within viewport by nudging centerIdx on UI side
+      if (view.autoFollow && view.centerIdx !== null) {{
+        const margin = Math.floor(view.priceSpan * 0.12);
+        if (midIdx > (view.centerIdx + margin) || midIdx < (view.centerIdx - margin)) {{
+          view.centerIdx = midIdx;
+          throttledSend();
+        }}
+      }}
     }}
   }}
 
-// Touch gesture handling
+  // Touch gesture handling
   let active = false;
   let startTouches = [];
   let startMid = null;
