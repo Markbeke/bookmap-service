@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX20/P09"
+BUILD = "FIX20/P10_1"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -810,6 +810,7 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0, *, bm_center
 
     bm_view = {
         "tick": tick,
+        "basePrice": 0.0,
         "center_idx": bm_center_idx,
         "price_span_bins": bm_price_span_bins,
         "time_offset_cols": bm_time_offset_cols,
@@ -1248,12 +1249,29 @@ def _ui_html() -> str:
   }}
 
   function setHealth(h) {{
+    // Debounce short flips to reduce confusing GREEN↔YELLOW↔RED oscillations.
+    const now = performance.now();
+    if (!window.__qdHealth) {{
+        window.__qdHealth = {{ shown: "YELLOW", pending: null, pendingTs: 0 }};
+    }}
+    const st = window.__qdHealth;
+    if (h === st.shown) return;
+    if (st.pending !== h) {{
+        st.pending = h;
+        st.pendingTs = now;
+        return;
+    }}
+    if (now - st.pendingTs < 800) return; // require ~0.8s stability before switching
+    st.shown = h;
+    st.pending = null;
+
     healthEl.classList.remove('green','yellow','red');
     if (h === 'GREEN') healthEl.classList.add('green');
     else if (h === 'RED') healthEl.classList.add('red');
     else healthEl.classList.add('yellow');
-    healthEl.textContent = 'HEALTH: ' + (h || 'YELLOW');
-  }}
+    healthEl.textContent = `HEALTH: ${h}`;
+}}
+
 
   function fmtTimeScale(sPerCol) {{
     if (!isFinite(sPerCol) || sPerCol <= 0) return '--';
