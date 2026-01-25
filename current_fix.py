@@ -941,16 +941,16 @@ def _ui_html() -> str:
   let pointerActive = false;
   let pointerId = null;
 
-  cv.addEventListener('pointerdown', (ev) => {
+  cv.addEventListener('pointerdown', (ev) => {{
     // Ensure the page does not scroll/zoom on touch interactions
     ev.preventDefault();
     pointerActive = true;
     pointerId = ev.pointerId;
     lastY = ev.clientY;
-    try { cv.setPointerCapture(pointerId); } catch (e) {}
-  }, { passive: false });
+    try {{ cv.setPointerCapture(pointerId); }} catch (e) {{}}
+  }}, {{ passive: false }});
 
-  cv.addEventListener('pointermove', (ev) => {
+  cv.addEventListener('pointermove', (ev) => {{
     if (!pointerActive) return;
     if (pointerId !== null && ev.pointerId !== pointerId) return;
     ev.preventDefault();
@@ -959,17 +959,17 @@ def _ui_html() -> str:
     const approxRowH = 6;
     view.panTicks = clamp(view.panTicks + (-dy / approxRowH), -2000.0, 2000.0);
     sendView();
-  }, { passive: false });
+  }}, {{ passive: false }});
 
-  function endPointer(ev) {
+  function endPointer(ev) {{
     if (pointerId !== null && ev.pointerId !== pointerId) return;
     pointerActive = false;
     pointerId = null;
-    try { cv.releasePointerCapture(ev.pointerId); } catch (e) {}
-  }
+    try {{ cv.releasePointerCapture(ev.pointerId); }} catch (e) {{}}
+  }}
 
-  cv.addEventListener('pointerup', endPointer, { passive: true });
-  cv.addEventListener('pointercancel', endPointer, { passive: true });
+  cv.addEventListener('pointerup', endPointer, {{ passive: true }});
+  cv.addEventListener('pointercancel', endPointer, {{ passive: true }});
 
 
   // Touch support (iPad): one-finger drag = pan, two-finger pinch = zoom
