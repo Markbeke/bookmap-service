@@ -927,7 +927,7 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0, *, bm_center
         health_raw = "RED"
     elif (not parity_ok):
         health_raw = "YELLOW"
-    elif age <= 2.0 and STATE.status == "CONNECTED":
+    elif age <= 5.0 and STATE.status == "CONNECTED":
         health_raw = "GREEN"
     elif age <= 12.0:
         health_raw = "YELLOW"
@@ -1475,6 +1475,114 @@ def _ui_html() -> str:
   cv.addEventListener('touchmove', onTouchMove, {{ passive:false }});
   cv.addEventListener('touchend', onTouchEnd, {{ passive:false }});
   cv.addEventListener('touchcancel', onTouchEnd, {{ passive:false }});
+// (FIX20/P13) Pointer Events (work across mouse, touch, stylus; fixes non-working gestures)
+const ptrs = new Map(); // pointerId -> {{x,y}}
+let peMode = null;
+let peStart = null;
+
+function peSnapshot() {{
+  const ids = Array.from(ptrs.keys());
+  if (ids.length === 1) {{
+    const p = ptrs.get(ids[0]);
+    return {{ ids, p1:{{x:p.x,y:p.y}} }};
+  }}
+  if (ids.length >= 2) {{
+    const p1 = ptrs.get(ids[0]), p2 = ptrs.get(ids[1]);
+    const mid = {{ x:(p1.x+p2.x)/2, y:(p1.y+p2.y)/2 }};
+    const dx = (p2.x-p1.x), dy=(p2.y-p1.y);
+    return {{ ids, p1:{{x:p1.x,y:p1.y}}, p2:{{x:p2.x,y:p2.y}}, mid, dist:Math.sqrt(dx*dx+dy*dy) }};
+  }}
+  return {{ ids: [] }};
+}}
+
+function peBegin() {{
+  const snap = peSnapshot();
+  if (snap.ids.length === 0) return;
+  peMode = null;
+  peStart = {{ center:view.center, span:view.span, offset:view.offset, secPerCol:view.secPerCol, snap }};
+  isInteracting = true;
+  requestDraw();
+}}
+
+function peFinish() {{
+  peMode = null;
+  peStart = null;
+  if (isInteracting) {{
+    isInteracting = false;
+    scheduleSend(true);
+    requestDraw();
+  }}
+}}
+
+function peApply() {{
+  if (!peStart) return;
+  const snap = peSnapshot();
+  const s0 = peStart.snap;
+  if (snap.ids.length === 1 && s0.p1) {{
+    const dy = snap.p1.y - s0.p1.y;
+    const pricePerPx = view.span / Math.max(1, cv.height);
+    view.center = peStart.center + (-dy * pricePerPx);
+    view.follow = false;
+    scheduleSend(false);
+    requestDraw();
+    return;
+  }}
+  if (snap.ids.length >= 2 && s0.p1 && s0.p2) {{
+    const dx1 = snap.p1.x - s0.p1.x, dy1 = snap.p1.y - s0.p1.y;
+    const dx2 = snap.p2.x - s0.p2.x, dy2 = snap.p2.y - s0.p2.y;
+    const dxAvg = (dx1+dx2)/2, dyAvg = (dy1+dy2)/2;
+    const distDelta = (snap.dist - s0.dist);
+    const pinchThresh = 6;
+
+    if (Math.abs(distDelta) > pinchThresh) peMode = 'pinchPrice';
+    if (!peMode) peMode = (Math.abs(dxAvg) >= Math.abs(dyAvg)) ? 'scrubTime' : 'zoomTime';
+
+    if (peMode === 'pinchPrice') {{
+      const ratio = Math.max(0.25, Math.min(4.0, snap.dist / Math.max(1e-6, s0.dist)));
+      view.span = clamp(peStart.span / ratio, MIN_SPAN, MAX_SPAN);
+      const dyMid = (snap.mid.y - s0.mid.y);
+      const pricePerPx = view.span / Math.max(1, cv.height);
+      view.center = peStart.center + (-dyMid * pricePerPx);
+      view.follow = false;
+    }} else if (peMode === 'scrubTime') {{
+      view.offset = clamp(peStart.offset - (dxAvg * peStart.secPerCol), -MAX_OFFSET, 0);
+      view.follow = (view.offset === 0);
+    }} else if (peMode === 'zoomTime') {{
+      const factor = Math.exp(dyAvg / 220.0);
+      view.secPerCol = clamp(peStart.secPerCol * factor, MIN_SEC_PER_COL, MAX_SEC_PER_COL);
+    }}
+    scheduleSend(false);
+    requestDraw();
+    return;
+  }}
+}}
+
+cv.addEventListener('pointerdown', (ev) => {{
+  try {{ cv.setPointerCapture(ev.pointerId); }} catch(e) {{}}
+  ptrs.set(ev.pointerId, {{x:ev.clientX, y:ev.clientY}});
+  if (ptrs.size === 1 || ptrs.size === 2) peBegin();
+  ev.preventDefault();
+}}, {{ passive:false }});
+
+cv.addEventListener('pointermove', (ev) => {{
+  if (!ptrs.has(ev.pointerId)) return;
+  ptrs.set(ev.pointerId, {{x:ev.clientX, y:ev.clientY}});
+  peApply();
+  ev.preventDefault();
+}}, {{ passive:false }});
+
+cv.addEventListener('pointerup', (ev) => {{
+  if (ptrs.has(ev.pointerId)) ptrs.delete(ev.pointerId);
+  if (ptrs.size === 0) peFinish();
+  ev.preventDefault();
+}}, {{ passive:false }});
+
+cv.addEventListener('pointercancel', (ev) => {{
+  ptrs.clear();
+  peFinish();
+  ev.preventDefault();
+}}, {{ passive:false }});
+
 
   // JUMP button => return to LIVE follow and offset=0
   jumpBtn.addEventListener('click', () => {{
@@ -1486,6 +1594,8 @@ def _ui_html() -> str:
   // --- WebSocket render feed ---
   let ws = null;
   let wsOpen = false;
+  let wsRetryMs = 250;
+  let wsTimer = null;
 
   function setHealth(h) {{
     healthEl.innerHTML = '<strong>HEALTH:</strong> ' + h;
