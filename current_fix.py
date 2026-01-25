@@ -804,9 +804,9 @@ def _ui_html() -> str:
     .endpoints a {{ display:inline-block; margin-right:12px; }}
     pre {{ white-space: pre-wrap; word-break: break-word; }}
   
-    .badge { padding:6px 10px; border-radius:999px; font-weight:700; font-size:12px; }
-    .badge-live { background:#e6f6ea; color:#1b7f3c; border:1px solid #b9e5c6; }
-    .badge-hist { background:#f2f2f2; color:#555; border:1px solid #ddd; }
+    .badge {{ padding:6px 10px; border-radius:999px; font-weight:700; font-size:12px; }}
+    .badge-live {{ background:#e6f6ea; color:#1b7f3c; border:1px solid #b9e5c6; }}
+    .badge-hist {{ background:#f2f2f2; color:#555; border:1px solid #ddd; }}
 
   </style>
 </head>
