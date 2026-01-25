@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =========================================================
-# QuantDesk Bookmap Service — FIX17_HEATMAP_DENSITY_LAYER
+# QuantDesk Bookmap Service — FIX17_HEATMAP_TIME_DENSITY_LAYER
 #
 # Builds on FIX14 (parity-safe incremental book):
 # - Maintains canonical CLOB via incremental merge (no side wipeouts)
@@ -29,8 +29,6 @@
 
 import asyncio
 import json
-import urllib.request
-import urllib.parse
 import math
 import os
 import time
@@ -52,8 +50,6 @@ PORT = int(os.environ.get("PORT", "5000"))
 
 SYMBOL = os.environ.get("QD_SYMBOL", "BTC_USDT")
 WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
-REST_DEPTH_URL = os.environ.get("QD_REST_DEPTH_URL", "https://contract.mexc.com/api/v1/contract/depth/")
-
 
 # Render controls (minimal)
 RENDER_FPS = float(os.environ.get("QD_RENDER_FPS", "8"))
@@ -69,6 +65,16 @@ RENDER_STEP = float(os.environ.get("QD_STEP", "0.1"))      # price tick for ladd
 ANCHOR_ALPHA = float(os.environ.get("QD_ANCHOR_ALPHA", "0.25"))  # smoothing factor
 ANCHOR_HISTORY_SEC = float(os.environ.get("QD_ANCHOR_HISTORY_SEC", "90"))  # overlay window seconds
 
+# Bookmap parity pivot — FIX20/P01
+# Absolute price grid + horizontal time ring buffer + camera viewport.
+BM_BASE_COL_DT = float(os.environ.get("QD_BM_BASE_COL_DT", "0.25"))   # seconds per base column (producer cadence)
+BM_MAX_COLS = int(os.environ.get("QD_BM_MAX_COLS", "1200"))           # ring buffer width (columns)
+BM_DEFAULT_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_PRICE_SPAN_BINS", "700"))  # visible price bins (zoom)
+BM_DEFAULT_TIME_WINDOW_S = float(os.environ.get("QD_BM_TIME_WINDOW_S", "90"))     # target visible time span in seconds at default scale
+BM_MAX_DOWNSAMPLE = int(os.environ.get("QD_BM_MAX_DOWNSAMPLE", "64"))             # max column skip factor at extreme zoom-out
+BM_MIN_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_MIN_PRICE_SPAN_BINS", "80"))
+BM_MAX_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_MAX_PRICE_SPAN_BINS", "6000"))
+
 # Book bounds (avoid unbounded growth)
 MAX_LEVELS_PER_SIDE = int(os.environ.get("QD_MAX_LEVELS_PER_SIDE", "1200"))
 
@@ -79,10 +85,6 @@ def _now() -> float:
     return time.time()
 
 
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 def bootlog(msg: str) -> None:
     try:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
@@ -150,7 +152,6 @@ class State:
     status: str = "INIT"  # INIT | CONNECTING | CONNECTED | ERROR
     last_error: Optional[str] = None
     reconnects: int = 0
-    ws_reconnects: int = 0
     frames: int = 0
     last_event_ts: Optional[float] = None
 
@@ -167,6 +168,20 @@ class State:
     heat_ask: Dict[float, float] = field(default_factory=dict)
     heat_last_ts: Optional[float] = None
 
+    # Bookmap tape (FIX20): time ring buffer of liquidity snapshots in absolute price bins.
+    # Each column is {"ts": float, "col": Dict[int, float]} where keys are price_idx.
+    bm_tick: float = 0.1  # inferred/overridden tick size for price binning
+    bm_min_idx_seen: Optional[int] = None
+    bm_max_idx_seen: Optional[int] = None
+    bm_tape: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=BM_MAX_COLS))
+    bm_last_col_ts: Optional[float] = None
+
+    # Default camera state (server-side hints; UI owns interaction)
+    bm_center_idx: Optional[int] = None
+    bm_price_span_bins: int = BM_DEFAULT_PRICE_SPAN_BINS
+    bm_time_offset_cols: int = 0
+    bm_time_downsample: int = 1
+
     # Debug
     last_raw: Optional[Dict[str, Any]] = None
 
@@ -175,11 +190,6 @@ class State:
     trade_msgs: int = 0
     depth_updates_applied: int = 0
     snapshots_seen: int = 0
-
-    # REST snapshot seeding telemetry
-    rest_seed_ok: int = 0
-    rest_seed_err: int = 0
-    last_rest_seed_ms: int = 0
 
 
 STATE = State()
@@ -194,96 +204,6 @@ def _mid_px() -> Optional[float]:
     if STATE.trades:
         return STATE.trades[-1].px
     return bb or ba
-
-
-
-def _render_frame(levels: int, step: float, pan_ticks: int = 0, **_kw) -> Dict[str, Any]:
-    ts = _now()
-    mid = _mid_px()
-    if mid is not None and pan_ticks:
-        try:
-            mid = float(mid) + float(pan_ticks) * float(step)
-        except Exception:
-            pass
-    if mid is not None and pan_ticks:
-        try:
-            mid = float(mid) + float(pan_ticks) * float(step)
-        except Exception:
-            pass
-    bb = STATE.book.best_bid
-    ba = STATE.book.best_ask
-
-    # Create a symmetric ladder around mid if possible
-    prices: List[float] = []
-    bid_qty: List[float] = []
-    ask_qty: List[float] = []
-
-    if mid is not None and step > 0 and levels > 0:
-        center = round(mid / step) * step
-        half = levels // 2
-        start = center - half * step
-        for i in range(levels):
-            px = round(start + i * step, 10)
-            prices.append(px)
-            bid_qty.append(float(STATE.book.bids.get(px, 0.0)))
-            ask_qty.append(float(STATE.book.asks.get(px, 0.0)))
-
-    # Tape (last N, newest last)
-    tape = [
-        {"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side}
-        for t in list(STATE.trades)[-50:]
-    ]
-
-    last_event_age = None
-    if STATE.last_event_ts is not None:
-        last_event_age = ts - STATE.last_event_ts
-
-    return {
-        "ts": ts,
-        "service": SERVICE,
-        "build": BUILD,
-        "symbol": SYMBOL,
-        "ws_url": WS_URL,
-        "health": "GREEN" if STATE.status == "CONNECTED" else ("YELLOW" if STATE.status in ("INIT", "CONNECTING") else "RED"),
-        "connector": {
-            "status": STATE.status,
-            "frames": STATE.frames,
-            "reconnects": STATE.reconnects,
-            "last_error": STATE.last_error,
-            "last_event_age_s": last_event_age,
-        },
-        "book": {
-            "best_bid": bb,
-            "best_ask": ba,
-            "version": STATE.book.version,
-            "depth_counts": {"bids": len(STATE.book.bids), "asks": len(STATE.book.asks)},
-            "totals": {"bid_qty": STATE.book.bid_qty_total, "ask_qty": STATE.book.ask_qty_total},
-            "last_update_ts": STATE.book.last_update_ts,
-        },
-        "tape": {
-            "trades_seen": len(STATE.trades),
-            "last_trade_px": STATE.trades[-1].px if STATE.trades else None,
-            "last_trade_qty": STATE.trades[-1].qty if STATE.trades else None,
-            "last_trade_side": STATE.trades[-1].side if STATE.trades else None,
-            "last_trade_ts": STATE.trades[-1].ts if STATE.trades else None,
-            "items": tape,
-        },
-        "render": {
-            "levels": levels,
-            "step": step,
-            "mid_px": mid,
-            "prices": prices,
-            "bid_qty": bid_qty,
-            "ask_qty": ask_qty,
-        },
-    }
-
-
-# ----------------------------
-# FastAPI App (with lifespan)
-# ----------------------------
-
-app = FastAPI(title="QuantDesk Bookmap", version=BUILD)
 
 
 def _update_anchor() -> Optional[float]:
@@ -335,7 +255,7 @@ def _apply_side_updates(side: Dict[float, float], raw_levels: Any) -> int:
         qty = None
         if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
             px = _as_float(lvl[0])
-            qty = _as_float(lvl[2] if len(lvl) >= 3 else lvl[1])
+            qty = _as_float(lvl[1])
         elif isinstance(lvl, dict):
             px = _as_float(lvl.get("price") or lvl.get("p"))
             qty = _as_float(lvl.get("quantity") or lvl.get("q"))
@@ -490,91 +410,26 @@ def _route_message(obj: Dict[str, Any]) -> None:
 # Connector loop (resilient)
 # ----------------------------
 
-
-
-
-async def _rest_seed_depth_snapshot(symbol: str) -> None:
-    """Seed local book from REST depth snapshot for correctness and fast first paint.
-
-    Official REST: GET /api/v1/contract/depth/{symbol}
-    Schema: asks/bids levels are [price, orderNumbers, quantity]
-    """
-    global BOOK_VERSION, BOOK_TS_MS, BOOK_LAST_TOUCH_MS
-
-    try:
-        url = urllib.parse.urljoin(REST_DEPTH_URL, urllib.parse.quote(symbol))
-        def _fetch() -> dict:
-            with urllib.request.urlopen(url, timeout=8) as r:
-                raw = r.read()
-            return json.loads(raw.decode("utf-8", errors="replace"))
-
-        payload = await asyncio.to_thread(_fetch)
-        data = payload.get("data") or {}
-
-        asks = data.get("asks") or []
-        bids = data.get("bids") or []
-        version = int(data.get("version") or 0)
-        ts_ms = int(data.get("timestamp") or 0)
-        now_ms = _now_ms()
-
-        if not asks and not bids:
-            return
-
-        with BOOK_LOCK:
-            BOOK_ASKS.clear()
-            BOOK_BIDS.clear()
-            _apply_side_updates(BOOK_ASKS, asks, is_ask=True)
-            _apply_side_updates(BOOK_BIDS, bids, is_ask=False)
-            BOOK_VERSION = max(BOOK_VERSION, version)
-            BOOK_TS_MS = ts_ms or now_ms
-            BOOK_LAST_TOUCH_MS = now_ms
-
-        STATE.rest_seed_ok += 1
-        STATE.last_rest_seed_ms = now_ms
-    except Exception:
-        STATE.rest_seed_err += 1
-        STATE.last_rest_seed_ms = _now_ms()
-        return
-
-
 async def _connector_loop() -> None:
-    """Maintain a resilient WS connection to MEXC contract market stream.
-
-    IMPORTANT: MEXC requires an *application-level* ping (method: ping) at least once per minute,
-    otherwise the server closes the connection (often with close code 1005 / no status).
-    """
     backoff = 1.0
     while True:
-        ping_task = None
         try:
             STATE.status = "CONNECTING"
             STATE.last_error = None
             bootlog(f"CONNECTING ws={WS_URL} symbol={SYMBOL}")
-            # Seed with REST snapshot so the book has a correct baseline even before WS updates.
-            await _rest_seed_depth_snapshot(SYMBOL)
 
-            async with websockets.connect(
-                WS_URL,
-                ping_interval=None,   # we do app-level ping; avoid double-ping behavior
-                ping_timeout=None,
-                close_timeout=5,
-                max_queue=2048,
-            ) as ws:
-
-                async def _app_ping_loop() -> None:
-                    # Ping more frequently than the 60s requirement to be safe.
-                    while True:
-                        try:
-                            await ws.send(json.dumps({"method": "ping"}))
-                        except Exception:
-                            return
-                        await asyncio.sleep(15)
-
-                ping_task = asyncio.create_task(_app_ping_loop())
-
-                # Subscribe to depth + trades (docs: sub.depth / sub.deal with param.symbol)
-                await ws.send(json.dumps({"method": "sub.depth", "param": {"symbol": SYMBOL}}))
-                await ws.send(json.dumps({"method": "sub.deal", "param": {"symbol": SYMBOL}}))
+            async with websockets.connect(WS_URL, ping_interval=15, ping_timeout=15, close_timeout=5) as ws:
+                # Subscribe to depth + trades
+                sub_depth = {
+                    "method": "sub.depth",
+                    "param": {"symbol": SYMBOL, "depth": 200},
+                }
+                sub_trade = {
+                    "method": "sub.deal",
+                    "param": {"symbol": SYMBOL},
+                }
+                await ws.send(json.dumps(sub_depth))
+                await ws.send(json.dumps(sub_trade))
 
                 STATE.status = "CONNECTED"
                 backoff = 1.0
@@ -585,30 +440,393 @@ async def _connector_loop() -> None:
                         obj = json.loads(msg)
                     except Exception:
                         continue
-
-                    # Some servers respond to ping with a pong payload; ignore safely.
-                    ch = obj.get("channel") if isinstance(obj, dict) else None
-                    if ch in ("pong", "rs.pong") or obj.get("method") == "pong":
-                        continue
-
                     _route_message(obj)
 
         except Exception as e:
             STATE.status = "ERROR"
-            STATE.last_error = f"{type(e).__name__}: {e}"
-            STATE.ws_reconnects += 1
+            STATE.last_error = str(e)
             STATE.reconnects += 1
-            bootlog(f"WS ERROR: {STATE.last_error}")
-        finally:
-            if ping_task is not None:
+            bootlog(f"WS ERROR: {e} (reconnects={STATE.reconnects})")
+
+            # bounded exponential backoff with jitter
+            await asyncio.sleep(backoff + (0.1 * backoff * (0.5 - (time.time() % 1.0))))
+            backoff = min(backoff * 1.8, 20.0)
+
+
+# ----------------------------
+
+# ----------------------------
+# Heatmap (FIX17): decayed liquidity intensity per price
+# ----------------------------
+
+def _heat_decay_factor(dt: float) -> float:
+    # exponential decay by half-life
+    if dt <= 0:
+        return 1.0
+    hl = max(0.5, float(HEAT_HALFLIFE_S))
+    return math.exp(-math.log(2.0) * dt / hl)
+
+def _heat_update_and_extract(prices: List[float], bid_qty: List[float], ask_qty: List[float]) -> Tuple[List[float], List[float]]:
+    """Update decayed heat maps and return normalized heat arrays aligned to `prices`."""
+    if not prices:
+        return [], []
+    ts = _now()
+    if STATE.heat_last_ts is None:
+        dt = 0.0
+    else:
+        dt = max(0.0, ts - float(STATE.heat_last_ts))
+    decay = _heat_decay_factor(dt)
+    STATE.heat_last_ts = ts
+
+    # Update intensities for current visible window
+    # Safety: limit dict growth
+    pmin = prices[0]
+    pmax = prices[-1]
+    # Because prices are ascending, this defines the visible range
+    for i, px in enumerate(prices):
+        bq = float(bid_qty[i] or 0.0)
+        aq = float(ask_qty[i] or 0.0)
+        if bq > 0.0:
+            prev = float(STATE.heat_bid.get(px, 0.0)) * decay
+            STATE.heat_bid[px] = max(prev, bq)
+        else:
+            # still decay existing
+            if px in STATE.heat_bid:
+                STATE.heat_bid[px] = float(STATE.heat_bid[px]) * decay
+
+        if aq > 0.0:
+            prev = float(STATE.heat_ask.get(px, 0.0)) * decay
+            STATE.heat_ask[px] = max(prev, aq)
+        else:
+            if px in STATE.heat_ask:
+                STATE.heat_ask[px] = float(STATE.heat_ask[px]) * decay
+
+    # Prune keys outside current view range and tiny values
+    def _prune_side(d: Dict[float, float]) -> None:
+        if not d:
+            return
+        # soft prune: remove out-of-range or near-zero
+        kill = []
+        for k, v in d.items():
+            if (k < pmin - 1e-9) or (k > pmax + 1e-9) or (v <= 0.0) or (v < 1e-9):
+                kill.append(k)
+        for k in kill:
+            try:
+                del d[k]
+            except Exception:
+                pass
+        # hard cap
+        if len(d) > HEAT_MAX_KEYS:
+            # drop smallest values
+            items = sorted(d.items(), key=lambda kv: kv[1])
+            for k, _ in items[: max(0, len(d) - HEAT_MAX_KEYS)]:
                 try:
-                    ping_task.cancel()
+                    del d[k]
                 except Exception:
                     pass
 
-        await asyncio.sleep(backoff)
-        backoff = min(backoff * 1.5, 30.0)
+    _prune_side(STATE.heat_bid)
+    _prune_side(STATE.heat_ask)
 
+    # Extract aligned arrays
+    hb = [float(STATE.heat_bid.get(px, 0.0)) for px in prices]
+    ha = [float(STATE.heat_ask.get(px, 0.0)) for px in prices]
+
+    # Normalize with log scaling to [0,1]
+    # Use max over window; avoid divide by 0
+    vmax = max(1e-9, max(hb + ha + [1e-9]))
+    denom = math.log1p(vmax)
+    if denom <= 0:
+        return [0.0 for _ in hb], [0.0 for _ in ha]
+
+    def _norm(v: float) -> float:
+        return min(1.0, max(0.0, math.log1p(max(0.0, v)) / denom))
+
+    hb_n = [_norm(v) for v in hb]
+    ha_n = [_norm(v) for v in ha]
+    return hb_n, ha_n
+
+# Render frame (bridge contract)
+# ----------------------------
+
+
+# ----------------------------
+# Bookmap tape (FIX20): absolute price grid + time ring buffer
+# ----------------------------
+
+def _infer_tick_from_book() -> float:
+    """Infer a plausible tick size from current book levels.
+    This is a best-effort heuristic; if it fails we fall back to current STATE.bm_tick.
+    """
+    try:
+        # sample up to 50 nearest levels across bids+asks
+        pxs = []
+        if STATE.book.best_bid is not None:
+            pxs.extend(sorted(STATE.book.bids.keys(), reverse=True)[:25])
+        if STATE.book.best_ask is not None:
+            pxs.extend(sorted(STATE.book.asks.keys())[:25])
+        pxs = sorted(set(float(p) for p in pxs))
+        if len(pxs) < 3:
+            return float(STATE.bm_tick)
+        diffs = []
+        for a,b in zip(pxs, pxs[1:]):
+            d = abs(b-a)
+            if d > 0:
+                diffs.append(d)
+        if not diffs:
+            return float(STATE.bm_tick)
+        # pick a low quantile to approximate the smallest regular increment
+        diffs.sort()
+        cand = diffs[max(0, int(0.10*len(diffs))-1)]
+        # snap to reasonable decimals
+        if cand >= 1:
+            tick = round(cand, 2)
+        elif cand >= 0.1:
+            tick = round(cand, 3)
+        else:
+            tick = round(cand, 6)
+        # safety clamp
+        if tick <= 0:
+            return float(STATE.bm_tick)
+        return float(tick)
+    except Exception:
+        return float(STATE.bm_tick)
+
+
+def _price_to_idx(price: float, tick: float) -> int:
+    return int(round(float(price) / float(tick)))
+
+
+def _idx_to_price(idx: int, tick: float) -> float:
+    return float(idx) * float(tick)
+
+
+def _build_bm_column(tick: float) -> Dict[str, Any]:
+    """Build a sparse column from current book state."""
+    ts = _now()
+    col: Dict[int, float] = {}
+    # sample limited depth for performance; keep closest liquidity
+    bids = sorted(STATE.book.bids.items(), key=lambda kv: kv[0], reverse=True)[:MAX_LEVELS_PER_SIDE]
+    asks = sorted(STATE.book.asks.items(), key=lambda kv: kv[0])[:MAX_LEVELS_PER_SIDE]
+
+    def add(px: float, qty: float) -> None:
+        if qty <= 0:
+            return
+        idx = _price_to_idx(px, tick)
+        # intensity: log scaling for stability across regimes
+        v = math.log1p(float(qty))
+        col[idx] = col.get(idx, 0.0) + v
+        if STATE.bm_min_idx_seen is None or idx < STATE.bm_min_idx_seen:
+            STATE.bm_min_idx_seen = idx
+        if STATE.bm_max_idx_seen is None or idx > STATE.bm_max_idx_seen:
+            STATE.bm_max_idx_seen = idx
+
+    for px, qty in bids:
+        add(float(px), float(qty))
+    for px, qty in asks:
+        add(float(px), float(qty))
+
+    return {"ts": ts, "col": col}
+
+
+async def _bm_tape_loop() -> None:
+    """Continuously append columns into the Bookmap tape ring buffer."""
+    # Warm start
+    await asyncio.sleep(0.25)
+    while True:
+        try:
+            # Only build columns when book is at least minimally populated
+            if STATE.book.best_bid is None or STATE.book.best_ask is None or (len(STATE.book.bids) == 0) or (len(STATE.book.asks) == 0):
+                await asyncio.sleep(0.25)
+                continue
+
+            # Update tick estimate slowly
+            inferred = _infer_tick_from_book()
+            if inferred > 0:
+                # low-pass to avoid jumpiness
+                STATE.bm_tick = 0.9*float(STATE.bm_tick) + 0.1*float(inferred)
+
+            tick = float(STATE.bm_tick)
+
+            # cadence
+            ts = _now()
+            if STATE.bm_last_col_ts is not None and (ts - STATE.bm_last_col_ts) < BM_BASE_COL_DT:
+                await asyncio.sleep(max(0.01, BM_BASE_COL_DT*0.5))
+                continue
+
+            col = _build_bm_column(tick)
+            STATE.bm_last_col_ts = col["ts"]
+            STATE.bm_tape.append(col)
+
+            # Set default camera center if missing
+            if STATE.bm_center_idx is None:
+                mid = _mid_px()
+                if mid is not None:
+                    STATE.bm_center_idx = _price_to_idx(float(mid), tick)
+
+            await asyncio.sleep(max(0.01, BM_BASE_COL_DT))
+        except Exception:
+            # Never crash the service due to tape generation
+            await asyncio.sleep(0.25)
+
+def _render_frame(levels: int, step: float, pan_ticks: float = 0.0, *, bm_center_idx: Optional[int] = None, bm_price_span_bins: Optional[int] = None, bm_time_offset_cols: int = 0, bm_time_downsample: int = 1) -> Dict[str, Any]:
+    ts = _now()
+    anchor = _update_anchor()
+    view_anchor = None
+    if anchor is not None:
+        # pan_ticks shifts the view window in units of current step
+        try:
+            view_anchor = float(anchor) + float(pan_ticks) * float(step)
+        except Exception:
+            view_anchor = float(anchor)
+    bb = STATE.book.best_bid
+    ba = STATE.book.best_ask
+
+    # Determine ladder around anchor
+    prices: List[float] = []
+    bid_qty: List[float] = []
+    ask_qty: List[float] = []
+
+    if view_anchor is not None and step > 0 and levels > 0:
+        center = round(view_anchor / step) * step
+        half = levels // 2
+        start = center - half * step
+
+        # NOTE: prices are ascending low->high; UI will map high->top (axis fix)
+        for i in range(levels):
+            px = round(start + i * step, 10)
+            prices.append(px)
+            bid_qty.append(float(STATE.book.bids.get(px, 0.0)))
+            ask_qty.append(float(STATE.book.asks.get(px, 0.0)))
+
+    
+    # Heatmap density (FIX17): update decayed liquidity intensity and extract normalized arrays
+    heat_bid, heat_ask = _heat_update_and_extract(prices, bid_qty, ask_qty)
+# Trades (last N)
+    tape = [{"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side} for t in list(STATE.trades)[-60:]]
+
+    # Anchor history for time window overlay
+    hist = [{"ts": hts, "px": hpx} for (hts, hpx) in list(STATE.anchor_hist)[-900:]]
+
+
+    # Bookmap viewport slice (FIX20): absolute price grid + horizontal time columns
+    tick = float(STATE.bm_tick) if getattr(STATE, "bm_tick", None) else float(RENDER_STEP)
+    if bm_center_idx is None:
+        bm_center_idx = STATE.bm_center_idx
+    if bm_price_span_bins is None:
+        bm_price_span_bins = int(STATE.bm_price_span_bins)
+
+    bm_center_idx = int(bm_center_idx) if bm_center_idx is not None else None
+    bm_price_span_bins = int(max(BM_MIN_PRICE_SPAN_BINS, min(BM_MAX_PRICE_SPAN_BINS, bm_price_span_bins)))
+
+    bm_time_offset_cols = int(max(0, bm_time_offset_cols))
+    bm_time_downsample = int(max(1, min(BM_MAX_DOWNSAMPLE, bm_time_downsample)))
+
+    bm_view = {
+        "tick": tick,
+        "center_idx": bm_center_idx,
+        "price_span_bins": bm_price_span_bins,
+        "time_offset_cols": bm_time_offset_cols,
+        "time_downsample": bm_time_downsample,
+        "live": True,
+        "time_scale_s_per_col": BM_BASE_COL_DT * bm_time_downsample,
+        "t_minus_s": 0.0,
+        "cols": [],
+        "min_idx": None,
+        "max_idx": None,
+    }
+
+    bm_tape_list = list(getattr(STATE, "bm_tape", []))
+    if bm_center_idx is not None and bm_price_span_bins > 0 and len(bm_tape_list) > 0:
+        half = bm_price_span_bins // 2
+        min_idx = bm_center_idx - half
+        max_idx = bm_center_idx + half
+        bm_view["min_idx"] = int(min_idx)
+        bm_view["max_idx"] = int(max_idx)
+
+        # Determine which columns to show
+        # We keep a target visible time span; downsample controls scale.
+        target_cols = max(120, min(900, int(BM_DEFAULT_TIME_WINDOW_S / (BM_BASE_COL_DT * bm_time_downsample))))
+        newest_ix = len(bm_tape_list) - 1
+        right_ix = max(0, newest_ix - bm_time_offset_cols)
+        left_ix = max(0, right_ix - target_cols * bm_time_downsample)
+
+        # build columns from left->right, skipping by downsample
+        cols = []
+        idxs = list(range(left_ix, right_ix + 1, bm_time_downsample))
+        for j in idxs[-target_cols:]:
+            c = bm_tape_list[j]
+            sparse = c.get("col", {})
+            # Filter to viewport
+            pts = [[int(k), float(v)] for (k, v) in sparse.items() if min_idx <= int(k) <= max_idx]
+            cols.append({"ts": float(c.get("ts", ts)), "pts": pts})
+        bm_view["cols"] = cols
+        bm_view["live"] = (bm_time_offset_cols == 0)
+        if not bm_view["live"] and len(cols) > 0:
+            bm_view["t_minus_s"] = float(bm_tape_list[right_ix].get("ts", ts)) - float(cols[-1]["ts"])
+            # approximate offset from newest
+            newest_ts = float(bm_tape_list[newest_ix].get("ts", ts))
+            cur_ts = float(bm_tape_list[right_ix].get("ts", ts))
+            bm_view["t_minus_s"] = max(0.0, newest_ts - cur_ts)
+    last_event_age = None
+    if STATE.last_event_ts is not None:
+        last_event_age = ts - STATE.last_event_ts
+
+    # Health gating:
+    # - GREEN only if connected AND fresh data AND parity ok
+    # - YELLOW if warming / no frames yet / not connected
+    # - RED if connector ERROR
+    parity_ok = (bb is not None) and (ba is not None) and (len(STATE.book.bids) > 0) and (len(STATE.book.asks) > 0)
+    fresh = (STATE.last_event_ts is not None) and ((ts - STATE.last_event_ts) <= 5.0)
+    if STATE.status == "ERROR":
+        health = "RED"
+    elif STATE.status == "CONNECTED" and fresh and parity_ok:
+        health = "GREEN"
+    else:
+        health = "YELLOW"
+
+    return {
+        "ts": ts,
+        "service": SERVICE,
+        "build": BUILD,
+        "symbol": SYMBOL,
+        "ws_url": WS_URL,
+        "health": health,
+        "connector": {
+            "status": STATE.status,
+            "frames": STATE.frames,
+            "reconnects": STATE.reconnects,
+            "last_error": STATE.last_error,
+            "last_event_age_s": last_event_age,
+            "depth_msgs": STATE.depth_msgs,
+            "trade_msgs": STATE.trade_msgs,
+            "depth_updates_applied": STATE.depth_updates_applied,
+        },
+        "book": {
+            "best_bid": bb,
+            "best_ask": ba,
+            "version": STATE.book.version,
+            "depth_counts": {"bids": len(STATE.book.bids), "asks": len(STATE.book.asks)},
+            "totals": {"bid_qty": STATE.book.bid_qty_total, "ask_qty": STATE.book.ask_qty_total},
+            "last_update_ts": STATE.book.last_update_ts,
+        },
+        "tape": {"items": tape},
+        "render": {
+            "levels": levels,
+            "step": step,
+            "anchor_px": view_anchor,
+            "base_step": RENDER_STEP,
+            "pan_ticks": pan_ticks,
+            "heat_alpha": HEAT_ALPHA,
+            "prices": prices,
+            "bid_qty": bid_qty,
+            "ask_qty": ask_qty,
+            "heat_bid": heat_bid,
+            "heat_ask": heat_ask,
+            "anchor_hist": hist,
+            "bm": bm_view,
+        },
+    }
 
 
 # ----------------------------
@@ -622,6 +840,7 @@ app = FastAPI(title="QuantDesk Bookmap", version=BUILD)
 async def _startup() -> None:
     bootlog(f"Starting {SERVICE} {BUILD} on {HOST}:{PORT}")
     asyncio.create_task(_connector_loop())
+    asyncio.create_task(_bm_tape_loop())
 
 
 @app.get("/bootlog.txt")
@@ -635,20 +854,13 @@ async def bootlog_txt() -> PlainTextResponse:
 
 @app.get("/health.json")
 async def health_json() -> JSONResponse:
-    try:
-        frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
-        payload = {"service": SERVICE, "build": BUILD, "health": frame.get("health"), "connector": frame.get("connector"), "book": frame.get("book")}
-    except Exception as e:
-        payload = {"service": SERVICE, "build": BUILD, "health": "RED", "connector": {"status": "ERROR", "last_error": repr(e)}, "book": {"best_bid": None, "best_ask": None}}
-    return JSONResponse(payload)
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
+    return JSONResponse({"service": SERVICE, "build": BUILD, "health": frame["health"], "connector": frame["connector"], "book": frame["book"]})
 
 
 @app.get("/telemetry.json")
 async def telemetry_json() -> JSONResponse:
-    try:
-        frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
-    except Exception as e:
-        frame = {"service": SERVICE, "build": BUILD, "symbol": SYMBOL, "status": "ERROR", "error": repr(e), "frames": STATE.frames, "ws_reconnects": STATE.ws_reconnects, "reconnects": STATE.reconnects, "last_update_ts": STATE.book.last_update_ts}
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
     return JSONResponse(frame)
 
 
@@ -703,11 +915,16 @@ async def render_ws(ws: WebSocket) -> None:
 
     # Per-connection interactive view state (mutable)
     view_state = {
+        # legacy ladder view params (kept for backward compatibility)
         "levels": int(RENDER_LEVELS),
         "step": float(RENDER_STEP),
         "pan_ticks": 0.0,
-        "t_offset": 0.0,
-        "t_scale": 1.0,
+
+        # Bookmap camera params (FIX20)
+        "bm_center_idx": None,
+        "bm_price_span_bins": int(BM_DEFAULT_PRICE_SPAN_BINS),
+        "bm_time_offset_cols": 0,
+        "bm_time_downsample": 1,
     }
 
     def _apply_view(payload: dict) -> None:
@@ -725,16 +942,19 @@ async def render_ws(ws: WebSocket) -> None:
                 pt = float(payload["pan_ticks"])
                 view_state["pan_ticks"] = max(-2000.0, min(pt, 2000.0))
 
-            if "t_offset" in payload:
-                try:
-                    view_state["t_offset"] = max(0.0, float(payload["t_offset"]))
-                except Exception:
-                    pass
-            if "t_scale" in payload:
-                try:
-                    view_state["t_scale"] = max(0.25, min(6.0, float(payload["t_scale"])))
-                except Exception:
-                    pass
+            # Bookmap camera (FIX20)
+            if "bm_center_idx" in payload and payload["bm_center_idx"] is not None:
+                ci = int(payload["bm_center_idx"])
+                view_state["bm_center_idx"] = ci
+            if "bm_price_span_bins" in payload:
+                ps = int(payload["bm_price_span_bins"])
+                view_state["bm_price_span_bins"] = max(int(BM_MIN_PRICE_SPAN_BINS), min(int(BM_MAX_PRICE_SPAN_BINS), ps))
+            if "bm_time_offset_cols" in payload:
+                to = int(payload["bm_time_offset_cols"])
+                view_state["bm_time_offset_cols"] = max(0, to)
+            if "bm_time_downsample" in payload:
+                td = int(payload["bm_time_downsample"])
+                view_state["bm_time_downsample"] = max(1, min(int(BM_MAX_DOWNSAMPLE), td))
         except Exception:
             # ignore malformed values
             return
@@ -761,6 +981,10 @@ async def render_ws(ws: WebSocket) -> None:
                 int(view_state["levels"]),
                 float(view_state["step"]),
                 pan_ticks=float(view_state["pan_ticks"]),
+                bm_center_idx=view_state.get("bm_center_idx"),
+                bm_price_span_bins=int(view_state.get("bm_price_span_bins", BM_DEFAULT_PRICE_SPAN_BINS)),
+                bm_time_offset_cols=int(view_state.get("bm_time_offset_cols", 0)),
+                bm_time_downsample=int(view_state.get("bm_time_downsample", 1)),
             )
             STATE.frames += 1
             await ws.send_text(json.dumps(frame))
@@ -774,509 +998,396 @@ async def render_ws(ws: WebSocket) -> None:
             pass
 
 
+
 def _ui_html() -> str:
-    # Minimal bridge demo:
-    # - Canvas ladder view
-    # - Price axis corrected: higher prices at top
-    # - Time-window overlay: anchor history line
+    # Bookmap parity demo (FIX20):
+    # - Absolute price axis (bins) + horizontal time columns
+    # - Camera viewport (price pan/zoom, time scrub/zoom)
+    # - iPad-first gestures:
+    #     1-finger vertical drag: price pan
+    #     pinch: price zoom
+    #     2-finger horizontal drag: time scrub
+    #     2-finger vertical drag: time zoom (downsample)
     return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
   <title>QuantDesk Bookmap</title>
   <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }}
-    .top {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
-    .pill {{ padding:6px 10px; border-radius:999px; border:1px solid #ddd; font-weight:600; }}
-    .pill.green {{ border-color:#2e7d32; color:#2e7d32; }}
-    .pill.yellow {{ border-color:#f9a825; color:#8a6d00; }}
-    .pill.red {{ border-color:#c62828; color:#c62828; }}
-    .muted {{ color:#666; }}
-    .grid {{ display:grid; grid-template-columns: 1fr; gap:14px; margin-top:16px; max-width: 1100px; }}
-    @media (min-width: 980px) {{
-      .grid {{ grid-template-columns: 1.2fr 0.8fr; }}
+    html, body {{ height: 100%; margin: 0; background: #0b0f14; color: #e6eef8; }}
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; overflow:hidden; }}
+    #topbar {{
+      position: fixed; left: 0; right: 0; top: 0;
+      display: flex; gap: 10px; align-items: center; padding: 10px 12px;
+      background: rgba(11,15,20,0.88); backdrop-filter: blur(8px);
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      z-index: 20;
     }}
-    .card {{ border:1px solid #eee; border-radius:12px; padding:12px; box-shadow: 0 1px 8px rgba(0,0,0,0.04); }}
-    canvas {{ width:100%; height:520px; border:1px solid #eee; border-radius:12px; background:#fff; touch-action:none; user-select:none; -webkit-user-select:none; }}
-    .small {{ font-size: 12px; }}
+    .pill {{ padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.14); font-weight: 650; font-size: 13px; }}
+    .pill.green {{ border-color: rgba(46,125,50,0.8); color: #76ff7a; }}
+    .pill.yellow {{ border-color: rgba(249,168,37,0.8); color: #ffd36b; }}
+    .pill.red {{ border-color: rgba(198,40,40,0.8); color: #ff8a80; }}
+    .spacer {{ flex: 1; }}
+    .muted {{ opacity: 0.8; font-size: 13px; }}
+    #cvwrap {{ position: fixed; left: 0; right: 0; top: 52px; bottom: 0; }}
+    canvas {{ display:block; width: 100%; height: 100%; touch-action: none; }}
+    #hint {{
+      position: fixed; left: 12px; bottom: 12px;
+      font-size: 12px; opacity: 0.75; background: rgba(0,0,0,0.25);
+      padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.08);
+      max-width: 70ch;
+    }}
     a {{ color: inherit; }}
-    .endpoints a {{ display:inline-block; margin-right:12px; }}
-    pre {{ white-space: pre-wrap; word-break: break-word; }}
-  
-    .badge {{ padding:6px 10px; border-radius:999px; font-weight:700; font-size:12px; }}
-    .badge-live {{ background:#e6f6ea; color:#1b7f3c; border:1px solid #b9e5c6; }}
-    .badge-hist {{ background:#f2f2f2; color:#555; border:1px solid #ddd; }}
-
   </style>
 </head>
 <body>
-  <h1>QuantDesk Bookmap</h1>
-  <div class="top">
+  <div id="topbar">
     <div id="health" class="pill yellow">HEALTH: YELLOW</div>
-    <div><b>Build:</b> {BUILD}</div>
-    <div><b>Symbol:</b> {SYMBOL}</div>
-    <div id="liveBadge" class="badge badge-live">LIVE</div>
-    <div id="timeInfo" class="muted small">time scale x1.00</div>
-    <div class="muted small">WS: {WS_URL}</div>
+    <div id="mode" class="pill">LIVE</div>
+    <div id="scale" class="pill">TIME: --</div>
+    <div id="offset" class="pill">OFFSET: --</div>
+    <div class="spacer"></div>
+    <div class="muted">{SERVICE} {BUILD} · {SYMBOL}</div>
   </div>
 
-  <div class="grid">
-    <div class="card">
-      <div class="muted">This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a moving anchored ladder (price travel) with interactive pan/zoom (FIX16) + heatmap density (FIX17). It is not a full Bookmap renderer yet.</div>
-      <div style="height:10px"></div>
-      <canvas id="cv" width="980" height="520"></canvas>
-      <div class="muted small" style="margin-top:8px;">Ladder: green = bids, red = asks. Axis: higher prices at top. Mid line shows anchor. Wheel/pinch = zoom, drag = pan.</div>
-    </div>
-
-    <div class="card">
-      <div><b>Endpoints</b></div>
-      <div class="endpoints small" style="margin-top:6px;">
-        <a href="/health.json">/health.json</a>
-        <a href="/telemetry.json">/telemetry.json</a>
-        <a href="/book.json">/book.json</a>
-        <a href="/tape.json">/tape.json</a>
-        <a href="/render.json">/render.json</a>
-        <a href="/raw.json">/raw.json</a>
-        <a href="/bootlog.txt">/bootlog.txt</a>
-      </div>
-      <div style="height:10px"></div>
-      <div class="muted small"><b>Status</b> (auto-refresh)</div>
-      <pre id="status" class="small"></pre>
-    </div>
+  <div id="cvwrap"><canvas id="cv"></canvas></div>
+  <div id="hint">
+    Gestures: 1-finger vertical pan (price), pinch (price zoom), 2-finger horizontal scrub (time), 2-finger vertical drag (time zoom).
+    Auto-follow ON by default; it turns OFF when you scrub away from LIVE.
   </div>
 
 <script>
 (() => {{
   const cv = document.getElementById('cv');
-  const ctx = cv.getContext('2d');
+  const ctx = cv.getContext('2d', {{ alpha: false }});
   const healthEl = document.getElementById('health');
-  const statusEl = document.getElementById('status');
+  const modeEl = document.getElementById('mode');
+  const scaleEl = document.getElementById('scale');
+  const offsetEl = document.getElementById('offset');
 
-  // Interactive view state (FIX16):
-  // - wheel / pinch zoom changes step
-  // - drag pans ladder in price ticks
-  let view = {{ levels: null, baseStep: null, step: null, zoom: 1.0, panTicks: 0.0 }}
-
-  // ----------------------------
-  // Time ring buffer + UI (FIX20)
-  // ----------------------------
-  const HIST_MAX = 1200; // frames
-  const hist = [];
-  function pushHist(frame){{
-    hist.push({{t: Date.now(), frame}});
-    if (hist.length > HIST_MAX) hist.splice(0, hist.length - HIST_MAX);
+  function resize() {{
+    const dpr = window.devicePixelRatio || 1;
+    const rect = cv.getBoundingClientRect();
+    cv.width = Math.max(1, Math.floor(rect.width * dpr));
+    cv.height = Math.max(1, Math.floor(rect.height * dpr));
   }}
-  function selectFrame(){{
-    if (hist.length === 0) return null;
-    const off = Math.round(view.tOffset);
-    const idx = Math.max(0, Math.min(hist.length-1, hist.length-1 - off));
-    return hist[idx].frame;
+  window.addEventListener('resize', resize, {{ passive: true }});
+  resize();
+
+  // View (camera) state owned by UI
+  const view = {{
+    centerIdx: null,        // price bin index
+    priceSpan: {BM_DEFAULT_PRICE_SPAN_BINS}, // bins
+    timeOffset: 0,          // columns from newest
+    timeDownsample: 1,      // 1=base scale; >1 zoom-out in time
+    autoFollow: true,
+  }};
+
+  // WS render bridge
+  let ws = null;
+  function wsUrl() {{
+    const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+    return proto + '//' + location.host + '/render.ws';
   }}
-  function historyOffsetMs(){{
-    if (hist.length === 0) return 0;
-    const off = Math.round(view.tOffset);
-    const idx = Math.max(0, Math.min(hist.length-1, hist.length-1 - off));
-    const tLatest = hist[hist.length-1].t;
-    const tSel = hist[idx].t;
-    return Math.max(0, tLatest - tSel);
-  }}
-  function setHistoryUI(){{
-    const badge = document.getElementById('liveBadge');
-    const info = document.getElementById('timeInfo');
-    if (!badge || !info) return;
-    const live = (view.tOffset <= 0.5);
-    badge.textContent = live ? 'LIVE' : 'HISTORY';
-    badge.className = live ? 'badge badge-live' : 'badge badge-hist';
-    const ms = historyOffsetMs();
-    const sec = Math.round(ms/100)/10.0;
-    info.textContent = live ? `time scale x${{view.tScale.toFixed(2)}}` : `offset T-${{sec}}s | scale x${{view.tScale.toFixed(2)}}`;
-  }}
-;
-  let wsRef = null;
 
-  function clamp(x, a, b) {{{{ return Math.max(a, Math.min(b, x)); }}}}
-
-  function sendView() {{{{
-    if (!wsRef || wsRef.readyState !== 1) return;
-    const payload = {{{{
-      cmd: "set_view",
-      levels: view.levels,
-      step: view.step,
-      pan_ticks: view.panTicks
-    }}}};
-    try {{{{ wsRef.send(JSON.stringify(payload)); }}}} catch(e) {{{{}}}}
-  }}}}
-
-
-  function setHealth(h) {{{{
+  function setHealth(h) {{
     healthEl.classList.remove('green','yellow','red');
     if (h === 'GREEN') healthEl.classList.add('green');
     else if (h === 'RED') healthEl.classList.add('red');
     else healthEl.classList.add('yellow');
-    healthEl.textContent = 'HEALTH: ' + h;
-  }}}}
+    healthEl.textContent = 'HEALTH: ' + (h || 'YELLOW');
+  }}
 
-  function fmt(x) {{{{
-    if (x === null || x === undefined) return 'null';
-    if (typeof x === 'number') {{{{
-      if (Math.abs(x) >= 1000) return x.toFixed(1);
-      return x.toFixed(2);
-    }}}}
-    return String(x);
-  }}}}
+  function fmtTimeScale(sPerCol) {{
+    if (!isFinite(sPerCol) || sPerCol <= 0) return '--';
+    if (sPerCol < 1) return sPerCol.toFixed(2) + 's/col';
+    if (sPerCol < 10) return sPerCol.toFixed(1) + 's/col';
+    return Math.round(sPerCol) + 's/col';
+  }}
 
-  function draw(frame) {{{{
-    const W = cv.width, H = cv.height;
-    ctx.clearRect(0,0,W,H);
+  function sendView() {{
+    if (!ws || ws.readyState !== 1) return;
+    const payload = {{
+      cmd: "set_view",
+      // legacy params left intact; server will ignore for Bookmap draw
+      levels: {RENDER_LEVELS},
+      step: {RENDER_STEP},
+      pan_ticks: 0.0,
 
-    const r = frame.render;
-    // Update client-side view defaults from server frame
-    if (view.levels === null) view.levels = r.levels || 220;
-    if (view.baseStep === null) view.baseStep = r.base_step || r.step || 0.1;
-    if (view.step === null) view.step = r.step || view.baseStep;
-    const prices = r.prices || [];
-    const bids = r.bid_qty || [];
-    const asks = r.ask_qty || [];
-    const heatB = r.heat_bid || [];
-    const heatA = r.heat_ask || [];
+      bm_center_idx: view.centerIdx,
+      bm_price_span_bins: Math.round(view.priceSpan),
+      bm_time_offset_cols: Math.round(view.timeOffset),
+      bm_time_downsample: Math.round(view.timeDownsample),
+    }};
+    try {{ ws.send(JSON.stringify(payload)); }} catch(e) {{}}
+  }}
 
-    const levels = prices.length;
-
-    // Layout
-    const padL = 84;
-    const padR = 18;
-    const axisX = padL;
-    const midX = Math.floor(W*0.52);
-    const bidX0 = padL + 10;
-    const bidX1 = midX - 8;
-    const askX0 = midX + 8;
-    const askX1 = W - padR;
-
-    // Scaling for bars
-    let maxQty = 1.0;
-    for (let i=0;i<levels;i++) {{{{
-      maxQty = Math.max(maxQty, bids[i]||0, asks[i]||0);
-    }}}}
-    const bidW = Math.max(10, bidX1 - bidX0);
-    const askW = Math.max(10, askX1 - askX0);
-
-    // Row height (fit canvas)
-    const rowH = Math.max(3, Math.floor((H-20) / Math.max(1, levels)));
-    const top = 10;
-
-    // Helper: map index to Y with correct price orientation:
-    // prices array is low->high, but screen Y increases downward.
-    // So high price should be near top => invert index.
-    function yForIndex(i) {{{{
-      const inv = (levels - 1 - i);
-      return top + inv * rowH;
-    }}}}
-
-    // Price labels + grid
-    ctx.font = '12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = '#444';
-    ctx.strokeStyle = '#eee';
-
-    for (let i=0;i<levels;i++) {{{{
-      const y = yForIndex(i);
-      if (i % 10 === 0) {{{{
-        // horizontal grid line
-        ctx.beginPath();
-        ctx.moveTo(padL, y+0.5);
-        ctx.lineTo(W-padR, y+0.5);
-        ctx.stroke();
-
-        // price label
-        ctx.fillText(fmt(prices[i]), 8, y + 10);
-      }}}}
-    }}}}
-
-    
-    // Heatmap background (FIX17): draw decayed liquidity intensity per price level
-    // Values are normalized 0..1 server-side.
-    const heatMaxAlpha = clamp((frame.render && frame.render.heat_alpha) ? frame.render.heat_alpha : 0.55, 0.0, 1.0);
-    for (let i=0;i<levels;i++) {{{{
-      const y = yForIndex(i);
-      const hb = heatB[i] || 0;
-      const ha = heatA[i] || 0;
-      if (hb > 0.001) {{{{
-        const a = Math.min(heatMaxAlpha, hb * heatMaxAlpha);
-        ctx.fillStyle = 'rgba(46,125,50,' + (0.06 + 0.34*a).toFixed(3) + ')';
-        ctx.fillRect(bidX0, y, bidX1 - bidX0, rowH-1);
-      }}}}
-      if (ha > 0.001) {{{{
-        const a = Math.min(heatMaxAlpha, ha * heatMaxAlpha);
-        ctx.fillStyle = 'rgba(198,40,40,' + (0.06 + 0.34*a).toFixed(3) + ')';
-        ctx.fillRect(askX0, y, askX1 - askX0, rowH-1);
-      }}}}
-    }}}}
-
-// Draw bids/asks
-    for (let i=0;i<levels;i++) {{{{
-      const y = yForIndex(i);
-      const bq = bids[i] || 0;
-      const aq = asks[i] || 0;
-
-      // bid bar
-      const bw = Math.min(bidW, (bq / maxQty) * bidW);
-      if (bw > 0.5) {{{{
-        ctx.fillStyle = 'rgba(46,125,50,0.35)';
-        ctx.fillRect(bidX1 - bw, y, bw, rowH-1);
-      }}}}
-
-      // ask bar
-      const aw = Math.min(askW, (aq / maxQty) * askW);
-      if (aw > 0.5) {{{{
-        ctx.fillStyle = 'rgba(198,40,40,0.35)';
-        ctx.fillRect(askX0, y, aw, rowH-1);
-      }}}}
-    }}}}
-
-    // Mid/anchor line (center of ladder)
-    if (r.anchor_px !== null && r.anchor_px !== undefined) {{{{
-      // anchor index nearest to anchor_px
-      const step = r.step || 0.1;
-      const anchor = r.anchor_px;
-      // find closest index by rounding
-      const center = Math.round(anchor / step) * step;
-      // find index of center in array (prices[i] == center)
-      let idx = -1;
-      for (let i=0;i<levels;i++) {{{{
-        if (Math.abs((prices[i]||0) - center) < (step/2 + 1e-9)) {{{{ idx = i; break; }}}}
-      }}}}
-      if (idx >= 0) {{{{
-        const y = yForIndex(idx) + Math.floor(rowH/2);
-        ctx.strokeStyle = 'rgba(0,0,0,0.35)';
-        ctx.beginPath();
-        ctx.moveTo(padL, y+0.5);
-        ctx.lineTo(W-padR, y+0.5);
-        ctx.stroke();
-        ctx.fillStyle = '#111';
-        ctx.fillText('anchor ' + fmt(anchor), padL+6, y-4);
-      }}}}
-    }}}}
-
-    // Time-window overlay (anchor history as a line on the far right)
-    const hist = r.anchor_hist || [];
-    if (hist.length >= 2 && levels > 0) {{{{
-      // map px -> y using ladder window
-      const pMin = prices[0];
-      const pMax = prices[levels-1];
-      const tMin = hist[0].ts;
-      const tMax = hist[hist.length-1].ts;
-      const x0 = W - 180;
-      const x1 = W - 20;
-
-      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
-      ctx.beginPath();
-      for (let k=0;k<hist.length;k++) {{{{
-        const t = hist[k].ts;
-        const px = hist[k].px;
-        const x = x0 + (t - tMin) / Math.max(1e-9, (tMax - tMin)) * (x1 - x0);
-        // price to y: higher price -> smaller y
-        const y = top + (pMax - px) / Math.max(1e-9, (pMax - pMin)) * (levels*rowH);
-        if (k===0) ctx.moveTo(x,y);
-        else ctx.lineTo(x,y);
-      }}}}
-      ctx.stroke();
-
-      ctx.fillStyle = '#666';
-      ctx.fillText('anchor history', x0, 18);
-    }}}}
-
-    // Status panel
-    try {{{{
-      statusEl.textContent = JSON.stringify({{{{
-        service: frame.service,
-        build: frame.build,
-        symbol: frame.symbol,
-        connector: frame.connector,
-        book: frame.book,
-        render: {{{{
-          levels: r.levels,
-          step: r.step,
-          anchor_px: r.anchor_px
-        }}}}
-      }}}}, null, 2);
-    }}}} catch(e) {{{{}}}}
-  }}}}
+  let lastSend = 0;
+  function throttledSend() {{
+    const now = performance.now();
+    if (now - lastSend > 50) {{ lastSend = now; sendView(); }}
+  }}
 
   function connect() {{
-    const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
-    const ws = new WebSocket(proto + '://' + location.host + '/render.ws');
-    wsRef = ws;
+    ws = new WebSocket(wsUrl());
+    ws.onopen = () => {{ sendView(); }};
     ws.onmessage = (ev) => {{
       try {{
         const frame = JSON.parse(ev.data);
-        setHealth(frame.health || 'YELLOW');
-        pushHist(frame);
-        const sel = selectFrame();
-        if (sel) draw(sel);
-        setHistoryUI();
+        draw(frame);
       }} catch(e) {{}}
     }};
-
-    ws.onopen = () => {{
-      // Push current view to server
-      if (view.baseStep !== null) {{
-        view.step = view.baseStep * view.zoom;
-      }}
-      sendView();
+    ws.onclose = () => {{
+      setTimeout(connect, 750);
     }};
+  }}
+  connect();
 
-    ws.onclose = () => setTimeout(connect, 600);
+  // Color mapping: value -> intensity -> RGB. (Simple, stable; not tuned yet.)
+  function valToRGB(v, vmax) {{
+    if (v <= 0 || vmax <= 0) return [11,15,20];
+    const x = Math.max(0, Math.min(1, v / vmax));
+    // blue -> cyan -> yellow -> red (simple gradient)
+    const r = Math.floor(30 + 225 * Math.pow(x, 0.85));
+    const g = Math.floor(50 + 205 * Math.pow(x, 0.60));
+    const b = Math.floor(80 + 160 * Math.pow(1 - x, 0.55));
+    return [r,g,b];
   }}
 
+  function draw(frame) {{
+    const W = cv.width, H = cv.height;
+    ctx.fillStyle = '#0b0f14';
+    ctx.fillRect(0,0,W,H);
 
-  // ----------------------------
-  // Interaction handlers (FIX16)
-  // ----------------------------
-  let dragging = false;
-  let lastY = 0;
+    setHealth(frame.health);
 
-  cv.addEventListener('wheel', (ev) => {{
-    ev.preventDefault();
-    if (view.baseStep === null) return;
-    const delta = ev.deltaY;
-    // Zoom: wheel up = zoom in (smaller step)
-    const factor = (delta > 0) ? 1.15 : 0.87;
-    view.zoom = clamp(view.zoom * factor, 0.25, 8.0);
-    view.step = view.baseStep * view.zoom;
-    sendView();
-  }}, {{ passive: false }});
+    const bm = frame.render && frame.render.bm ? frame.render.bm : null;
+    if (!bm || !bm.cols) {{
+      ctx.fillStyle = 'rgba(230,238,248,0.85)';
+      ctx.font = '16px system-ui';
+      ctx.fillText('Warming up...', 16, 24);
+      return;
+    }}
 
-    // Pointer pan (mouse + touch) — works reliably on iPad
-  let pointerActive = false;
-  let pointerId = null;
+    // initialize centerIdx from server once
+    if (view.centerIdx === null && bm.center_idx !== null && bm.center_idx !== undefined) {{
+      view.centerIdx = bm.center_idx;
+      throttledSend();
+    }}
 
-  cv.addEventListener('pointerdown', (ev) => {{
-    // Ensure the page does not scroll/zoom on touch interactions
-    ev.preventDefault();
-    pointerActive = true;
-    pointerId = ev.pointerId;
-    lastY = ev.clientY;
-    try {{ cv.setPointerCapture(pointerId); }} catch (e) {{}}
-  }}, {{ passive: false }});
+    const live = !!bm.live && (view.timeOffset === 0);
+    modeEl.textContent = live ? 'LIVE' : 'HISTORY';
+    modeEl.className = 'pill' + (live ? ' green' : '');
 
-  cv.addEventListener('pointermove', (ev) => {{
-    if (!pointerActive) return;
-    if (pointerId !== null && ev.pointerId !== pointerId) return;
-    ev.preventDefault();
-    const dy = ev.clientY - lastY;
-    lastY = ev.clientY;
-    const approxRowH = 6;
-    view.panTicks = clamp(view.panTicks + (-dy / approxRowH), -2000.0, 2000.0);
-    sendView();
-  }}, {{ passive: false }});
+    scaleEl.textContent = 'TIME: ' + fmtTimeScale(bm.time_scale_s_per_col);
+    offsetEl.textContent = live ? 'OFFSET: 0s' : ('OFFSET: T-' + (bm.t_minus_s || 0).toFixed(1) + 's');
 
-  function endPointer(ev) {{
-    if (pointerId !== null && ev.pointerId !== pointerId) return;
-    pointerActive = false;
-    pointerId = null;
-    try {{ cv.releasePointerCapture(ev.pointerId); }} catch (e) {{}}
+    // Update auto-follow
+    if (live) view.autoFollow = true;
+
+    const cols = bm.cols;
+    const minIdx = bm.min_idx, maxIdx = bm.max_idx;
+    const tick = bm.tick || 0.1;
+
+    // Layout
+    const leftPad = Math.floor(W * 0.08); // price labels area
+    const rightPad = 8;
+    const topPad = 8;
+    const botPad = 8;
+    const plotW = W - leftPad - rightPad;
+    const plotH = H - topPad - botPad;
+
+    // Determine vmax (robust): sample max across visible points
+    let vmax = 0;
+    for (let i=0;i<cols.length;i++) {{
+      const pts = cols[i].pts || [];
+      for (let j=0;j<pts.length;j++) {{
+        const v = pts[j][1];
+        if (v > vmax) vmax = v;
+      }}
+    }}
+    // soft cap for stability
+    vmax = Math.max(1e-9, vmax);
+
+    // Render columns
+    const colW = Math.max(1, Math.floor(plotW / Math.max(1, cols.length)));
+    const span = Math.max(1, (maxIdx - minIdx));
+    const pxPerBin = plotH / span;
+
+    for (let ci=0; ci<cols.length; ci++) {{
+      const x0 = leftPad + ci * colW;
+      const pts = cols[ci].pts || [];
+      for (let k=0; k<pts.length; k++) {{
+        const idx = pts[k][0];
+        const v = pts[k][1];
+        const y = topPad + (maxIdx - idx) * pxPerBin; // higher idx at top
+        const h = Math.max(1, Math.ceil(pxPerBin));
+        const rgb = valToRGB(v, vmax);
+        ctx.fillStyle = `rgb(${{rgb[0]}},${{rgb[1]}},${{rgb[2]}})`;
+        ctx.fillRect(x0, y, colW, h);
+      }}
+    }}
+
+    // Draw price labels (few ticks)
+    ctx.fillStyle = 'rgba(230,238,248,0.80)';
+    ctx.font = (Math.max(10, Math.floor(H/48))) + 'px system-ui';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    const labelCount = 6;
+    for (let i=0;i<=labelCount;i++) {{
+      const t = i/labelCount;
+      const idx = Math.round(maxIdx - t*(maxIdx - minIdx));
+      const y = topPad + t*plotH;
+      const px = (idx * tick);
+      ctx.fillText(px.toFixed(1), leftPad - 8, y);
+      // grid line
+      ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+      ctx.beginPath();
+      ctx.moveTo(leftPad, y);
+      ctx.lineTo(W-rightPad, y);
+      ctx.stroke();
+    }}
+
+    // Price line (best bid/ask mid) overlay
+    if (frame.book && frame.book.best_bid !== null && frame.book.best_ask !== null) {{
+      const mid = (frame.book.best_bid + frame.book.best_ask)/2.0;
+      const midIdx = Math.round(mid / tick);
+      const y = topPad + (maxIdx - midIdx) * pxPerBin;
+      ctx.strokeStyle = 'rgba(255,255,255,0.70)';
+      ctx.beginPath();
+      ctx.moveTo(leftPad, y);
+      ctx.lineTo(W-rightPad, y);
+      ctx.stroke();
+
+      // auto-follow: keep mid within viewport by nudging centerIdx on UI side
+      if (view.autoFollow && view.centerIdx !== null) {{
+        const margin = Math.floor(view.priceSpan * 0.12);
+        if (midIdx > (view.centerIdx + margin) || midIdx < (view.centerIdx - margin)) {{
+          view.centerIdx = midIdx;
+          throttledSend();
+        }}
+      }}
+    }}
   }}
 
-  cv.addEventListener('pointerup', endPointer, {{ passive: true }});
-  cv.addEventListener('pointercancel', endPointer, {{ passive: true }});
+  // Touch gesture handling
+  let active = false;
+  let startTouches = [];
+  let startMid = null;
+  let startDist = 0;
+  let startCenter = null;
+  let startSpan = null;
+  let startOffset = null;
+  let startDownsample = null;
 
+  function getTouches(e) {{
+    const t = [];
+    for (let i=0;i<e.touches.length;i++) {{
+      const touch = e.touches[i];
+      t.push({{ id: touch.identifier, x: touch.clientX, y: touch.clientY }});
+    }}
+    return t;
+  }}
 
-  // Touch support (iPad): one-finger drag = pan, two-finger pinch = zoom
-  let touchMode = null;
-  let pinchStartDist = 0;
-  let pinchStartZoom = 1.0;
-
-  function dist(t1, t2) {{
-    const dx = t1.clientX - t2.clientX;
-    const dy = t1.clientY - t2.clientY;
+  function dist(a,b) {{
+    const dx = a.x-b.x, dy = a.y-b.y;
     return Math.sqrt(dx*dx + dy*dy);
   }}
 
-  
-  // Touch support (iPad): one-finger vertical pan, pinch price zoom, two-finger drag time scrub/zoom (FIX20)
-  let touchMode = null; // 'pan' | 'pinch' | 'time'
-  let startPanY = 0;
-  let startPanTicks = 0;
-  let pinchStartDist = 0;
-  let pinchStartZoom = 1.0;
-  let twoStartMid = {{x:0,y:0}};
-  let twoStartOffset = 0;
-  let twoStartScale = 1.0;
+  function midpoint(a,b) {{
+    return {{ x: (a.x+b.x)/2, y: (a.y+b.y)/2 }};
+  }}
 
-  function dist(a,b){{ const dx=a.clientX-b.clientX, dy=a.clientY-b.clientY; return Math.sqrt(dx*dx+dy*dy); }}
-  function mid(a,b){{ return {{x:(a.clientX+b.clientX)/2, y:(a.clientY+b.clientY)/2}}; }}
+  function clamp(v, lo, hi) {{
+    return Math.max(lo, Math.min(hi, v));
+  }}
 
-  cv.addEventListener('touchstart', (ev) => {{
-    if (!ev.touches || ev.touches.length === 0) return;
-    if (ev.touches.length === 1){{
-      touchMode = 'pan';
-      startPanY = ev.touches[0].clientY;
-      startPanTicks = view.panTicks;
-    }} else if (ev.touches.length === 2){{
-      touchMode = 'time';
-      pinchStartDist = dist(ev.touches[0], ev.touches[1]);
-      pinchStartZoom = view.zoom;
-      twoStartMid = mid(ev.touches[0], ev.touches[1]);
-      twoStartOffset = view.tOffset;
-      twoStartScale = view.tScale;
+  cv.addEventListener('touchstart', (e) => {{
+    if (!view) return;
+    active = true;
+    startTouches = getTouches(e);
+    if (startTouches.length === 1) {{
+      startCenter = view.centerIdx;
+    }} else if (startTouches.length >= 2) {{
+      const a = startTouches[0], b = startTouches[1];
+      startMid = midpoint(a,b);
+      startDist = dist(a,b);
+      startSpan = view.priceSpan;
+      startOffset = view.timeOffset;
+      startDownsample = view.timeDownsample;
     }}
-  }}, {{passive:false}});
+  }}, {{ passive: false }});
 
-  cv.addEventListener('touchmove', (ev) => {{
-    if (!ev.touches) return;
-    if (ev.touches.length === 1 && touchMode === 'pan'){{
-      ev.preventDefault();
-      const dy = ev.touches[0].clientY - startPanY;
-      const ticksPerPx = 0.12;
-      view.panTicks = startPanTicks + Math.round(dy * ticksPerPx);
-      view.autoFollow = (view.tOffset <= 0.5);
-      sendView();
-      setHistoryUI();
+  cv.addEventListener('touchmove', (e) => {{
+    if (!active) return;
+    e.preventDefault();
+    const t = getTouches(e);
+    if (t.length === 1) {{
+      // 1-finger vertical pan (price)
+      const dy = t[0].y - startTouches[0].y;
+      if (view.centerIdx === null) return;
+      const binsPerPx = (view.priceSpan / Math.max(50, cv.getBoundingClientRect().height));
+      const deltaBins = Math.round(dy * binsPerPx);
+      view.centerIdx = (startCenter === null ? view.centerIdx : startCenter) + deltaBins;
+      view.autoFollow = false;
+      throttledSend();
       return;
     }}
-    if (ev.touches.length === 2){{
-      ev.preventDefault();
-      const d = dist(ev.touches[0], ev.touches[1]);
-      const mm = mid(ev.touches[0], ev.touches[1]);
-      const dx = mm.x - twoStartMid.x;
-      const dy = mm.y - twoStartMid.y;
+    if (t.length >= 2) {{
+      const a = t[0], b = t[1];
+      const mid = midpoint(a,b);
+      const d = dist(a,b);
+      const dx = mid.x - startMid.x;
+      const dy = mid.y - startMid.y;
 
-      // Pinch (price zoom) dominates if distance changed enough
-      if (Math.abs(d - pinchStartDist) > 10){{
-        touchMode = 'pinch';
-        const factor = clamp(d / Math.max(1, pinchStartDist), 0.6, 1.8);
-        view.zoom = clamp(pinchStartZoom / factor, 0.25, 8.0);
-        if (view.baseStep !== null) view.step = view.baseStep * view.zoom;
-        sendView();
-        setHistoryUI();
+      const pinchRatio = (startDist > 0) ? (d / startDist) : 1.0;
+      const pinchDelta = pinchRatio - 1.0;
+
+      // Rule:
+      // - If pinch changes distance noticeably -> price zoom
+      // - Else: horizontal move -> time scrub, vertical move -> time zoom
+      if (Math.abs(pinchDelta) > 0.03) {{
+        // pinch: price zoom (inverse ratio)
+        const newSpan = (startSpan || view.priceSpan) / pinchRatio;
+        view.priceSpan = clamp(newSpan, {BM_MIN_PRICE_SPAN_BINS}, {BM_MAX_PRICE_SPAN_BINS});
+        view.autoFollow = false;
+        throttledSend();
         return;
       }}
 
-      // Two-finger drag: time scrub (horizontal) OR time zoom (vertical)
-      touchMode = 'time';
-      if (Math.abs(dx) >= Math.abs(dy)){{
-        const colsPerPx = 0.06 / Math.max(0.25, view.tScale);
-        view.tOffset = clamp(twoStartOffset - dx * colsPerPx, 0, Math.max(0, hist.length-1));
+      if (Math.abs(dx) >= Math.abs(dy)) {{
+        // two-finger horizontal scrub
+        const rect = cv.getBoundingClientRect();
+        const colsPerPx = 900 / Math.max(200, rect.width); // heuristic; server clamps anyway
+        const deltaCols = Math.round(-dx * colsPerPx);
+        view.timeOffset = Math.max(0, (startOffset || view.timeOffset) + deltaCols);
+        view.autoFollow = (view.timeOffset === 0);
+        throttledSend();
+        return;
       }} else {{
-        const scalePerPx = 0.01;
-        view.tScale = clamp(twoStartScale * Math.exp(-dy * scalePerPx), 0.25, 6.0);
+        // two-finger vertical drag: time zoom (downsample)
+        // drag down => zoom out => increase downsample
+        const rect = cv.getBoundingClientRect();
+        const units = dy / Math.max(120, rect.height);
+        const factor = Math.pow(2, units * 6); // ~64x over full height
+        const base = (startDownsample || view.timeDownsample);
+        const newDs = clamp(Math.round(base * factor), 1, {BM_MAX_DOWNSAMPLE});
+        view.timeDownsample = newDs;
+        view.autoFollow = false;
+        throttledSend();
+        return;
       }}
-
-      view.autoFollow = (view.tOffset <= 0.5);
-      const sel = selectFrame();
-      if (sel) draw(sel);
-      setHistoryUI();
-      return;
     }}
-  }}, {{passive:false}});
+  }}, {{ passive: false }});
 
-  cv.addEventListener('touchend', (ev) => {{
-    if (!ev.touches || ev.touches.length === 0){{
-      touchMode = null;
-    }}
-  }});
+  cv.addEventListener('touchend', (e) => {{
+    active = false;
+  }}, {{ passive: true }});
+  cv.addEventListener('touchcancel', (e) => {{
+    active = false;
+  }}, {{ passive: true }});
 
-  connect();
 }})();
 </script>
 </body>
