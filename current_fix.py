@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =========================================================
-# QuantDesk Bookmap Service — FIX15_PRICE_TRAVEL_TIME_WINDOW
+# QuantDesk Bookmap Service — FIX16_INTERACTIVE_SCROLL_ZOOM
 #
 # Builds on FIX14 (parity-safe incremental book):
 # - Maintains canonical CLOB via incremental merge (no side wipeouts)
@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX15/P01"
+BUILD = "FIX16/P01"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -421,9 +421,16 @@ async def _connector_loop() -> None:
 # Render frame (bridge contract)
 # ----------------------------
 
-def _render_frame(levels: int, step: float) -> Dict[str, Any]:
+def _render_frame(levels: int, step: float, pan_ticks: float = 0.0) -> Dict[str, Any]:
     ts = _now()
     anchor = _update_anchor()
+    view_anchor = None
+    if anchor is not None:
+        # pan_ticks shifts the view window in units of current step
+        try:
+            view_anchor = float(anchor) + float(pan_ticks) * float(step)
+        except Exception:
+            view_anchor = float(anchor)
     bb = STATE.book.best_bid
     ba = STATE.book.best_ask
 
@@ -432,8 +439,8 @@ def _render_frame(levels: int, step: float) -> Dict[str, Any]:
     bid_qty: List[float] = []
     ask_qty: List[float] = []
 
-    if anchor is not None and step > 0 and levels > 0:
-        center = round(anchor / step) * step
+    if view_anchor is not None and step > 0 and levels > 0:
+        center = round(view_anchor / step) * step
         half = levels // 2
         start = center - half * step
 
@@ -496,7 +503,9 @@ def _render_frame(levels: int, step: float) -> Dict[str, Any]:
         "render": {
             "levels": levels,
             "step": step,
-            "anchor_px": anchor,
+            "anchor_px": view_anchor,
+            "base_step": RENDER_STEP,
+            "pan_ticks": pan_ticks,
             "prices": prices,
             "bid_qty": bid_qty,
             "ask_qty": ask_qty,
@@ -529,13 +538,13 @@ async def bootlog_txt() -> PlainTextResponse:
 
 @app.get("/health.json")
 async def health_json() -> JSONResponse:
-    frame = _render_frame(RENDER_LEVELS, RENDER_STEP)
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
     return JSONResponse({"service": SERVICE, "build": BUILD, "health": frame["health"], "connector": frame["connector"], "book": frame["book"]})
 
 
 @app.get("/telemetry.json")
 async def telemetry_json() -> JSONResponse:
-    frame = _render_frame(RENDER_LEVELS, RENDER_STEP)
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
     return JSONResponse(frame)
 
 
@@ -573,22 +582,55 @@ async def raw_json() -> JSONResponse:
 
 @app.get("/render.json")
 async def render_json() -> JSONResponse:
-    frame = _render_frame(RENDER_LEVELS, RENDER_STEP)
+    frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
     return JSONResponse(frame["render"])
 
 
 @app.websocket("/render.ws")
 async def render_ws(ws: WebSocket) -> None:
     await ws.accept()
+    # Per-connection interactive view state
+    view_levels = int(RENDER_LEVELS)
+    view_step = float(RENDER_STEP)
+    pan_ticks = 0.0
     try:
-        interval = 1.0 / max(1.0, RENDER_FPS)
+        interval = 1.0 / max(1.0, float(RENDER_FPS))
         while True:
-            frame = _render_frame(RENDER_LEVELS, RENDER_STEP)
+            # Non-blocking receive: apply client view updates if present
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=0.0)
+            except asyncio.TimeoutError:
+                msg = None
+            except Exception:
+                return
+
+            if msg:
+                try:
+                    payload = json.loads(msg)
+                    if isinstance(payload, dict) and payload.get("cmd") == "set_view":
+                        if "levels" in payload:
+                            lv = int(payload["levels"])
+                            if 40 <= lv <= 800:
+                                view_levels = lv
+                        if "step" in payload:
+                            st = float(payload["step"])
+                            # Clamp to avoid degenerate windows
+                            if st > 0:
+                                view_step = max(1e-6, min(st, 1e6))
+                        if "pan_ticks" in payload:
+                            pt = float(payload["pan_ticks"])
+                            # Clamp panning to a bounded range to prevent runaway
+                            pan_ticks = max(-2000.0, min(pt, 2000.0))
+                except Exception:
+                    # ignore malformed control messages
+                    pass
+
+            frame = _render_frame(view_levels, view_step, pan_ticks=pan_ticks)
             STATE.frames += 1
             await ws.send_text(json.dumps(frame))
             await asyncio.sleep(interval)
     except Exception:
-        # client disconnected
+        # client disconnected or send failure
         return
 
 
@@ -634,10 +676,10 @@ def _ui_html() -> str:
 
   <div class="grid">
     <div class="card">
-      <div class="muted">This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a moving anchored ladder (price travel). It is not a full Bookmap renderer yet.</div>
+      <div class="muted">This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a moving anchored ladder (price travel) with interactive pan/zoom (FIX16). It is not a full Bookmap renderer yet.</div>
       <div style="height:10px"></div>
       <canvas id="cv" width="980" height="520"></canvas>
-      <div class="muted small" style="margin-top:8px;">Ladder: green = bids, red = asks. Axis: higher prices at top. Mid line shows anchor.</div>
+      <div class="muted small" style="margin-top:8px;">Ladder: green = bids, red = asks. Axis: higher prices at top. Mid line shows anchor. Wheel/pinch = zoom, drag = pan.</div>
     </div>
 
     <div class="card">
@@ -664,6 +706,26 @@ def _ui_html() -> str:
   const healthEl = document.getElementById('health');
   const statusEl = document.getElementById('status');
 
+  // Interactive view state (FIX16):
+  // - wheel / pinch zoom changes step
+  // - drag pans ladder in price ticks
+  let view = {{ levels: null, baseStep: null, step: null, zoom: 1.0, panTicks: 0.0 }};
+  let wsRef = null;
+
+  function clamp(x, a, b) {{ return Math.max(a, Math.min(b, x)); }}
+
+  function sendView() {{
+    if (!wsRef || wsRef.readyState !== 1) return;
+    const payload = {{
+      cmd: "set_view",
+      levels: view.levels,
+      step: view.step,
+      pan_ticks: view.panTicks
+    }};
+    try {{ wsRef.send(JSON.stringify(payload)); }} catch(e) {{}}
+  }}
+
+
   function setHealth(h) {{
     healthEl.classList.remove('green','yellow','red');
     if (h === 'GREEN') healthEl.classList.add('green');
@@ -686,6 +748,10 @@ def _ui_html() -> str:
     ctx.clearRect(0,0,W,H);
 
     const r = frame.render;
+    // Update client-side view defaults from server frame
+    if (view.levels === null) view.levels = r.levels || 220;
+    if (view.baseStep === null) view.baseStep = r.base_step || r.step || 0.1;
+    if (view.step === null) view.step = r.step || view.baseStep;
     const prices = r.prices || [];
     const bids = r.bid_qty || [];
     const asks = r.ask_qty || [];
@@ -833,6 +899,7 @@ def _ui_html() -> str:
   function connect() {{
     const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
     const ws = new WebSocket(proto + '://' + location.host + '/render.ws');
+    wsRef = ws;
     ws.onmessage = (ev) => {{
       try {{
         const frame = JSON.parse(ev.data);
@@ -840,8 +907,95 @@ def _ui_html() -> str:
         draw(frame);
       }} catch(e) {{}}
     }};
+
+    ws.onopen = () => {{
+      // Push current view to server
+      if (view.baseStep !== null) {{
+        view.step = view.baseStep * view.zoom;
+      }}
+      sendView();
+    }};
+
     ws.onclose = () => setTimeout(connect, 600);
   }}
+
+
+  // ----------------------------
+  // Interaction handlers (FIX16)
+  // ----------------------------
+  let dragging = false;
+  let lastY = 0;
+
+  cv.addEventListener('wheel', (ev) => {{
+    ev.preventDefault();
+    if (view.baseStep === null) return;
+    const delta = ev.deltaY;
+    // Zoom: wheel up = zoom in (smaller step)
+    const factor = (delta > 0) ? 1.15 : 0.87;
+    view.zoom = clamp(view.zoom * factor, 0.25, 8.0);
+    view.step = view.baseStep * view.zoom;
+    sendView();
+  }}, {{ passive: false }});
+
+  cv.addEventListener('mousedown', (ev) => {{
+    dragging = true;
+    lastY = ev.clientY;
+  }});
+  window.addEventListener('mouseup', () => {{ dragging = false; }});
+  window.addEventListener('mousemove', (ev) => {{
+    if (!dragging) return;
+    const dy = ev.clientY - lastY;
+    lastY = ev.clientY;
+    // Drag up should pan to higher prices (increase panTicks)
+    // Convert pixels to ticks using approximate row height (fallback 6)
+    const approxRowH = 6;
+    view.panTicks = clamp(view.panTicks + (-dy / approxRowH), -2000.0, 2000.0);
+    sendView();
+  }});
+
+  // Touch support (iPad): one-finger drag = pan, two-finger pinch = zoom
+  let touchMode = null;
+  let pinchStartDist = 0;
+  let pinchStartZoom = 1.0;
+
+  function dist(t1, t2) {{
+    const dx = t1.clientX - t2.clientX;
+    const dy = t1.clientY - t2.clientY;
+    return Math.sqrt(dx*dx + dy*dy);
+  }}
+
+  cv.addEventListener('touchstart', (ev) => {{
+    if (ev.touches.length === 1) {{
+      touchMode = 'pan';
+      lastY = ev.touches[0].clientY;
+    }} else if (ev.touches.length === 2) {{
+      touchMode = 'pinch';
+      pinchStartDist = dist(ev.touches[0], ev.touches[1]);
+      pinchStartZoom = view.zoom;
+    }}
+  }}, {{ passive: true }});
+
+  cv.addEventListener('touchmove', (ev) => {{
+    if (view.baseStep === null) return;
+    if (touchMode === 'pan' && ev.touches.length === 1) {{
+      const y = ev.touches[0].clientY;
+      const dy = y - lastY;
+      lastY = y;
+      const approxRowH = 6;
+      view.panTicks = clamp(view.panTicks + (-dy / approxRowH), -2000.0, 2000.0);
+      sendView();
+    }} else if (touchMode === 'pinch' && ev.touches.length === 2) {{
+      const d = dist(ev.touches[0], ev.touches[1]);
+      if (pinchStartDist > 1) {{
+        const ratio = pinchStartDist / d; // closer fingers => zoom in
+        view.zoom = clamp(pinchStartZoom * ratio, 0.25, 8.0);
+        view.step = view.baseStep * view.zoom;
+        sendView();
+      }}
+    }}
+  }}, {{ passive: true }});
+
+  cv.addEventListener('touchend', () => {{ touchMode = null; }}, {{ passive: true }});
 
   connect();
 }})();
