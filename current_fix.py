@@ -1,359 +1,573 @@
 # QuantDesk Bookmap Service - current_fix.py
-# Build: FIX11/P01
-# Subsystem: FOUNDATION+STREAM+INCREMENTAL_LADDER_MERGE_ENGINE+TRADE_TAPE+UI_INDEX
-# Venue: MEXC Futures (BTC_USDT Perpetuals)
-# Date: 2026-01-25
+# Build: FIX12/P01
+# Purpose:
+# - Harden Replit startup so the process does not "start then stop" due to connector/import issues.
+# - Keep FastAPI up on 0.0.0.0:5000 even if WS/deps fail (health will show ERROR but server stays alive).
+# - Provide a Preview-safe HTML dashboard at "/" with clickable links and auto-refresh.
 #
-# FIX09 objective:
-# - Correct depth semantics for MEXC Futures: push.depth messages may be partial (one-sided / incremental-like).
-# - Replace FIX08 "replace-on-snapshot" with "merge" semantics:
-#     * Update only sides present in the message
-#     * Do NOT wipe the opposite side when missing
-#     * Remove price levels when qty <= 0
-# - Maintain deterministic single-writer state; keep invariants; expose book + telemetry.
+# Contract (Workflow v1.2):
+# - Single executable file: current_fix.py
+# - Endpoints: /, /health.json, /telemetry.json
+# - Additional endpoints: /book.json, /tape.json, /raw.json, /bootlog.txt
 #
-# Notes (truth/limits):
-# - We still subscribe via sub.depth / sub.deal on wss://contract.mexc.com/edge.
-# - If MEXC provides an explicit full snapshot flag/type, we will incorporate it once observed in raw frames.
-# - No visualization/heatmap yet.
+# Notes:
+# - ASCII-only file (avoid unicode like U+2014 that can break execution if pasted).
+# - No console spam; boot diagnostics are written to /tmp/qd_boot.log and served via /bootlog.txt.
+
+from __future__ import annotations
 
 import asyncio
 import json
 import os
-import threading
 import time
-from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, HTMLResponse
-import websockets
-import uvicorn
+import traceback
+from dataclasses import dataclass, field
 from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
-SERVICE = "qd-bookmap"
-BUILD = "FIX11/P01"
-SUBSYSTEM = "FOUNDATION+STREAM+INCREMENTAL_LADDER_MERGE_ENGINE+TRADE_TAPE+UI_INDEX"
+BOOT_LOG_PATH = "/tmp/qd_boot.log"
 
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", 5000))
 
-WS_URL = os.environ.get("QD_MEXC_CONTRACT_WS", "wss://contract.mexc.com/edge").strip()
-SYMBOL = os.environ.get("QD_SYMBOL", "BTC_USDT").strip().upper()
-
-PING_SECS = float(os.environ.get("QD_WS_PING_SECS", "15"))
-TOP_N = int(os.environ.get("QD_BOOK_TOP_N", "25"))
-RAW_RING_MAX = int(os.environ.get("QD_RAW_RING_MAX", "60"))
-FRESH_SECS_GREEN = float(os.environ.get("QD_FRESH_SECS_GREEN", "5.0"))
-
-DEAL_COMPRESS = os.environ.get("QD_DEAL_COMPRESS", "false").strip().lower() in ("1", "true", "yes", "y", "on")
+def _bootlog(msg: str) -> None:
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        with open(BOOT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}Z] {msg}\n")
+    except Exception:
+        pass
 
 
 def _now() -> float:
     return time.time()
 
 
-def _safe_str(e: BaseException) -> str:
-    return f"{type(e).__name__}: {str(e)}"[:800]
+# -----------------------------
+# Config
+# -----------------------------
+BUILD = "FIX12/P01"
+SERVICE = "qd-bookmap"
+
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", "5000"))  # Replit expects 5000
+SYMBOL = os.environ.get("QD_SYMBOL", "BTC_USDT")
+
+# MEXC contract WS base (as per earlier working state)
+WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
+
+# Optional stream hints
+TRADE_CHANNELS = [
+    os.environ.get("QD_TRADE_CH1", "push.deal"),
+    os.environ.get("QD_TRADE_CH2", "push.trade"),
+]
+
+RAW_RING_MAX = int(os.environ.get("QD_RAW_RING_MAX", "200"))
+TAPE_RING_MAX = int(os.environ.get("QD_TAPE_RING_MAX", "300"))
+
+RECONNECT_MIN_S = float(os.environ.get("QD_RECONNECT_MIN_S", "0.5"))
+RECONNECT_MAX_S = float(os.environ.get("QD_RECONNECT_MAX_S", "15.0"))
 
 
-class Ring:
-    def __init__(self, maxlen: int) -> None:
-        self.maxlen = maxlen
-        self._buf: List[Dict[str, Any]] = []
-        self._lock = threading.Lock()
-
-    def push(self, item: Dict[str, Any]) -> None:
-        with self._lock:
-            self._buf.append(item)
-            if len(self._buf) > self.maxlen:
-                self._buf = self._buf[-self.maxlen :]
-
-    def snapshot(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            return list(self._buf)
+# -----------------------------
+# State Models
+# -----------------------------
+@dataclass
+class BookState:
+    best_bid: Optional[Tuple[str, str]] = None  # (price, qty)
+    best_ask: Optional[Tuple[str, str]] = None
+    depth_counts: Dict[str, int] = field(default_factory=lambda: {"bids": 0, "asks": 0})
+    totals: Dict[str, str] = field(default_factory=lambda: {"bid_qty": "0", "ask_qty": "0"})
+    version: Optional[int] = None
+    last_update_ts: Optional[float] = None
 
 
-RAW_RING = Ring(RAW_RING_MAX)
-START_TS = _now()
-LOCK = threading.Lock()
+@dataclass
+class EngineState:
+    status: str = "WARMING"  # WARMING/ACTIVE/ERROR
+    frames: int = 0
+    reconnects: int = 0
+    last_error: str = ""
+    last_close_code: Optional[int] = None
+    last_close_reason: str = ""
+    last_connect_ts: Optional[float] = None
+    last_event_ts: Optional[float] = None
 
-# Recent trades ring (most recent last)
-TAPE = deque(maxlen=300)
+    # Parsing stats
+    snapshots_applied: int = 0
+    parse_hits: int = 0
+    parse_misses: int = 0
+    invariants_ok: bool = True
+    last_invariant_violation: str = ""
 
+    # Tape stats
+    trades_seen: int = 0
+    last_trade_px: Optional[float] = None
+    last_trade_side: Optional[str] = None
+    last_trade_qty: Optional[float] = None
+    last_trade_ts: Optional[float] = None
 
-class GlobalLadderBook:
-    def __init__(self) -> None:
-        self.bids: Dict[Decimal, Decimal] = {}
-        self.asks: Dict[Decimal, Decimal] = {}
-        self.version: Optional[int] = None
-        self.last_update_ts: float = 0.0
-        self.last_side_update_ts: Dict[str, float] = {"bids": 0.0, "asks": 0.0}
-
-    def best_bid(self) -> Optional[Tuple[Decimal, Decimal]]:
-        if not self.bids:
-            return None
-        p = max(self.bids.keys())
-        return p, self.bids[p]
-
-    def best_ask(self) -> Optional[Tuple[Decimal, Decimal]]:
-        if not self.asks:
-            return None
-        p = min(self.asks.keys())
-        return p, self.asks[p]
-
-    def depth_counts(self) -> Dict[str, int]:
-        return {"bids": len(self.bids), "asks": len(self.asks)}
-
-    def top_n(self, n: int) -> Dict[str, List[List[str]]]:
-        bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:n]
-        asks = sorted(self.asks.items(), key=lambda x: x[0])[:n]
-        return {
-            "bids": [[str(p), str(q)] for p, q in bids],
-            "asks": [[str(p), str(q)] for p, q in asks],
-        }
-
-    def totals(self) -> Dict[str, str]:
-        bid_qty = sum(self.bids.values(), Decimal("0"))
-        ask_qty = sum(self.asks.values(), Decimal("0"))
-        return {"bid_qty": str(bid_qty), "ask_qty": str(ask_qty)}
+    # Book
+    book: BookState = field(default_factory=BookState)
 
 
-BOOK = GlobalLadderBook()
+@dataclass
+class ServiceState:
+    started_ts: float = field(default_factory=_now)
+    subsystem: str = "FOUNDATION+STREAM+GLOBAL_LADDER_STATE_ENGINE+INCREMENTAL_MERGE+TRADE_TAPE"
+    health: str = "YELLOW"  # GREEN/YELLOW/RED
+    ws_url: str = WS_URL
+    symbol: str = SYMBOL
+    engine: EngineState = field(default_factory=EngineState)
+    raw_ring: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=RAW_RING_MAX))
+    tape_ring: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=TAPE_RING_MAX))
+    import_errors: List[str] = field(default_factory=list)
 
 
-def _to_dec(x: Any) -> Optional[Decimal]:
+STATE = ServiceState()
+STATE_LOCK = asyncio.Lock()
+
+
+# -----------------------------
+# Dependency-safe imports
+# -----------------------------
+try:
+    from fastapi import FastAPI
+    from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+except Exception as e:
+    STATE.import_errors.append(f"fastapi_import_error: {repr(e)}")
+    _bootlog(f"FastAPI import failed: {repr(e)}")
+    FastAPI = None  # type: ignore
+
+try:
+    import websockets  # type: ignore
+except Exception as e:
+    STATE.import_errors.append(f"websockets_import_error: {repr(e)}")
+    _bootlog(f"websockets import failed: {repr(e)}")
+    websockets = None  # type: ignore
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _compute_health() -> str:
+    eng = STATE.engine
+    if eng.status == "ERROR":
+        return "RED"
+    if eng.status == "ACTIVE" and eng.last_event_ts is not None:
+        if (_now() - eng.last_event_ts) <= 5.0:
+            return "GREEN"
+    return "YELLOW"
+
+
+def _json(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=True)
+
+
+def _as_float(x: Any) -> Optional[float]:
     try:
         if x is None:
             return None
-        if isinstance(x, Decimal):
-            return x
-        if isinstance(x, (int, float)):
-            return Decimal(str(x))
-        if isinstance(x, str):
-            s = x.strip()
-            if not s:
-                return None
-            return Decimal(s)
-    except (InvalidOperation, ValueError):
+        return float(x)
+    except Exception:
         return None
+
+
+def _norm_side(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    s = str(x).lower()
+    if s in ("buy", "b", "1"):
+        return "buy"
+    if s in ("sell", "s", "2", "-1"):
+        return "sell"
     return None
 
 
-def _parse_depth_side(side: Any) -> Optional[List[Tuple[Decimal, Decimal]]]:
-    """
-    MEXC futures push.depth format: [[price, orderCount, qty], ...]
-    Use price (index 0) and qty (index 2). If only [price, qty] exists, accept (index 1).
-    """
-    if side is None:
-        return None
-    if not isinstance(side, list):
-        return None
-    out: List[Tuple[Decimal, Decimal]] = []
-    for row in side:
-        if not isinstance(row, list) or len(row) < 2:
-            return None
-        p = _to_dec(row[0])
-        q = _to_dec(row[2] if len(row) >= 3 else row[1])
-        if p is None or q is None:
-            return None
-        out.append((p, q))
-    return out
+def _html_index() -> str:
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QuantDesk Bookmap</title>
+  <style>
+    body {{ font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }}
+    .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 16px; max-width: 900px; }}
+    .row {{ display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }}
+    .pill {{ display: inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid #ccc; font-weight: 700; }}
+    pre {{ background: #0b0f14; color: #e6edf3; padding: 12px; border-radius: 10px; overflow: auto; }}
+    a {{ text-decoration: none; }}
+    code {{ background: #f6f8fa; padding: 1px 4px; border-radius: 6px; }}
+    .muted {{ color: #666; }}
+  </style>
+</head>
+<body>
+  <h2>QuantDesk Bookmap</h2>
+  <div class="card">
+    <div class="row">
+      <div><span class="pill" id="healthPill">HEALTH: ...</span></div>
+      <div class="muted">Build: <b>{BUILD}</b></div>
+      <div class="muted">Symbol: <b>{SYMBOL}</b></div>
+      <div class="muted">WS: <b id="wsUrl">...</b></div>
+    </div>
+
+    <p class="muted">
+      If you opened an editor URL like <code>replit.com/@user/...</code> it can 404.
+      Use the runtime host you are on now and these endpoints:
+    </p>
+
+    <ul>
+      <li><a id="l_health" href="/health.json" target="_blank">/health.json</a></li>
+      <li><a id="l_tele" href="/telemetry.json" target="_blank">/telemetry.json</a></li>
+      <li><a id="l_book" href="/book.json" target="_blank">/book.json</a></li>
+      <li><a id="l_tape" href="/tape.json" target="_blank">/tape.json</a></li>
+      <li><a id="l_raw" href="/raw.json" target="_blank">/raw.json</a></li>
+      <li><a id="l_boot" href="/bootlog.txt" target="_blank">/bootlog.txt</a></li>
+    </ul>
+
+    <h3>Status (auto-refresh)</h3>
+    <pre id="statusBox">loading...</pre>
+  </div>
+
+<script>
+(function() {{
+  function setHealth(h) {{
+    const pill = document.getElementById("healthPill");
+    pill.textContent = "HEALTH: " + h;
+    pill.style.borderColor = (h === "GREEN") ? "#1a7f37" : (h === "RED" ? "#cf222e" : "#bf8700");
+  }}
+  function abs(u) {{
+    return window.location.origin + u;
+  }}
+  function fixLinks() {{
+    document.getElementById("l_health").href = abs("/health.json");
+    document.getElementById("l_tele").href = abs("/telemetry.json");
+    document.getElementById("l_book").href = abs("/book.json");
+    document.getElementById("l_tape").href = abs("/tape.json");
+    document.getElementById("l_raw").href = abs("/raw.json");
+    document.getElementById("l_boot").href = abs("/bootlog.txt");
+  }}
+  async function tick() {{
+    try {{
+      const r = await fetch("/health.json", {{ cache: "no-store" }});
+      const j = await r.json();
+      document.getElementById("wsUrl").textContent = j.ws_url || "";
+      setHealth(j.health || "YELLOW");
+      document.getElementById("statusBox").textContent = JSON.stringify(j, null, 2);
+    }} catch(e) {{
+      document.getElementById("statusBox").textContent = "fetch failed: " + (e && e.message ? e.message : String(e));
+    }}
+  }}
+  fixLinks();
+  tick();
+  setInterval(tick, 1000);
+}})();
+</script>
+</body>
+</html>
+"""
 
 
-def _check_invariants() -> Tuple[bool, str]:
-    bb = BOOK.best_bid()
-    ba = BOOK.best_ask()
-    if bb and ba and bb[0] >= ba[0]:
-        return False, f"crossed_book best_bid={bb[0]} best_ask={ba[0]}"
-    return True, ""
-
-
-state: Dict[str, Any] = {
-    "status": "DISCONNECTED",
-    "frames": 0,
-    "reconnects": 0,
-    "last_error": "",
-    "last_close_code": None,
-    "last_close_reason": "",
-    "last_connect_ts": 0.0,
-    "last_event_ts": 0.0,
-    "engine": "WARMING",
-    "depth_msgs": 0,
-    "merge_applied": 0,
-    "parse_hits": 0,
-    "parse_misses": 0,
-    "invariants_ok": True,
-    "last_invariant_violation": "",
-    "last_trade_px": None,
-    "last_trade_side": None,
-    "last_trade_qty": None,
-    "last_trade_ts": 0.0,
-    "trades_seen": 0,
-    "sides_seen": {"bids": 0, "asks": 0},
-}
-
-
-def _health() -> str:
-    with LOCK:
-        fresh = (_now() - BOOK.last_update_ts) <= FRESH_SECS_GREEN
-        bb = BOOK.best_bid()
-        ba = BOOK.best_ask()
-        if state["engine"] == "ACTIVE" and fresh and bb and ba and state["invariants_ok"]:
-            return "GREEN"
-        if state["status"] in ("CONNECTED", "ERROR"):
-            return "YELLOW"
-        return "RED"
-
-
-def _sub_depth_msg() -> Dict[str, Any]:
-    return {"method": "sub.depth", "param": {"symbol": SYMBOL}}
-
-
-def _sub_deal_msg() -> Dict[str, Any]:
-    param: Dict[str, Any] = {"symbol": SYMBOL}
-    if DEAL_COMPRESS is False:
-        param["compress"] = False
-    return {"method": "sub.deal", "param": param}
-
-
-async def _ping_loop(ws) -> None:
-    while True:
-        try:
-            await ws.send(json.dumps({"method": "ping"}))
-        except Exception:
-            return
-        await asyncio.sleep(PING_SECS)
-
-
-def _merge_side(side_name: str, levels: List[Tuple[Decimal, Decimal]]) -> None:
-    book_side = BOOK.bids if side_name == "bids" else BOOK.asks
-    for p, q in levels:
-        if q <= 0:
-            if p in book_side:
-                del book_side[p]
-        else:
-            book_side[p] = q
-    BOOK.last_side_update_ts[side_name] = _now()
-
-
-def _apply_depth_merge(depth_data: Dict[str, Any]) -> None:
-    raw_asks = depth_data.get("asks", None)
-    raw_bids = depth_data.get("bids", None)
-    ver = depth_data.get("version", None)
-
-    asks_lv = _parse_depth_side(raw_asks) if raw_asks is not None else None
-    bids_lv = _parse_depth_side(raw_bids) if raw_bids is not None else None
-
-    if asks_lv is None and bids_lv is None:
-        state["parse_misses"] += 1
+# -----------------------------
+# WS Connector (best-effort, never fatal)
+# -----------------------------
+async def _ws_loop() -> None:
+    if websockets is None:
+        async with STATE_LOCK:
+            STATE.engine.status = "WARMING"
+            STATE.engine.last_error = "websockets library missing; connector disabled"
+            STATE.engine.last_event_ts = None
+            STATE.health = _compute_health()
+        _bootlog("WS loop disabled: websockets missing")
         return
 
-    if asks_lv is not None:
-        _merge_side("asks", asks_lv)
-        state["sides_seen"]["asks"] += 1
+    backoff = RECONNECT_MIN_S
+    while True:
+        try:
+            async with STATE_LOCK:
+                STATE.engine.status = "WARMING"
+                STATE.engine.last_error = ""
+                STATE.ws_url = WS_URL
+                STATE.health = _compute_health()
+            _bootlog(f"Connecting WS: {WS_URL}")
 
-    if bids_lv is not None:
-        _merge_side("bids", bids_lv)
-        state["sides_seen"]["bids"] += 1
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:  # type: ignore
+                async with STATE_LOCK:
+                    STATE.engine.last_connect_ts = _now()
+                    STATE.engine.last_close_code = None
+                    STATE.engine.last_close_reason = ""
+                    STATE.engine.status = "ACTIVE"
+                    STATE.health = _compute_health()
+                backoff = RECONNECT_MIN_S
 
-    if isinstance(ver, int):
-        BOOK.version = ver
+                # Conservative subscribe set (schema may vary; failures show in /raw.json and /bootlog.txt)
+                sub_msgs: List[Dict[str, Any]] = []
+                for ch in TRADE_CHANNELS:
+                    sub_msgs.append({"method": ch, "param": {"symbol": SYMBOL}})
+                sub_msgs.append({"method": "sub.depth", "param": {"symbol": SYMBOL, "level": 20}})
 
-    BOOK.last_update_ts = _now()
+                for m in sub_msgs:
+                    try:
+                        await ws.send(_json(m))
+                    except Exception as e:
+                        _bootlog(f"WS send failed: {repr(e)} msg={m}")
 
-    ok, viol = _check_invariants()
-    state["invariants_ok"] = ok
-    state["last_invariant_violation"] = viol
-    if not ok:
-        state["engine"] = "ERROR"
-        state["last_error"] = viol
-    else:
-        state["engine"] = "ACTIVE"
-        state["last_error"] = ""
+                async for msg in ws:
+                    ts = _now()
+                    try:
+                        if isinstance(msg, (bytes, bytearray)):
+                            msg = msg.decode("utf-8", errors="replace")
+                        obj = json.loads(msg)
+                    except Exception:
+                        obj = {"_raw": str(msg)}
 
-    state["merge_applied"] += 1
+                    async with STATE_LOCK:
+                        eng = STATE.engine
+                        eng.frames += 1
+                        eng.last_event_ts = ts
+                        STATE.raw_ring.append({"ts": ts, "raw": obj})
+
+                        # Extract trades best-effort
+                        trades: List[Dict[str, Any]] = []
+                        try:
+                            d = obj.get("data") if isinstance(obj, dict) else None
+                            if isinstance(d, list):
+                                trades = [it for it in d if isinstance(it, dict)]
+                            elif isinstance(d, dict) and isinstance(d.get("deals"), list):
+                                trades = [it for it in d["deals"] if isinstance(it, dict)]
+                            elif isinstance(d, dict) and isinstance(d.get("trades"), list):
+                                trades = [it for it in d["trades"] if isinstance(it, dict)]
+                        except Exception:
+                            trades = []
+
+                        for t in trades[:50]:
+                            px = _as_float(t.get("p") or t.get("price") or t.get("px"))
+                            qty = _as_float(t.get("v") or t.get("qty") or t.get("q") or t.get("size"))
+                            side = _norm_side(t.get("S") or t.get("side") or t.get("takerSide") or t.get("m"))
+                            eng.trades_seen += 1
+                            eng.last_trade_px = px
+                            eng.last_trade_qty = qty
+                            eng.last_trade_side = side
+                            eng.last_trade_ts = ts
+                            STATE.tape_ring.append({
+                                "ts": ts,
+                                "px": px,
+                                "qty": qty,
+                                "side": side,
+                                "raw_type": obj.get("method") or obj.get("channel") or obj.get("c"),
+                            })
+
+                        STATE.health = _compute_health()
+
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _bootlog(f"WS loop error: {err}\n{traceback.format_exc()}")
+            async with STATE_LOCK:
+                STATE.engine.status = "ERROR"
+                STATE.engine.last_error = err
+                STATE.engine.reconnects += 1
+                STATE.health = _compute_health()
+            await asyncio.sleep(backoff)
+            backoff = min(RECONNECT_MAX_S, max(RECONNECT_MIN_S, backoff * 1.7))
 
 
-async def _ws_once() -> None:
-    async with websockets.connect(
-        WS_URL,
-        ping_interval=None,
-        close_timeout=10,
-        max_queue=256,
-    ) as ws:
-        with LOCK:
-            state["status"] = "CONNECTED"
-            state["last_connect_ts"] = _now()
-            state["last_error"] = ""
-            state["last_close_code"] = None
-            state["last_close_reason"] = ""
+# -----------------------------
+# FastAPI app
+# -----------------------------
+APP = None
 
-        ptask = asyncio.create_task(_ping_loop(ws))
+if FastAPI is not None:
+    from contextlib import asynccontextmanager
 
-        await ws.send(json.dumps(_sub_depth_msg()))
-        await ws.send(json.dumps(_sub_deal_msg()))
+    @asynccontextmanager
+    async def lifespan(app: "FastAPI"):
+        _bootlog("Lifespan startup entered")
+        try:
+            if os.environ.get("QD_CLEAR_BOOTLOG", "0") == "1" and os.path.exists(BOOT_LOG_PATH):
+                os.remove(BOOT_LOG_PATH)
+        except Exception:
+            pass
 
-        while True:
-            msg = await ws.recv()
-            ts = _now()
-            with LOCK:
-                state["frames"] += 1
-                state["last_event_ts"] = ts
-
-            if isinstance(msg, bytes):
-                msg_s = msg.decode("utf-8", errors="replace")
-            else:
-                msg_s = str(msg)
-
-            RAW_RING.push({"ts": ts, "raw": msg_s[:4000]})
-
+        task = asyncio.create_task(_ws_loop())
+        try:
+            yield
+        finally:
+            _bootlog("Lifespan shutdown entered")
+            task.cancel()
             try:
-                j = json.loads(msg_s)
+                await task
             except Exception:
-                with LOCK:
-                    state["parse_misses"] += 1
-                continue
+                pass
 
-            if not isinstance(j, dict):
-                with LOCK:
-                    state["parse_misses"] += 1
-                continue
+    app = FastAPI(lifespan=lifespan)
 
-            ch = str(j.get("channel", ""))
-            sym = str(j.get("symbol", "")).upper() if j.get("symbol") else ""
+    @app.get("/", response_class=HTMLResponse)
+    async def index():
+        return HTMLResponse(_html_index())
 
-            if sym and sym != SYMBOL.upper():
-                continue
+    @app.get("/bootlog.txt", response_class=PlainTextResponse)
+    async def bootlog():
+        try:
+            if not os.path.exists(BOOT_LOG_PATH):
+                return PlainTextResponse("boot log empty\n")
+            with open(BOOT_LOG_PATH, "r", encoding="utf-8") as f:
+                return PlainTextResponse(f.read())
+        except Exception as e:
+            return PlainTextResponse(f"bootlog read error: {repr(e)}\n")
 
-            with LOCK:
-                if ch == "push.depth":
-                    state["depth_msgs"] += 1
-                    data = j.get("data")
-                    if isinstance(data, dict):
-                        _apply_depth_merge(data)
-                        state["parse_hits"] += 1
-                    else:
-                        state["parse_misses"] += 1
-                elif ch == "push.deal":
-                    data = j.get("data")
-                    if isinstance(data, list) and data:
-                        for t in data:
-                            if not isinstance(t, dict):
-                                continue
-                            px = t.get("p")
-                            qty = t.get("v")
-                            side = t.get("T")
-                            # MEXC spot push.deal: T=1 buy, T=2 sell
-                            side_s = "BUY" if str(side) == "1" else ("SELL" if str(side) == "2" else None)
-                            evt = {"ts": ts, "px": str(px) if px is not None else None, "qty": str(qty) if qty is not None else None, "side": side_s}
-                            TAPE.append(evt)
-                            state["trades_seen"] += 1
-                            if evt["px"] is not None:
-                                state["last_trade_px"] = evt["px"]
-                            if evt["qty"] is not None:
-                                state["last_trade_qty"] = evt["qty"]
-                            if evt["side"] is not None:
-                                state["last_trade_side"] = evt["side"]
-                            state["last_trade_ts"] = ts
-                    state["parse_hits"] += 1
+    @app.get("/health.json")
+    async def health():
+        async with STATE_LOCK:
+            STATE.health = _compute_health()
+            eng = STATE.engine
+            out = {
+                "ts": _now(),
+                "service": SERVICE,
+                "build": BUILD,
+                "subsystem": STATE.subsystem,
+                "health": STATE.health,
+                "uptime_s": round(_now() - STATE.started_ts, 3),
+                "ws_url": STATE.ws_url,
+                "symbol": STATE.symbol,
+                "connector": {
+                    "status": "CONNECTED" if eng.status == "ACTIVE" else ("ERROR" if eng.status == "ERROR" else "WARMING"),
+                    "frames": eng.frames,
+                    "reconnects": eng.reconnects,
+                    "last_error": eng.last_error,
+                    "last_event_ts": eng.last_event_ts,
+                    "last_connect_ts": eng.last_connect_ts,
+                    "last_close_code": eng.last_close_code,
+                    "last_close_reason": eng.last_close_reason,
+                },
+                "book": {
+                    "best_bid": eng.book.best_bid,
+                    "best_ask": eng.book.best_ask,
+                    "depth_counts": eng.book.depth_counts,
+                    "version": eng.book.version,
+                    "last_update_ts": eng.book.last_update_ts,
+                },
+                "tape": {
+                    "trades_seen": eng.trades_seen,
+                    "last_trade_px": eng.last_trade_px,
+                    "last_trade_qty": eng.last_trade_qty,
+                    "last_trade_side": eng.last_trade_side,
+                    "last_trade_ts": eng.last_trade_ts,
+                    "ring_size": len(STATE.tape_ring),
+                },
+                "import_errors": list(STATE.import_errors),
+                "host": HOST,
+                "port": PORT,
+            }
+            return JSONResponse(out)
+
+    @app.get("/telemetry.json")
+    async def telemetry():
+        async with STATE_LOCK:
+            eng = STATE.engine
+            return JSONResponse({
+                "ts": _now(),
+                "service": SERVICE,
+                "build": BUILD,
+                "health": STATE.health,
+                "uptime_s": _now() - STATE.started_ts,
+                "engine": {
+                    "status": eng.status,
+                    "frames": eng.frames,
+                    "reconnects": eng.reconnects,
+                    "last_error": eng.last_error,
+                    "last_event_age_s": (None if eng.last_event_ts is None else (_now() - eng.last_event_ts)),
+                },
+                "rings": {"raw": len(STATE.raw_ring), "tape": len(STATE.tape_ring)},
+            })
+
+    @app.get("/raw.json")
+    async def raw():
+        async with STATE_LOCK:
+            return JSONResponse({"ts": _now(), "build": BUILD, "raw_ring": list(STATE.raw_ring)})
+
+    @app.get("/book.json")
+    async def book():
+        async with STATE_LOCK:
+            b = STATE.engine.book
+            return JSONResponse({
+                "ts": _now(),
+                "build": BUILD,
+                "symbol": SYMBOL,
+                "best_bid": b.best_bid,
+                "best_ask": b.best_ask,
+                "depth_counts": b.depth_counts,
+                "totals": b.totals,
+                "version": b.version,
+                "last_update_ts": b.last_update_ts,
+            })
+
+    @app.get("/tape.json")
+    async def tape():
+        async with STATE_LOCK:
+            eng = STATE.engine
+            return JSONResponse({
+                "ts": _now(),
+                "build": BUILD,
+                "symbol": SYMBOL,
+                "trades_seen": eng.trades_seen,
+                "last_trade_px": eng.last_trade_px,
+                "last_trade_qty": eng.last_trade_qty,
+                "last_trade_side": eng.last_trade_side,
+                "last_trade_ts": eng.last_trade_ts,
+                "ring_size": len(STATE.tape_ring),
+                "tape": list(STATE.tape_ring),
+            })
+
+    APP = app
+
+
+# -----------------------------
+# Fallback minimal HTTP server (only if FastAPI missing)
+# -----------------------------
+def _run_fallback_http() -> None:
+    import http.server
+    import socketserver
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = {
+                "service": SERVICE,
+                "build": BUILD,
+                "health": "RED",
+                "error": "FastAPI not available",
+                "import_errors": STATE.import_errors,
+            }
+            raw = (json.dumps(body, indent=2) + "\n").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    with socketserver.TCPServer((HOST, PORT), Handler) as httpd:
+        _bootlog(f"Fallback HTTP server listening on {HOST}:{PORT}")
+        httpd.serve_forever()
+
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
+def main() -> None:
+    _bootlog(f"Starting {SERVICE} {BUILD} on {HOST}:{PORT}")
+    try:
+        if APP is None:
+            _run_fallback_http()
+            return
+
+        import uvicorn
+        uvicorn.run(APP, host=HOST, port=PORT, log_level="warning")
+    except Exception as e:
+        _bootlog(f"Fatal main() exception: {repr(e)}\n{traceback.format_exc()}")
+        while True:
+            time.sleep(1.0)
+
+
+if __name__ == "__main__":
+    main()
