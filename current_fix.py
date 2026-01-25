@@ -29,6 +29,8 @@
 
 import asyncio
 import json
+import urllib.request
+import urllib.parse
 import math
 import os
 import time
@@ -43,13 +45,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX17/P04_FIX2"
+BUILD = "FIX18/P01"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
 
 SYMBOL = os.environ.get("QD_SYMBOL", "BTC_USDT")
 WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
+REST_DEPTH_URL = os.environ.get("QD_REST_DEPTH_URL", "https://contract.mexc.com/api/v1/contract/depth/")
+
 
 # Render controls (minimal)
 RENDER_FPS = float(os.environ.get("QD_RENDER_FPS", "8"))
@@ -167,6 +171,11 @@ class State:
     depth_updates_applied: int = 0
     snapshots_seen: int = 0
 
+    # REST snapshot seeding telemetry
+    rest_seed_ok: int = 0
+    rest_seed_err: int = 0
+    last_rest_seed_ms: int = 0
+
 
 STATE = State()
 
@@ -231,7 +240,7 @@ def _apply_side_updates(side: Dict[float, float], raw_levels: Any) -> int:
         qty = None
         if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
             px = _as_float(lvl[0])
-            qty = _as_float(lvl[1])
+            qty = _as_float(lvl[2] if len(lvl) >= 3 else lvl[1])
         elif isinstance(lvl, dict):
             px = _as_float(lvl.get("price") or lvl.get("p"))
             qty = _as_float(lvl.get("quantity") or lvl.get("q"))
@@ -386,6 +395,53 @@ def _route_message(obj: Dict[str, Any]) -> None:
 # Connector loop (resilient)
 # ----------------------------
 
+
+
+
+async def _rest_seed_depth_snapshot(symbol: str) -> None:
+    """Seed local book from REST depth snapshot for correctness and fast first paint.
+
+    Official REST: GET /api/v1/contract/depth/{symbol}
+    Schema: asks/bids levels are [price, orderNumbers, quantity]
+    """
+    global BOOK_VERSION, BOOK_TS_MS, BOOK_LAST_TOUCH_MS
+
+    try:
+        url = urllib.parse.urljoin(REST_DEPTH_URL, urllib.parse.quote(symbol))
+        def _fetch() -> dict:
+            with urllib.request.urlopen(url, timeout=8) as r:
+                raw = r.read()
+            return json.loads(raw.decode("utf-8", errors="replace"))
+
+        payload = await asyncio.to_thread(_fetch)
+        data = payload.get("data") or {}
+
+        asks = data.get("asks") or []
+        bids = data.get("bids") or []
+        version = int(data.get("version") or 0)
+        ts_ms = int(data.get("timestamp") or 0)
+        now_ms = _now_ms()
+
+        if not asks and not bids:
+            return
+
+        with BOOK_LOCK:
+            BOOK_ASKS.clear()
+            BOOK_BIDS.clear()
+            _apply_side_updates(BOOK_ASKS, asks, is_ask=True)
+            _apply_side_updates(BOOK_BIDS, bids, is_ask=False)
+            BOOK_VERSION = max(BOOK_VERSION, version)
+            BOOK_TS_MS = ts_ms or now_ms
+            BOOK_LAST_TOUCH_MS = now_ms
+
+        STATE.rest_seed_ok += 1
+        STATE.last_rest_seed_ms = now_ms
+    except Exception:
+        STATE.rest_seed_err += 1
+        STATE.last_rest_seed_ms = _now_ms()
+        return
+
+
 async def _connector_loop() -> None:
     """Maintain a resilient WS connection to MEXC contract market stream.
 
@@ -399,6 +455,8 @@ async def _connector_loop() -> None:
             STATE.status = "CONNECTING"
             STATE.last_error = None
             bootlog(f"CONNECTING ws={WS_URL} symbol={SYMBOL}")
+            # Seed with REST snapshot so the book has a correct baseline even before WS updates.
+            await _rest_seed_depth_snapshot(SYMBOL)
 
             async with websockets.connect(
                 WS_URL,
