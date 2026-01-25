@@ -45,7 +45,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX18/P01"
+BUILD = "FIX18/P01_FIX1"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -189,6 +189,86 @@ def _mid_px() -> Optional[float]:
     if STATE.trades:
         return STATE.trades[-1].px
     return bb or ba
+
+
+
+def _render_frame(levels: int, step: float) -> Dict[str, Any]:
+    ts = _now()
+    mid = _mid_px()
+    bb = STATE.book.best_bid
+    ba = STATE.book.best_ask
+
+    # Create a symmetric ladder around mid if possible
+    prices: List[float] = []
+    bid_qty: List[float] = []
+    ask_qty: List[float] = []
+
+    if mid is not None and step > 0 and levels > 0:
+        center = round(mid / step) * step
+        half = levels // 2
+        start = center - half * step
+        for i in range(levels):
+            px = round(start + i * step, 10)
+            prices.append(px)
+            bid_qty.append(float(STATE.book.bids.get(px, 0.0)))
+            ask_qty.append(float(STATE.book.asks.get(px, 0.0)))
+
+    # Tape (last N, newest last)
+    tape = [
+        {"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side}
+        for t in list(STATE.trades)[-50:]
+    ]
+
+    last_event_age = None
+    if STATE.last_event_ts is not None:
+        last_event_age = ts - STATE.last_event_ts
+
+    return {
+        "ts": ts,
+        "service": SERVICE,
+        "build": BUILD,
+        "symbol": SYMBOL,
+        "ws_url": WS_URL,
+        "health": "GREEN" if STATE.status == "CONNECTED" else ("YELLOW" if STATE.status in ("INIT", "CONNECTING") else "RED"),
+        "connector": {
+            "status": STATE.status,
+            "frames": STATE.frames,
+            "reconnects": STATE.reconnects,
+            "last_error": STATE.last_error,
+            "last_event_age_s": last_event_age,
+        },
+        "book": {
+            "best_bid": bb,
+            "best_ask": ba,
+            "version": STATE.book.version,
+            "depth_counts": {"bids": len(STATE.book.bids), "asks": len(STATE.book.asks)},
+            "totals": {"bid_qty": STATE.book.bid_qty_total, "ask_qty": STATE.book.ask_qty_total},
+            "last_update_ts": STATE.book.last_update_ts,
+        },
+        "tape": {
+            "trades_seen": len(STATE.trades),
+            "last_trade_px": STATE.trades[-1].px if STATE.trades else None,
+            "last_trade_qty": STATE.trades[-1].qty if STATE.trades else None,
+            "last_trade_side": STATE.trades[-1].side if STATE.trades else None,
+            "last_trade_ts": STATE.trades[-1].ts if STATE.trades else None,
+            "items": tape,
+        },
+        "render": {
+            "levels": levels,
+            "step": step,
+            "mid_px": mid,
+            "prices": prices,
+            "bid_qty": bid_qty,
+            "ask_qty": ask_qty,
+        },
+    }
+
+
+# ----------------------------
+# FastAPI App (with lifespan)
+# ----------------------------
+
+app = FastAPI(title="QuantDesk Bookmap", version=BUILD)
 
 
 def _update_anchor() -> Optional[float]:
