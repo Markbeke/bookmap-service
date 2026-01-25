@@ -220,7 +220,7 @@ async def _ws_loop() -> None:
     while True:
         try:
             STATE.status = "CONNECTING"
-            bootlog(f"CONNECTING {WS_URL} symbol={SYMBOL}")
+            bootlog(f"CONNECTING {WS_URL} symbol=__SYMBOL__")
             async with websockets.connect(WS_URL, ping_interval=15, ping_timeout=15, close_timeout=5) as ws:
                 # Subscribe to depth + trades (known working format from prior FIXes)
                 sub_depth = {"method": "sub.depth", "param": {"symbol": SYMBOL, "depth": DEPTH_N}}
@@ -296,7 +296,7 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def _startup() -> None:
-    bootlog(f"BOOT {SERVICE} {BUILD} PORT={PORT}")
+    bootlog(f"BOOT {SERVICE} __BUILD__ PORT={PORT}")
     asyncio.create_task(_ws_loop())
     STATE.status = "WARMING"
 
@@ -420,12 +420,12 @@ async def render_ws(ws: WebSocket) -> None:
 # ----------------------------
 
 def _ui_html() -> str:
-    return f"""<!doctype html>
+    html = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
-  <title>QuantDesk Bookmap — {BUILD}</title>
+  <title>QuantDesk Bookmap — __BUILD__</title>
   <style>
     body {{
       margin:0; padding:0;
@@ -477,7 +477,7 @@ def _ui_html() -> str:
     <div class="card" style="flex: 1 1 680px;">
       <div class="k">
         <b>QuantDesk Bookmap</b>
-        <span class="pill">{BUILD}</span>
+        <span class="pill">__BUILD__</span>
         <span class="pill" id="pillHealth">HEALTH</span>
         <span class="pill" id="pillMode">LIVE</span>
         <span class="pill" id="pillScale">t=1.0s/col</span>
@@ -765,7 +765,7 @@ def _ui_html() -> str:
     const bid = lastSnapshot?.best_bid ?? 0;
     const ask = lastSnapshot?.best_ask ?? 0;
     const mid = (bid>0 && ask>0) ? (bid+ask)/2 : 0;
-    ctx.fillText(`{SYMBOL}  bid ${bid.toFixed(2)}  ask ${ask.toFixed(2)}  mid ${mid.toFixed(2)}`, 14, 26);
+    ctx.fillText(`__SYMBOL__  bid ${bid.toFixed(2)}  ask ${ask.toFixed(2)}  mid ${mid.toFixed(2)}`, 14, 26);
 
     const topPrice = idxToPrice(pMax).toFixed(2);
     const botPrice = idxToPrice(pMin).toFixed(2);
@@ -1015,7 +1015,7 @@ def _ui_html() -> str:
 </script>
 </body>
 </html>"""
-
+    return html.replace("{{","{").replace("}}","}").replace("__BUILD__", BUILD).replace("__SYMBOL__", SYMBOL)
 @app.get("/")
 async def index() -> HTMLResponse:
     return HTMLResponse(_ui_html())
