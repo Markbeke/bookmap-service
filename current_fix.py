@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX16/P02"
+BUILD = "FIX16/P03"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -588,50 +588,73 @@ async def render_json() -> JSONResponse:
 
 @app.websocket("/render.ws")
 async def render_ws(ws: WebSocket) -> None:
+    """
+    Bidirectional render bridge:
+      - Server -> client: continuous render frames (JSON)
+      - Client -> server: {"cmd":"set_view","levels":..,"step":..,"pan_ticks":..}
+    FIX16_P03:
+      - Reliable receive loop (timeout=0.0 caused control messages to be missed)
+    """
     await ws.accept()
-    # Per-connection interactive view state
-    view_levels = int(RENDER_LEVELS)
-    view_step = float(RENDER_STEP)
-    pan_ticks = 0.0
+
+    # Per-connection interactive view state (mutable)
+    view_state = {
+        "levels": int(RENDER_LEVELS),
+        "step": float(RENDER_STEP),
+        "pan_ticks": 0.0,
+    }
+
+    def _apply_view(payload: dict) -> None:
+        try:
+            if "levels" in payload:
+                lv = int(payload["levels"])
+                if 40 <= lv <= 800:
+                    view_state["levels"] = lv
+            if "step" in payload:
+                st = float(payload["step"])
+                # Clamp to avoid degenerate windows
+                if st > 0:
+                    view_state["step"] = max(1e-6, min(st, 1e6))
+            if "pan_ticks" in payload:
+                pt = float(payload["pan_ticks"])
+                view_state["pan_ticks"] = max(-2000.0, min(pt, 2000.0))
+        except Exception:
+            # ignore malformed values
+            return
+
+    async def _recv_loop() -> None:
+        while True:
+            try:
+                msg = await ws.receive_text()
+            except Exception:
+                return
+            try:
+                payload = json.loads(msg)
+                if isinstance(payload, dict) and payload.get("cmd") == "set_view":
+                    _apply_view(payload)
+            except Exception:
+                # ignore malformed control messages
+                pass
+
+    recv_task = asyncio.create_task(_recv_loop())
     try:
         interval = 1.0 / max(1.0, float(RENDER_FPS))
         while True:
-            # Non-blocking receive: apply client view updates if present
-            try:
-                msg = await asyncio.wait_for(ws.receive_text(), timeout=0.0)
-            except asyncio.TimeoutError:
-                msg = None
-            except Exception:
-                return
-
-            if msg:
-                try:
-                    payload = json.loads(msg)
-                    if isinstance(payload, dict) and payload.get("cmd") == "set_view":
-                        if "levels" in payload:
-                            lv = int(payload["levels"])
-                            if 40 <= lv <= 800:
-                                view_levels = lv
-                        if "step" in payload:
-                            st = float(payload["step"])
-                            # Clamp to avoid degenerate windows
-                            if st > 0:
-                                view_step = max(1e-6, min(st, 1e6))
-                        if "pan_ticks" in payload:
-                            pt = float(payload["pan_ticks"])
-                            # Clamp panning to a bounded range to prevent runaway
-                            pan_ticks = max(-2000.0, min(pt, 2000.0))
-                except Exception:
-                    # ignore malformed control messages
-                    pass
-
-            frame = _render_frame(view_levels, view_step, pan_ticks=pan_ticks)
+            frame = _render_frame(
+                int(view_state["levels"]),
+                float(view_state["step"]),
+                pan_ticks=float(view_state["pan_ticks"]),
+            )
             STATE.frames += 1
             await ws.send_text(json.dumps(frame))
             await asyncio.sleep(interval)
     except Exception:
-        # client disconnected or send failure
         return
+    finally:
+        try:
+            recv_task.cancel()
+        except Exception:
+            pass
 
 
 def _ui_html() -> str:
@@ -658,7 +681,7 @@ def _ui_html() -> str:
       .grid {{ grid-template-columns: 1.2fr 0.8fr; }}
     }}
     .card {{ border:1px solid #eee; border-radius:12px; padding:12px; box-shadow: 0 1px 8px rgba(0,0,0,0.04); }}
-    canvas {{ width:100%; height:520px; border:1px solid #eee; border-radius:12px; background:#fff; }}
+    canvas {{ width:100%; height:520px; border:1px solid #eee; border-radius:12px; background:#fff; touch-action:none; user-select:none; -webkit-user-select:none; }}
     .small {{ font-size: 12px; }}
     a {{ color: inherit; }}
     .endpoints a {{ display:inline-block; margin-right:12px; }}
