@@ -1123,7 +1123,7 @@ def _ui_html() -> str:
     #     pinch: price zoom
     #     2-finger horizontal drag: time scrub
     #     2-finger vertical drag: time zoom (downsample)
-    return f"""<!doctype html>
+    html = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -1563,6 +1563,18 @@ def _ui_html() -> str:
 </script>
 </body>
 </html>"""
+    # Inject runtime constants without using an f-string (avoids brace conflicts with JS).
+    html = (html
+        .replace("{SERVICE}", str(SERVICE))
+        .replace("{BUILD}", str(BUILD))
+        .replace("{SYMBOL}", str(SYMBOL))
+        .replace("{BM_DEFAULT_PRICE_SPAN_BINS}", str(BM_DEFAULT_PRICE_SPAN_BINS))
+        .replace("{BM_MIN_PRICE_SPAN_BINS}", str(BM_MIN_PRICE_SPAN_BINS))
+        .replace("{BM_MAX_PRICE_SPAN_BINS}", str(BM_MAX_PRICE_SPAN_BINS))
+        .replace("{BM_MAX_DOWNSAMPLE}", str(BM_MAX_DOWNSAMPLE))
+    )
+    return html
+
 
 
 @app.get("/")
