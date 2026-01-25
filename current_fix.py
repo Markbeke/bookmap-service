@@ -45,7 +45,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX18/P01_FIX1"
+BUILD = "FIX18/P01_FIX2"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -146,6 +146,7 @@ class State:
     status: str = "INIT"  # INIT | CONNECTING | CONNECTED | ERROR
     last_error: Optional[str] = None
     reconnects: int = 0
+    ws_reconnects: int = 0
     frames: int = 0
     last_event_ts: Optional[float] = None
 
@@ -582,6 +583,7 @@ async def _connector_loop() -> None:
             STATE.status = "ERROR"
             STATE.last_error = f"{type(e).__name__}: {e}"
             STATE.ws_reconnects += 1
+            STATE.reconnects += 1
             bootlog(f"WS ERROR: {STATE.last_error}")
         finally:
             if ping_task is not None:
@@ -619,13 +621,20 @@ async def bootlog_txt() -> PlainTextResponse:
 
 @app.get("/health.json")
 async def health_json() -> JSONResponse:
-    frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
-    return JSONResponse({"service": SERVICE, "build": BUILD, "health": frame["health"], "connector": frame["connector"], "book": frame["book"]})
+    try:
+        frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
+        payload = {"service": SERVICE, "build": BUILD, "health": frame.get("health"), "connector": frame.get("connector"), "book": frame.get("book")}
+    except Exception as e:
+        payload = {"service": SERVICE, "build": BUILD, "health": "RED", "connector": {"status": "ERROR", "last_error": repr(e)}, "book": {"best_bid": None, "best_ask": None}}
+    return JSONResponse(payload)
 
 
 @app.get("/telemetry.json")
 async def telemetry_json() -> JSONResponse:
-    frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
+    try:
+        frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
+    except Exception as e:
+        frame = {"service": SERVICE, "build": BUILD, "symbol": SYMBOL, "status": "ERROR", "error": repr(e), "frames": STATE.frames, "ws_reconnects": STATE.ws_reconnects, "reconnects": STATE.reconnects, "last_update_ts": STATE.book.last_update_ts}
     return JSONResponse(frame)
 
 
