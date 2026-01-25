@@ -72,7 +72,9 @@ except Exception as _e:
 
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX20/P06"
+BUILD = "FIX20/P08"
+WS_PATH = "/render.ws"
+PROTOCOL_VERSION = "bmws/1"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -978,6 +980,19 @@ async def telemetry_json() -> JSONResponse:
     frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
     return JSONResponse(frame)
 
+@app.get("/ws_contract.json")
+async def ws_contract() -> JSONResponse:
+    """
+    WebSocket contract for the UI (used for debugging/reconnect safety).
+    This is intentionally small and stable.
+    """
+    return JSONResponse(_sanitize({
+        "ws_path": WS_PATH,
+        "protocol": PROTOCOL_VERSION,
+        "build": BUILD,
+        "symbol": SYMBOL,
+    }))
+
 
 @app.get("/book.json")
 async def book_json() -> JSONResponse:
@@ -1027,6 +1042,11 @@ async def render_ws(ws: WebSocket) -> None:
       - Reliable receive loop (timeout=0.0 caused control messages to be missed)
     """
     await ws.accept()
+    bootlog(f"WS ACCEPTED {WS_PATH} client={getattr(ws, 'client', None)}")
+    try:
+        await ws.send_text(json.dumps(_sanitize({"type":"hello","protocol":PROTOCOL_VERSION,"build":BUILD,"symbol":SYMBOL,"ts":time.time()})))
+    except Exception as _e:
+        bootlog(f"WS HELLO send failed: {_e}")
 
     # Per-connection interactive view state (mutable)
     view_state = {
@@ -1160,6 +1180,7 @@ def _ui_html() -> str:
   <div id="topbar">
     <div class="pill" id="jump">JUMP</div>
     <div id="health" class="pill yellow">HEALTH: YELLOW</div>
+    <div id="wsstate" class="pill">WS: --</div>
     <div id="mode" class="pill">LIVE</div>
     <div id="scale" class="pill">TIME: --</div>
     <div id="offset" class="pill">OFFSET: --</div>
@@ -1178,6 +1199,7 @@ def _ui_html() -> str:
   const cv = document.getElementById('cv');
   const ctx = cv.getContext('2d', {{ alpha: false }});
   const healthEl = document.getElementById('health');
+  const wsEl = document.getElementById('wsstate');
   const modeEl = document.getElementById('mode');
   const scaleEl = document.getElementById('scale');
   const offsetEl = document.getElementById('offset');
@@ -1206,8 +1228,13 @@ def _ui_html() -> str:
   let ws = null;
   function wsUrl() {{
     const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-    return proto + '//' + location.host + '/render.ws';
+    return proto + '//' + location.host + '{WS_PATH}';
   }}
+
+  function setWsState(s) {
+    if (!wsEl) return;
+    wsEl.textContent = 'WS: ' + (s || '--');
+  }
 
   function setHealth(h) {{
     healthEl.classList.remove('green','yellow','red');
@@ -1249,16 +1276,28 @@ def _ui_html() -> str:
 
   function connect() {{
     ws = new WebSocket(wsUrl());
-    ws.onopen = () => {{ sendView(); }};
-    ws.onmessage = (ev) => {{
-      try {{
-        const frame = JSON.parse(ev.data);
-        draw(frame);
-      }} catch(e) {{}}
-    }};
-    ws.onclose = () => {{
+    setWsState('CONNECTING');
+    ws.onopen = () => { setWsState('OPEN'); sendView(); };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg && msg.type === 'hello') {
+          // Contract handshake (non-blocking, but visible for diagnostics)
+          const p = msg.protocol || '--';
+          setWsState('OPEN ' + p);
+          return;
+        }
+        draw(msg);
+      } catch(e) {
+        // Surface parse errors by flipping WS state briefly.
+        setWsState('BAD_JSON');
+      }
+    };
+    ws.onerror = () => { setWsState('ERROR'); };
+    ws.onclose = () => {
+      setWsState('CLOSED');
       setTimeout(connect, 750);
-    }};
+    };
   }}
   connect();
 
@@ -1576,6 +1615,7 @@ def _ui_html() -> str:
         .replace("{BM_MIN_PRICE_SPAN_BINS}", str(BM_MIN_PRICE_SPAN_BINS))
         .replace("{BM_MAX_PRICE_SPAN_BINS}", str(BM_MAX_PRICE_SPAN_BINS))
         .replace("{BM_MAX_DOWNSAMPLE}", str(BM_MAX_DOWNSAMPLE))
+        .replace("{WS_PATH}", str(WS_PATH))
     )
     return html
 
