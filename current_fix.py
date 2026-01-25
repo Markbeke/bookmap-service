@@ -1,5 +1,5 @@
 # =========================================================
-# QuantDesk Bookmap Service — FIX13_RENDER_BRIDGE_CONTRACT
+# QuantDesk Bookmap Service — FIX14_CLOB_SIDE_PARITY_INCREMENTAL_MERGE
 # Replit runtime contract:
 # - Single entrypoint: current_fix.py
 # - FastAPI on 0.0.0.0:5000
@@ -43,7 +43,7 @@ except Exception:  # pragma: no cover
 # ----------------------------
 # Runtime configuration
 # ----------------------------
-BUILD = "FIX13/P01"
+BUILD = "FIX14/P01"
 SERVICE = "qd-bookmap"
 SYMBOL = os.getenv("QD_SYMBOL", "BTC_USDT")
 WS_URL = os.getenv("QD_WS_URL", "wss://contract.mexc.com/edge")  # contract WS
@@ -169,6 +169,12 @@ class State:
     book: Book = field(default_factory=Book)
     snapshots_applied: int = 0
 
+    # depth merge stats / parity (FIX14)
+    depth_updates_applied: int = 0
+    last_bid_side_ts: Optional[float] = None
+    last_ask_side_ts: Optional[float] = None
+    last_parity_ok_ts: Optional[float] = None
+
     def uptime_s(self) -> float:
         return _now() - self.start_ts
 
@@ -179,12 +185,16 @@ STATE = State()
 # Depth parsing & merge
 # ----------------------------
 
-def _apply_depth_snapshot(obj: Dict[str, Any], ts: float) -> bool:
+def _apply_depth_update(obj: Dict[str, Any], ts: float) -> bool:
     """
-    Accepts MEXC contract depth push. Seen variants include:
-      { "channel":"push.depth", "symbol":"BTC_USDT", "data": {"bids":[[px,qty],...], "asks":[[px,qty],...], "version": ... } }
-    and/or:
-      { "data": {"bids":..., "asks":...}, "symbol":..., "ts": ... }
+    Applies MEXC contract depth payloads in a *parity-safe* way.
+
+    Critical FIX14 change:
+    - Do NOT overwrite the entire book when only one side (bids/asks) is present.
+    - Support incremental merging semantics: qty<=0 deletes level; qty>0 sets level.
+
+    We treat a payload as a "full snapshot" only when BOTH sides are present
+    and the book is empty OR the payload looks large enough to plausibly be a snapshot.
     """
     data = obj.get("data")
     if not isinstance(data, dict):
@@ -195,14 +205,9 @@ def _apply_depth_snapshot(obj: Dict[str, Any], ts: float) -> bool:
     if not isinstance(bids, list) and not isinstance(asks, list):
         return False
 
-    # Build new maps (snapshot semantics)
-    new_bids: Dict[float, float] = {}
-    new_asks: Dict[float, float] = {}
-
-    def _ingest(side_list: Any, out: Dict[float, float]) -> None:
+    def _iter_levels(side_list: Any):
         if not isinstance(side_list, list):
             return
-        # Each entry may be [px, qty] or {"price":..., "quantity":...}
         for lvl in side_list[:DEPTH_MAX_LEVELS]:
             px = qty = None
             if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
@@ -213,22 +218,76 @@ def _apply_depth_snapshot(obj: Dict[str, Any], ts: float) -> bool:
                 qty = _as_float(lvl.get("quantity") or lvl.get("q"))
             if px is None or qty is None:
                 continue
-            if qty <= 0:
-                continue
-            out[px] = qty
+            yield float(px), float(qty)
 
-    _ingest(bids, new_bids)
-    _ingest(asks, new_asks)
+    # Heuristic: treat as full snapshot only when both sides present and either
+    # (a) we have no book yet, or (b) the payload size is large.
+    both_present = isinstance(bids, list) and isinstance(asks, list)
+    looks_like_snapshot = both_present and (
+        (len(STATE.book.bids) == 0 and len(STATE.book.asks) == 0) or
+        (len(bids) >= 50 and len(asks) >= 50)
+    )
 
-    # Apply
-    STATE.book.bids = new_bids
-    STATE.book.asks = new_asks
+    if looks_like_snapshot:
+        new_bids: Dict[float, float] = {}
+        new_asks: Dict[float, float] = {}
+
+        for px, qty in _iter_levels(bids):
+            if qty > 0:
+                new_bids[px] = qty
+        for px, qty in _iter_levels(asks):
+            if qty > 0:
+                new_asks[px] = qty
+
+        STATE.book.bids = new_bids
+        STATE.book.asks = new_asks
+        STATE.snapshots_applied += 1
+        STATE.depth_updates_applied += 1
+
+        STATE.last_bid_side_ts = ts if new_bids else STATE.last_bid_side_ts
+        STATE.last_ask_side_ts = ts if new_asks else STATE.last_ask_side_ts
+    else:
+        changed = False
+
+        if isinstance(bids, list):
+            # incremental merge for bids
+            for px, qty in _iter_levels(bids):
+                if qty <= 0:
+                    if px in STATE.book.bids:
+                        del STATE.book.bids[px]
+                        changed = True
+                else:
+                    if STATE.book.bids.get(px) != qty:
+                        STATE.book.bids[px] = qty
+                        changed = True
+            STATE.last_bid_side_ts = ts
+
+        if isinstance(asks, list):
+            # incremental merge for asks
+            for px, qty in _iter_levels(asks):
+                if qty <= 0:
+                    if px in STATE.book.asks:
+                        del STATE.book.asks[px]
+                        changed = True
+                else:
+                    if STATE.book.asks.get(px) != qty:
+                        STATE.book.asks[px] = qty
+                        changed = True
+            STATE.last_ask_side_ts = ts
+
+        if changed:
+            STATE.depth_updates_applied += 1
+
+    # version / timestamps
     STATE.book.version = _as_int(data.get("version") or obj.get("version") or obj.get("v"))
     STATE.book.last_update_ts = ts
     STATE.book.recompute()
-    STATE.snapshots_applied += 1
-    return True
 
+    # parity signal
+    if STATE.book.best_bid is not None and STATE.book.best_ask is not None and len(STATE.book.bids) > 0 and len(STATE.book.asks) > 0:
+        STATE.last_parity_ok_ts = ts
+
+    return True
 
 def _extract_trade_events(obj: Dict[str, Any], ts: float) -> int:
     """
@@ -303,7 +362,7 @@ def _handle_ws_message(raw: str) -> None:
 
         # Depth: push.depth or any dict containing bids/asks
         if "depth" in ch_l or ("data" in obj and isinstance(obj.get("data"), dict) and ("bids" in obj["data"] or "asks" in obj["data"])):
-            if _apply_depth_snapshot(obj, ts):
+            if _apply_depth_update(obj, ts):
                 hit = True
 
         # Deals/trades: push.deal, push.trade, deals, etc.
@@ -486,12 +545,23 @@ async def health_json() -> JSONResponse:
     # RED: server up but connector in ERROR
     now = _now()
     fresh = (STATE.last_event_ts is not None) and (now - STATE.last_event_ts < 5.0)
-    if STATE.status == "CONNECTED" and fresh and STATE.frames > 0:
-        h = "GREEN"
-    elif STATE.status == "ERROR":
+    parity_ok = (STATE.book.best_bid is not None) and (STATE.book.best_ask is not None) and (len(STATE.book.bids) > 0) and (len(STATE.book.asks) > 0)
+    # Health semantics:
+    # GREEN: server up + connector CONNECTED + fresh frames + book parity OK
+    # YELLOW: warmup/degraded (e.g., parity not yet achieved) but not fatal
+    # RED: connector ERROR OR prolonged parity failure while connected
+    if STATE.status == "ERROR":
         h = "RED"
     else:
-        h = "YELLOW"
+        if STATE.status == "CONNECTED" and fresh and STATE.frames > 0:
+            if parity_ok:
+                h = "GREEN"
+            else:
+                # allow warmup; after extended time, treat as RED because visuals would be misleading
+                up = STATE.uptime_s()
+                h = "YELLOW" if up < 30.0 else "RED"
+        else:
+            h = "YELLOW"
     return JSONResponse({
         "ts": now,
         "service": SERVICE,
@@ -514,6 +584,10 @@ async def health_json() -> JSONResponse:
             "depth_counts": {"bids": len(STATE.book.bids), "asks": len(STATE.book.asks)},
             "version": STATE.book.version,
             "last_update_ts": STATE.book.last_update_ts,
+            "parity_ok": (STATE.book.best_bid is not None) and (STATE.book.best_ask is not None) and (len(STATE.book.bids) > 0) and (len(STATE.book.asks) > 0),
+            "last_parity_ok_ts": STATE.last_parity_ok_ts,
+            "last_bid_side_ts": STATE.last_bid_side_ts,
+            "last_ask_side_ts": STATE.last_ask_side_ts,
         },
         "tape": {
             "trades_seen": len(STATE.trades),
@@ -546,6 +620,10 @@ async def telemetry_json() -> JSONResponse:
             "parse_hits": STATE.parse_hits,
             "parse_misses": STATE.parse_misses,
             "snapshots_applied": STATE.snapshots_applied,
+            "depth_updates_applied": STATE.depth_updates_applied,
+            "last_bid_side_ts": STATE.last_bid_side_ts,
+            "last_ask_side_ts": STATE.last_ask_side_ts,
+            "last_parity_ok_ts": STATE.last_parity_ok_ts,
         },
         "rings": {
             "raw_ring_size": len(STATE.raw_ring),
