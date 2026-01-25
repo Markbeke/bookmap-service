@@ -1563,6 +1563,10 @@ def _ui_html() -> str:
 </script>
 </body>
 </html>"""
+    # Normalize doubled braces ({{ }} were previously used for f-string escaping).
+    # Without this, embedded JS/CSS becomes invalid and the UI never opens the WebSocket.
+    html = html.replace("{{", "{").replace("}}", "}")
+
     # Inject runtime constants without using an f-string (avoids brace conflicts with JS).
     html = (html
         .replace("{SERVICE}", str(SERVICE))
