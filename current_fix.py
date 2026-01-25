@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =========================================================
-# QuantDesk Bookmap Service — FIX20_P02_HEATMAP_SIGNIFICANCE_CONTRAST_PARITY
+# QuantDesk Bookmap Service — FIX17_HEATMAP_TIME_DENSITY_LAYER
 #
 # Builds on FIX14 (parity-safe incremental book):
 # - Maintains canonical CLOB via incremental merge (no side wipeouts)
@@ -40,41 +40,10 @@ from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 # NOTE: We rely on `websockets` for WS client.
-
-
-def _is_finite_number(x: Any) -> bool:
-    try:
-        return isinstance(x, (int, float)) and math.isfinite(float(x))
-    except Exception:
-        return False
-
-def _sanitize(obj: Any) -> Any:
-    """Recursively replace NaN/Inf floats with None so JSON.parse never fails."""
-    if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize(v) for v in obj]
-    if _is_finite_number(obj):
-        return obj
-    if isinstance(obj, float):
-        return None
-    return obj
-
-def _safe_dumps(obj: Any) -> str:
-    try:
-        return json.dumps(obj, separators=(",", ":"), allow_nan=False)
-    except Exception:
-        return json.dumps(_sanitize(obj), separators=(",", ":"), allow_nan=False)
-try:
-    import websockets  # type: ignore
-except Exception as _e:
-    websockets = None  # type: ignore
-
+import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX20/P08"
-WS_PATH = "/render.ws"
-PROTOCOL_VERSION = "bmws/1"
+BUILD = "FIX20/P09"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -100,18 +69,26 @@ ANCHOR_HISTORY_SEC = float(os.environ.get("QD_ANCHOR_HISTORY_SEC", "90"))  # ove
 # Absolute price grid + horizontal time ring buffer + camera viewport.
 BM_BASE_COL_DT = float(os.environ.get("QD_BM_BASE_COL_DT", "0.25"))   # seconds per base column (producer cadence)
 BM_MAX_COLS = int(os.environ.get("QD_BM_MAX_COLS", "1200"))           # ring buffer width (columns)
-BM_DEFAULT_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_PRICE_SPAN_BINS", "2200"))  # visible price bins (zoom)
+
+# Fixed, instrument-specific price universe (camera can move into empty space)
+BM_GLOBAL_MIN_PRICE = float(os.environ.get("QD_BM_GLOBAL_MIN_PRICE", "0"))
+BM_GLOBAL_MAX_PRICE = float(os.environ.get("QD_BM_GLOBAL_MAX_PRICE", "200000"))
+BM_DEFAULT_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_PRICE_SPAN_BINS", "700"))  # visible price bins (zoom)
+
+# Instrument-specific price universe (Bookmap-like: pan/zoom across wide absolute ranges).
+# For BTC_USDT we default to a generous universe so you can jump/pan to 95k/120k etc.
+# This is a VIEW constraint only; it does not invent data (empty space remains empty).
+BM_UNIVERSE_MIN_PRICE = float(os.getenv("QD_BM_UNIVERSE_MIN_PRICE", "0"))
+BM_UNIVERSE_MAX_PRICE = float(os.getenv("QD_BM_UNIVERSE_MAX_PRICE", "200000"))
+
+# Price LOD: keep per-column point counts bounded when zoomed out massively.
+# We aggregate intensities into coarser bins when the visible span is very large.
+BM_PRICE_LOD_TARGET_BINS = int(os.getenv("QD_BM_PRICE_LOD_TARGET_BINS", "2200"))  # ~points/col max
+
 BM_DEFAULT_TIME_WINDOW_S = float(os.environ.get("QD_BM_TIME_WINDOW_S", "90"))     # target visible time span in seconds at default scale
 BM_MAX_DOWNSAMPLE = int(os.environ.get("QD_BM_MAX_DOWNSAMPLE", "64"))             # max column skip factor at extreme zoom-out
 BM_MIN_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_MIN_PRICE_SPAN_BINS", "80"))
-BM_MAX_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_MAX_PRICE_SPAN_BINS", "80000"))
-
-# Heatmap significance/contrast tuning (FIX20/P02)
-BM_INT_HALFLIFE_S = float(os.environ.get("QD_BM_INT_HALFLIFE_S", "18.0"))     # intensity decay half-life (seconds)
-BM_ACCUM_GAIN = float(os.environ.get("QD_BM_ACCUM_GAIN", "1.0"))              # accumulation gain
-BM_REMOVE_GAIN = float(os.environ.get("QD_BM_REMOVE_GAIN", "1.75"))           # removal penalty gain (scar)
-BM_PRUNE_FLOOR = float(os.environ.get("QD_BM_PRUNE_FLOOR", "0.02"))           # prune tiny intensities
-BM_SIG_MODE = os.environ.get("QD_BM_SIG_MODE", "log")                         # log|sqrt (liquidity->signal)
+BM_MAX_PRICE_SPAN_BINS = int(os.environ.get("QD_BM_MAX_PRICE_SPAN_BINS", "400000"))
 
 # Book bounds (avoid unbounded growth)
 MAX_LEVELS_PER_SIDE = int(os.environ.get("QD_MAX_LEVELS_PER_SIDE", "1200"))
@@ -211,13 +188,13 @@ class State:
     bm_tick: float = 0.1  # inferred/overridden tick size for price binning
     bm_min_idx_seen: Optional[int] = None
     bm_max_idx_seen: Optional[int] = None
+
+    bm_global_min_price: float = BM_GLOBAL_MIN_PRICE
+    bm_global_max_price: float = BM_GLOBAL_MAX_PRICE
+    bm_intensity: Dict[int, float] = field(default_factory=dict)
+    bm_prev_qty: Dict[int, float] = field(default_factory=dict)
     bm_tape: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=BM_MAX_COLS))
     bm_last_col_ts: Optional[float] = None
-
-    # Bookmap significance engine (FIX20/P02)
-    bm_intensity: Dict[int, float] = field(default_factory=dict)  # decayed integrated intensity per price_idx
-    bm_prev_qty: Dict[int, float] = field(default_factory=dict)   # last seen raw qty per price_idx
-    bm_last_int_ts: Optional[float] = None                        # last intensity update time
 
     # Default camera state (server-side hints; UI owns interaction)
     bm_center_idx: Optional[int] = None
@@ -461,13 +438,6 @@ async def _connector_loop() -> None:
             STATE.last_error = None
             bootlog(f"CONNECTING ws={WS_URL} symbol={SYMBOL}")
 
-            if websockets is None:
-                # Keep server alive even if connector dependency missing
-                STATE.status = "DEGRADED"
-                STATE.last_error = "websockets package missing; connector disabled"
-                await asyncio.sleep(2.0)
-                raise RuntimeError(STATE.last_error)
-
             async with websockets.connect(WS_URL, ping_interval=15, ping_timeout=15, close_timeout=5) as ws:
                 # Subscribe to depth + trades
                 sub_depth = {
@@ -641,6 +611,33 @@ def _infer_tick_from_book() -> float:
         return float(tick)
     except Exception:
         return float(STATE.bm_tick)
+def _update_universe_idx(tick: float) -> None:
+    """Update absolute price-universe bounds in index space (depends on tick)."""
+    try:
+        if tick is None or not math.isfinite(tick) or tick <= 0:
+            return
+        sym = str(getattr(STATE, "symbol", "") or os.getenv("QD_SYMBOL", "BTC_USDT"))
+
+        umin = BM_UNIVERSE_MIN_PRICE
+        umax = BM_UNIVERSE_MAX_PRICE
+
+        if getattr(STATE, "bm_universe_min_price", None) is not None:
+            umin = float(STATE.bm_universe_min_price)
+        if getattr(STATE, "bm_universe_max_price", None) is not None:
+            umax = float(STATE.bm_universe_max_price)
+
+        if not math.isfinite(umin):
+            umin = 0.0
+        if not math.isfinite(umax):
+            umax = 200000.0
+        if umax <= umin:
+            umax = umin + (200000.0 if "BTC" in sym else 10000.0)
+
+        STATE.bm_min_idx_universe = int(round(umin / tick))
+        STATE.bm_max_idx_universe = int(round(umax / tick))
+    except Exception:
+        return
+
 
 
 def _price_to_idx(price: float, tick: float) -> int:
@@ -652,98 +649,61 @@ def _idx_to_price(idx: int, tick: float) -> float:
 
 
 def _build_bm_column(tick: float) -> Dict[str, Any]:
-    """
-    Build a sparse column representing *integrated* resting liquidity significance.
-
-    FIX20/P02 changes vs FIX20/P01:
-    - We do NOT render raw snapshot depth as intensity.
-    - We maintain a decayed, time-integrated intensity field per price_idx:
-        intensity[idx] <- intensity[idx]*decay + gain*f(qty)*dt  (persistence reinforcement)
-      and apply a removal penalty when qty drops (scar/vacuum preservation).
-    """
     ts = _now()
 
-    # Determine dt for integration
-    if STATE.bm_last_int_ts is None:
-        dt = BM_BASE_COL_DT
-    else:
-        dt = max(0.001, min(2.0, ts - float(STATE.bm_last_int_ts)))
-    STATE.bm_last_int_ts = ts
+    # Simple, Bookmap-like significance accumulation (FIX20_P02)
+    halflife_s = float(os.environ.get("QD_BM_INT_HALFLIFE_S", "18"))
+    accum_gain = float(os.environ.get("QD_BM_ACCUM_GAIN", "1.0"))
+    remove_gain = float(os.environ.get("QD_BM_REMOVE_GAIN", "1.75"))
+    prune_floor = float(os.environ.get("QD_BM_PRUNE_FLOOR", "0.02"))
 
-    # Exponential decay from half-life
-    hl = max(0.5, float(BM_INT_HALFLIFE_S))
-    decay = math.exp(-dt * math.log(2.0) / hl)
+    dt = max(1e-3, BM_BASE_COL_DT)
+    decay = 0.5 ** (dt / max(1e-6, halflife_s))
 
-    # Pull book snapshot (bounded)
+    def sig(q: float) -> float:
+        return math.log1p(max(0.0, float(q)))
+
     bids = sorted(STATE.book.bids.items(), key=lambda kv: kv[0], reverse=True)[:MAX_LEVELS_PER_SIDE]
     asks = sorted(STATE.book.asks.items(), key=lambda kv: kv[0])[:MAX_LEVELS_PER_SIDE]
 
-    cur_qty: Dict[int, float] = {}
-
-    def sig(qty: float) -> float:
-        q = max(0.0, float(qty))
-        mode = str(BM_SIG_MODE or "log").lower()
-        if mode == "sqrt":
-            return math.sqrt(q)
-        # default: log scaling
-        return math.log1p(q)
-
-    def add(px: float, qty: float) -> None:
+    seen: Dict[int, float] = {}
+    for px, qty in bids:
+        if qty <= 0: 
+            continue
+        idx = _price_to_idx(float(px), tick)
+        seen[idx] = seen.get(idx, 0.0) + float(qty)
+        if STATE.bm_min_idx_seen is None or idx < STATE.bm_min_idx_seen:
+            STATE.bm_min_idx_seen = idx
+        if STATE.bm_max_idx_seen is None or idx > STATE.bm_max_idx_seen:
+            STATE.bm_max_idx_seen = idx
+    for px, qty in asks:
         if qty <= 0:
-            return
-        idx = _price_to_idx(px, tick)
-        cur_qty[idx] = cur_qty.get(idx, 0.0) + float(qty)
-
+            continue
+        idx = _price_to_idx(float(px), tick)
+        seen[idx] = seen.get(idx, 0.0) + float(qty)
         if STATE.bm_min_idx_seen is None or idx < STATE.bm_min_idx_seen:
             STATE.bm_min_idx_seen = idx
         if STATE.bm_max_idx_seen is None or idx > STATE.bm_max_idx_seen:
             STATE.bm_max_idx_seen = idx
 
-    for px, qty in bids:
-        add(float(px), float(qty))
-    for px, qty in asks:
-        add(float(px), float(qty))
+    # decay
+    for k in list(STATE.bm_intensity.keys()):
+        STATE.bm_intensity[k] = float(STATE.bm_intensity[k]) * decay
+        if STATE.bm_intensity[k] < prune_floor:
+            STATE.bm_intensity.pop(k, None)
 
-    # Decay existing intensity field (only keys we keep)
-    if STATE.bm_intensity:
-        for k in list(STATE.bm_intensity.keys()):
-            STATE.bm_intensity[k] = float(STATE.bm_intensity.get(k, 0.0)) * decay
-            if STATE.bm_intensity[k] < BM_PRUNE_FLOOR:
-                # prune tiny residuals to prevent dict growth
-                del STATE.bm_intensity[k]
-                if k in STATE.bm_prev_qty:
-                    del STATE.bm_prev_qty[k]
+    # accumulate + removal penalty
+    for idx, qty in seen.items():
+        prev_i = float(STATE.bm_intensity.get(idx, 0.0))
+        prev_qty = float(STATE.bm_prev_qty.get(idx, 0.0))
+        new_i = prev_i + accum_gain * sig(qty) * dt
+        if prev_qty > 0.0 and qty < prev_qty:
+            new_i = max(0.0, new_i - remove_gain * sig(prev_qty - qty) * dt)
+        STATE.bm_intensity[idx] = new_i
+        STATE.bm_prev_qty[idx] = float(qty)
 
-    # Update intensities with integrated contribution + removal penalty
-    for k, q in cur_qty.items():
-        prev = float(STATE.bm_prev_qty.get(k, 0.0))
-        dq = float(q) - prev
-
-        # persistence reinforcement: integrated contribution
-        inc = float(BM_ACCUM_GAIN) * sig(q) * dt
-        STATE.bm_intensity[k] = float(STATE.bm_intensity.get(k, 0.0)) + inc
-
-        # liquidity removal scar: when qty drops, subtract additional penalty
-        if dq < 0:
-            penalty = float(BM_REMOVE_GAIN) * sig(-dq)
-            STATE.bm_intensity[k] = max(0.0, float(STATE.bm_intensity.get(k, 0.0)) - penalty)
-
-        STATE.bm_prev_qty[k] = float(q)
-
-    # Build the sparse column from the current intensity field (viewport will filter)
-    col: Dict[int, float] = {int(k): float(v) for (k, v) in STATE.bm_intensity.items()}
-
-    # Safety cap: keep only strongest keys if we get too large (rare; protects runtime)
-    if len(col) > HEAT_MAX_KEYS:
-        items = sorted(col.items(), key=lambda kv: kv[1], reverse=True)[:HEAT_MAX_KEYS]
-        col = {int(k): float(v) for (k, v) in items}
-        # align state to cap
-        keep = set(col.keys())
-        STATE.bm_intensity = {int(k): float(v) for (k, v) in col.items()}
-        STATE.bm_prev_qty = {int(k): float(STATE.bm_prev_qty.get(k, 0.0)) for k in keep}
-
+    col = {int(k): float(v) for (k, v) in STATE.bm_intensity.items() if float(v) >= prune_floor}
     return {"ts": ts, "col": col}
-
 
 
 async def _bm_tape_loop() -> None:
@@ -861,6 +821,25 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0, *, bm_center
         bm_view["min_idx"] = int(min_idx)
         bm_view["max_idx"] = int(max_idx)
 
+        # Clamp to instrument universe so user can pan/jump across the full range (Bookmap-like),
+        # while still allowing empty space where no data exists.
+        umin = getattr(STATE, "bm_min_idx_universe", None)
+        umax = getattr(STATE, "bm_max_idx_universe", None)
+        if umin is None or umax is None:
+            # Fallback to observed range if universe not ready yet
+            umin = getattr(STATE, "bm_min_idx_seen", None)
+            umax = getattr(STATE, "bm_max_idx_seen", None)
+        if umin is not None and umax is not None:
+            if min_idx < umin:
+                min_idx = umin
+                max_idx = min_idx + bm_price_span_bins
+            if max_idx > umax:
+                max_idx = umax
+                min_idx = max_idx - bm_price_span_bins
+            bm_view["min_idx"] = int(min_idx)
+            bm_view["max_idx"] = int(max_idx)
+
+
         # Determine which columns to show
         # We keep a target visible time span; downsample controls scale.
         target_cols = max(120, min(900, int(BM_DEFAULT_TIME_WINDOW_S / (BM_BASE_COL_DT * bm_time_downsample))))
@@ -875,7 +854,30 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0, *, bm_center
             c = bm_tape_list[j]
             sparse = c.get("col", {})
             # Filter to viewport
-            pts = [[int(k), float(v)] for (k, v) in sparse.items() if min_idx <= int(k) <= max_idx]
+
+            # Filter to viewport with price LOD aggregation when zoomed out massively
+            span_bins = max(1, int(max_idx - min_idx))
+            lod = 1
+            if span_bins > BM_PRICE_LOD_TARGET_BINS:
+                lod = int(math.ceil(span_bins / float(BM_PRICE_LOD_TARGET_BINS)))
+            agg = {}
+            for (k, v) in sparse.items():
+                try:
+                    ik = int(k)
+                except Exception:
+                    continue
+                if ik < min_idx or ik > max_idx:
+                    continue
+                if lod > 1:
+                    b = int((ik - min_idx) // lod)
+                    ik2 = int(min_idx + b * lod)
+                else:
+                    ik2 = ik
+                fv = float(v)
+                prev = agg.get(ik2)
+                if prev is None or fv > prev:
+                    agg[ik2] = fv
+            pts = [[int(k), float(v)] for (k, v) in agg.items()]
             cols.append({"ts": float(c.get("ts", ts)), "pts": pts})
         bm_view["cols"] = cols
         bm_view["live"] = (bm_time_offset_cols == 0)
@@ -980,19 +982,6 @@ async def telemetry_json() -> JSONResponse:
     frame = _render_frame(RENDER_LEVELS, RENDER_STEP, pan_ticks=0.0)
     return JSONResponse(frame)
 
-@app.get("/ws_contract.json")
-async def ws_contract() -> JSONResponse:
-    """
-    WebSocket contract for the UI (used for debugging/reconnect safety).
-    This is intentionally small and stable.
-    """
-    return JSONResponse(_sanitize({
-        "ws_path": WS_PATH,
-        "protocol": PROTOCOL_VERSION,
-        "build": BUILD,
-        "symbol": SYMBOL,
-    }))
-
 
 @app.get("/book.json")
 async def book_json() -> JSONResponse:
@@ -1042,11 +1031,6 @@ async def render_ws(ws: WebSocket) -> None:
       - Reliable receive loop (timeout=0.0 caused control messages to be missed)
     """
     await ws.accept()
-    bootlog(f"WS ACCEPTED {WS_PATH} client={getattr(ws, 'client', None)}")
-    try:
-        await ws.send_text(json.dumps(_sanitize({"type":"hello","protocol":PROTOCOL_VERSION,"build":BUILD,"symbol":SYMBOL,"ts":time.time()})))
-    except Exception as _e:
-        bootlog(f"WS HELLO send failed: {_e}")
 
     # Per-connection interactive view state (mutable)
     view_state = {
@@ -1122,7 +1106,7 @@ async def render_ws(ws: WebSocket) -> None:
                 bm_time_downsample=int(view_state.get("bm_time_downsample", 1)),
             )
             STATE.frames += 1
-            await ws.send_text(_safe_dumps(frame))
+            await ws.send_text(json.dumps(frame))
             await asyncio.sleep(interval)
     except Exception:
         return
@@ -1143,7 +1127,7 @@ def _ui_html() -> str:
     #     pinch: price zoom
     #     2-finger horizontal drag: time scrub
     #     2-finger vertical drag: time zoom (downsample)
-    html = """<!doctype html>
+    return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -1178,9 +1162,7 @@ def _ui_html() -> str:
 </head>
 <body>
   <div id="topbar">
-    <div class="pill" id="jump">JUMP</div>
     <div id="health" class="pill yellow">HEALTH: YELLOW</div>
-    <div id="wsstate" class="pill">WS: --</div>
     <div id="mode" class="pill">LIVE</div>
     <div id="scale" class="pill">TIME: --</div>
     <div id="offset" class="pill">OFFSET: --</div>
@@ -1199,11 +1181,9 @@ def _ui_html() -> str:
   const cv = document.getElementById('cv');
   const ctx = cv.getContext('2d', {{ alpha: false }});
   const healthEl = document.getElementById('health');
-  const wsEl = document.getElementById('wsstate');
   const modeEl = document.getElementById('mode');
   const scaleEl = document.getElementById('scale');
   const offsetEl = document.getElementById('offset');
-  const jumpEl = document.getElementById('jump');
 
   function resize() {{
     const dpr = window.devicePixelRatio || 1;
@@ -1224,17 +1204,11 @@ def _ui_html() -> str:
   }};
 
   // WS render bridge
-  let lastTick = null;
   let ws = null;
   function wsUrl() {{
     const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-    return proto + '//' + location.host + '{WS_PATH}';
+    return proto + '//' + location.host + '/render.ws';
   }}
-
-  function setWsState(s) {
-    if (!wsEl) return;
-    wsEl.textContent = 'WS: ' + (s || '--');
-  }
 
   function setHealth(h) {{
     healthEl.classList.remove('green','yellow','red');
@@ -1276,57 +1250,27 @@ def _ui_html() -> str:
 
   function connect() {{
     ws = new WebSocket(wsUrl());
-    setWsState('CONNECTING');
-    ws.onopen = () => { setWsState('OPEN'); sendView(); };
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg && msg.type === 'hello') {
-          // Contract handshake (non-blocking, but visible for diagnostics)
-          const p = msg.protocol || '--';
-          setWsState('OPEN ' + p);
-          return;
-        }
-        draw(msg);
-      } catch(e) {
-        // Surface parse errors by flipping WS state briefly.
-        setWsState('BAD_JSON');
-      }
-    };
-    ws.onerror = () => { setWsState('ERROR'); };
-    ws.onclose = () => {
-      setWsState('CLOSED');
+    ws.onopen = () => {{ sendView(); }};
+    ws.onmessage = (ev) => {{
+      try {{
+        const frame = JSON.parse(ev.data);
+        draw(frame);
+      }} catch(e) {{}}
+    }};
+    ws.onclose = () => {{
       setTimeout(connect, 750);
-    };
+    }};
   }}
   connect();
 
-  // Jump to an absolute price (fast navigation for wide ranges)
-  jumpEl.addEventListener('click', () => {{
-    const s = prompt('Jump to price (e.g., 90000):', '');
-    if (!s) return;
-    const px = parseFloat(s);
-    if (!isFinite(px) || px <= 0) return;
-    // centerIdx = round(price/tick). tick is inferred server-side; use last tick seen from frames if available.
-    if (lastTick && isFinite(lastTick) && lastTick > 0) {{
-      view.centerIdx = Math.round(px / lastTick);
-      view.autoFollow = false;
-      throttledSend();
-    }}
-  }});
-
-
   // Color mapping: value -> intensity -> RGB. (Simple, stable; not tuned yet.)
-  function valToRGB(v, vmax, floor) {{
-    if (!isFinite(v) || v <= floor || vmax <= floor) return [11,15,20];
-    const x0 = (v - floor) / Math.max(1e-9, (vmax - floor));
-    const x = Math.max(0, Math.min(1, x0));
-    // Bookmap-like contrast curve: push midtones darker, preserve highlights
-    const y = Math.pow(x, 0.55);
-    // blue -> cyan -> yellow -> white (highlights)
-    const r = Math.floor(20 + 235 * Math.pow(y, 0.95));
-    const g = Math.floor(40 + 215 * Math.pow(y, 0.75));
-    const b = Math.floor(85 + 150 * Math.pow(1 - y, 0.55));
+  function valToRGB(v, vmax) {{
+    if (v <= 0 || vmax <= 0) return [11,15,20];
+    const x = Math.max(0, Math.min(1, v / vmax));
+    // blue -> cyan -> yellow -> red (simple gradient)
+    const r = Math.floor(30 + 225 * Math.pow(x, 0.85));
+    const g = Math.floor(50 + 205 * Math.pow(x, 0.60));
+    const b = Math.floor(80 + 160 * Math.pow(1 - x, 0.55));
     return [r,g,b];
   }}
 
@@ -1338,7 +1282,6 @@ def _ui_html() -> str:
     setHealth(frame.health);
 
     const bm = frame.render && frame.render.bm ? frame.render.bm : null;
-    if (bm && bm.tick) {{ lastTick = bm.tick; }}
     if (!bm || !bm.cols) {{
       ctx.fillStyle = 'rgba(230,238,248,0.85)';
       ctx.font = '16px system-ui';
@@ -1374,70 +1317,36 @@ def _ui_html() -> str:
     const plotW = W - leftPad - rightPad;
     const plotH = H - topPad - botPad;
 
-    // Determine robust scaling (percentile-based) for Bookmap-like contrast
-    const sample = [];
-    const stride = Math.max(1, Math.floor(cols.length / 140));
-    for (let i=0;i<cols.length;i+=stride) {{
+    // Determine vmax (robust): sample max across visible points
+    let vmax = 0;
+    for (let i=0;i<cols.length;i++) {{
       const pts = cols[i].pts || [];
-      const pstride = Math.max(1, Math.floor(pts.length / 80));
-      for (let j=0;j<pts.length;j+=pstride) {{
+      for (let j=0;j<pts.length;j++) {{
         const v = pts[j][1];
-        if (isFinite(v) && v > 0) sample.push(v);
+        if (v > vmax) vmax = v;
       }}
     }}
-    sample.sort((a,b)=>a-b);
-    function q(p) {{
-      if (sample.length === 0) return 0;
-      const ix = Math.max(0, Math.min(sample.length-1, Math.floor(p*(sample.length-1))));
-      return sample[ix];
-    }}
-    const p50 = q(0.50);
-    const p95 = q(0.95);
-    const floor = Math.max(0, p50 * 0.15);
-    let vmax = Math.max(1e-9, p95);
+    // soft cap for stability
+    vmax = Math.max(1e-9, vmax);
 
-    // Render columns (Bookmap-style LOD aggregation for wide zoom)
+    // Render columns
     const colW = Math.max(1, Math.floor(plotW / Math.max(1, cols.length)));
     const span = Math.max(1, (maxIdx - minIdx));
     const pxPerBin = plotH / span;
-    const binsPerPixel = span / Math.max(1, plotH);
-    const bucketBins = Math.max(1, Math.ceil(binsPerPixel)); // bins aggregated into one pixel-row when zoomed out
-    const rowH = Math.max(1, Math.ceil(bucketBins * pxPerBin));
 
-    for (let ci=0; ci<cols.length; ci++) {
+    for (let ci=0; ci<cols.length; ci++) {{
       const x0 = leftPad + ci * colW;
       const pts = cols[ci].pts || [];
-
-      if (bucketBins === 1) {
-        // Fine zoom: draw per bin
-        for (let k=0; k<pts.length; k++) {
-          const idx = pts[k][0];
-          const v = pts[k][1];
-          const y = topPad + (maxIdx - idx) * pxPerBin; // higher idx at top
-          const h = Math.max(1, Math.ceil(pxPerBin));
-          const rgb = valToRGB(v, vmax, floor);
-          ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
-          ctx.fillRect(x0, y, colW, h);
-        }
-      } else {
-        // Wide zoom: aggregate bins into buckets using MAX intensity (preserves dominant walls)
-        const bucketMax = new Map();
-        for (let k=0; k<pts.length; k++) {
-          const idx = pts[k][0];
-          const v = pts[k][1];
-          const b = Math.floor((idx - minIdx) / bucketBins);
-          const prev = bucketMax.get(b);
-          if (prev === undefined || v > prev) bucketMax.set(b, v);
-        }
-        bucketMax.forEach((v, b) => {
-          const idx0 = minIdx + b * bucketBins;
-          const y = topPad + (maxIdx - idx0) * pxPerBin;
-          const rgb = valToRGB(v, vmax, floor);
-          ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
-          ctx.fillRect(x0, y, colW, rowH);
-        });
-      }
-    }
+      for (let k=0; k<pts.length; k++) {{
+        const idx = pts[k][0];
+        const v = pts[k][1];
+        const y = topPad + (maxIdx - idx) * pxPerBin; // higher idx at top
+        const h = Math.max(1, Math.ceil(pxPerBin));
+        const rgb = valToRGB(v, vmax);
+        ctx.fillStyle = `rgb(${{rgb[0]}},${{rgb[1]}},${{rgb[2]}})`;
+        ctx.fillRect(x0, y, colW, h);
+      }}
+    }}
 
     // Draw price labels (few ticks)
     ctx.fillStyle = 'rgba(230,238,248,0.80)';
@@ -1602,23 +1511,6 @@ def _ui_html() -> str:
 </script>
 </body>
 </html>"""
-    # Normalize doubled braces ({{ }} were previously used for f-string escaping).
-    # Without this, embedded JS/CSS becomes invalid and the UI never opens the WebSocket.
-    html = html.replace("{{", "{").replace("}}", "}")
-
-    # Inject runtime constants without using an f-string (avoids brace conflicts with JS).
-    html = (html
-        .replace("{SERVICE}", str(SERVICE))
-        .replace("{BUILD}", str(BUILD))
-        .replace("{SYMBOL}", str(SYMBOL))
-        .replace("{BM_DEFAULT_PRICE_SPAN_BINS}", str(BM_DEFAULT_PRICE_SPAN_BINS))
-        .replace("{BM_MIN_PRICE_SPAN_BINS}", str(BM_MIN_PRICE_SPAN_BINS))
-        .replace("{BM_MAX_PRICE_SPAN_BINS}", str(BM_MAX_PRICE_SPAN_BINS))
-        .replace("{BM_MAX_DOWNSAMPLE}", str(BM_MAX_DOWNSAMPLE))
-        .replace("{WS_PATH}", str(WS_PATH))
-    )
-    return html
-
 
 
 @app.get("/")
