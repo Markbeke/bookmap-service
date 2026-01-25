@@ -45,7 +45,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX18/P01_FIX2"
+BUILD = "FIX19/P01"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -79,6 +79,10 @@ def _now() -> float:
     return time.time()
 
 
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 def bootlog(msg: str) -> None:
     try:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
@@ -193,9 +197,19 @@ def _mid_px() -> Optional[float]:
 
 
 
-def _render_frame(levels: int, step: float) -> Dict[str, Any]:
+def _render_frame(levels: int, step: float, pan_ticks: int = 0, **_kw) -> Dict[str, Any]:
     ts = _now()
     mid = _mid_px()
+    if mid is not None and pan_ticks:
+        try:
+            mid = float(mid) + float(pan_ticks) * float(step)
+        except Exception:
+            pass
+    if mid is not None and pan_ticks:
+        try:
+            mid = float(mid) + float(pan_ticks) * float(step)
+        except Exception:
+            pass
     bb = STATE.book.best_bid
     ba = STATE.book.best_ask
 
