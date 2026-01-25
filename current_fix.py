@@ -459,7 +459,26 @@ async def _connector_loop() -> None:
                 backoff = 1.0
                 bootlog("CONNECTED")
 
-                async for msg in ws:
+                # recv loop with watchdog: if stream stalls, force reconnect
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        # If no messages for too long, reconnect (Replit/network can stall silently)
+                        now = time.time()
+                        with STATE_LOCK:
+                            last_any = max(
+                                STATE.last_depth_ts or 0.0,
+                                STATE.last_trade_ts or 0.0,
+                            )
+                            status = STATE.status
+                        if status == "CONNECTED" and (now - last_any) > 15.0:
+                            raise RuntimeError("WS stalled (no market data >15s) — reconnecting")
+                        try:
+                            await ws.ping()
+                        except Exception:
+                            raise RuntimeError("WS ping failed — reconnecting")
+                        continue
                     try:
                         obj = json.loads(msg)
                     except Exception:
@@ -1360,7 +1379,8 @@ def _ui_html() -> str:
   let t1 = null;
 
   function onTouchStart(ev) {{
-    ev.preventDefault();
+    
+      try {{ ev.preventDefault(); }} catch(e) {{}}
     setInteracting(true);
     const ts = ev.touches;
     if (ts.length === 1) {{
@@ -1378,7 +1398,8 @@ def _ui_html() -> str:
   }}
 
   function onTouchMove(ev) {{
-    ev.preventDefault();
+    
+      try {{ ev.preventDefault(); }} catch(e) {{}}
     setInteracting(true);
     lastInteractMs = performance.now();
     const ts = ev.touches;
@@ -1439,7 +1460,8 @@ def _ui_html() -> str:
   }}
 
   function onTouchEnd(ev) {{
-    ev.preventDefault();
+    
+      try {{ ev.preventDefault(); }} catch(e) {{}}
     // If all touches ended, stop interacting and force an immediate server sync.
     if (ev.touches.length === 0) {{
       setInteracting(false);
