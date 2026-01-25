@@ -65,10 +65,14 @@ def _safe_dumps(obj: Any) -> str:
         return json.dumps(obj, separators=(",", ":"), allow_nan=False)
     except Exception:
         return json.dumps(_sanitize(obj), separators=(",", ":"), allow_nan=False)
-import websockets  # type: ignore
+try:
+    import websockets  # type: ignore
+except Exception as _e:
+    websockets = None  # type: ignore
+
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX20/P05"
+BUILD = "FIX20/P06"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -454,6 +458,13 @@ async def _connector_loop() -> None:
             STATE.status = "CONNECTING"
             STATE.last_error = None
             bootlog(f"CONNECTING ws={WS_URL} symbol={SYMBOL}")
+
+            if websockets is None:
+                # Keep server alive even if connector dependency missing
+                STATE.status = "DEGRADED"
+                STATE.last_error = "websockets package missing; connector disabled"
+                await asyncio.sleep(2.0)
+                raise RuntimeError(STATE.last_error)
 
             async with websockets.connect(WS_URL, ping_interval=15, ping_timeout=15, close_timeout=5) as ws:
                 # Subscribe to depth + trades
