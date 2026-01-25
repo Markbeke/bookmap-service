@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =========================================================
-# QuantDesk Bookmap Service — FIX17_HEATMAP_DENSITY_LAYER
+# QuantDesk Bookmap Service — FIX17_HEATMAP_TIME_DENSITY_LAYER
 #
 # Builds on FIX14 (parity-safe incremental book):
 # - Maintains canonical CLOB via incremental merge (no side wipeouts)
@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX17/P01"
+BUILD = "FIX17/P02"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -809,7 +809,7 @@ def _ui_html() -> str:
 
   <div class="grid">
     <div class="card">
-      <div class="muted">This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a moving anchored ladder (price travel) with interactive pan/zoom (FIX16) + heatmap density (FIX17). It is not a full Bookmap renderer yet.</div>
+      <div class="muted">This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a moving anchored ladder (price travel) with interactive pan/zoom (FIX16) + heatmap time-density (FIX17). It is not a full Bookmap renderer yet.</div>
       <div style="height:10px"></div>
       <canvas id="cv" width="980" height="520"></canvas>
       <div class="muted small" style="margin-top:8px;">Ladder: green = bids, red = asks. Axis: higher prices at top. Mid line shows anchor. Wheel/pinch = zoom, drag = pan.</div>
@@ -844,6 +844,45 @@ def _ui_html() -> str:
   // - drag pans ladder in price ticks
   let view = {{ levels: null, baseStep: null, step: null, zoom: 1.0, panTicks: 0.0 }};
   let wsRef = null;
+
+  // Heatmap time-history (FIX17/P02): client accumulates columns over time
+  const heatHist = [];
+  const HEAT_COLS_MAX = 260; // ~32s @ 8fps
+
+  function pushHeat(hb, ha) {{
+    if (!hb || !ha) return;
+    heatHist.push({{hb: hb.slice(0), ha: ha.slice(0)}});
+    if (heatHist.length > HEAT_COLS_MAX) {{
+      heatHist.splice(0, heatHist.length - HEAT_COLS_MAX);
+    }}
+  }}
+
+  // Bookmap-like colormap (simple perceptual-ish ramp): blue -> cyan -> yellow -> red
+  function heatRGBA(v, alpha) {{
+    v = clamp(v, 0.0, 1.0);
+    // piecewise linear in RGB space
+    let r=0, g=0, b=0;
+    if (v < 0.33) {{
+      // blue (0,80,255) -> cyan (0,255,255)
+      const t = v / 0.33;
+      r = 0;
+      g = 80 + t*(255-80);
+      b = 255;
+    }} else if (v < 0.66) {{
+      // cyan (0,255,255) -> yellow (255,255,0)
+      const t = (v-0.33) / 0.33;
+      r = t*255;
+      g = 255;
+      b = 255 - t*255;
+    }} else {{
+      // yellow (255,255,0) -> red (255,40,40)
+      const t = (v-0.66) / 0.34;
+      r = 255;
+      g = 255 - t*(255-40);
+      b = 0 + t*40;
+    }}
+    return 'rgba(' + Math.round(r) + ',' + Math.round(g) + ',' + Math.round(b) + ',' + alpha.toFixed(3) + ')';
+  }}
 
   function clamp(x, a, b) {{ return Math.max(a, Math.min(b, x)); }}
 
@@ -941,45 +980,38 @@ def _ui_html() -> str:
         ctx.fillText(fmt(prices[i]), 8, y + 10);
       }}
     }}
+    // Heatmap time-density layer (FIX17/P02):
+    // We render a scrolling time-history of per-price liquidity intensity (no bid/ask bars).
+    // Server provides per-frame heat_bid/heat_ask arrays normalized 0..1.
+    pushHeat(heatB, heatA);
 
-    
-    // Heatmap background (FIX17): draw decayed liquidity intensity per price level
-    // Values are normalized 0..1 server-side.
     const heatMaxAlpha = clamp((frame.render && frame.render.heat_alpha) ? frame.render.heat_alpha : 0.55, 0.0, 1.0);
-    for (let i=0;i<levels;i++) {{
-      const y = yForIndex(i);
-      const hb = heatB[i] || 0;
-      const ha = heatA[i] || 0;
-      if (hb > 0.001) {{
-        const a = Math.min(heatMaxAlpha, hb * heatMaxAlpha);
-        ctx.fillStyle = 'rgba(46,125,50,' + (0.06 + 0.34*a).toFixed(3) + ')';
-        ctx.fillRect(bidX0, y, bidX1 - bidX0, rowH-1);
-      }}
-      if (ha > 0.001) {{
-        const a = Math.min(heatMaxAlpha, ha * heatMaxAlpha);
-        ctx.fillStyle = 'rgba(198,40,40,' + (0.06 + 0.34*a).toFixed(3) + ')';
-        ctx.fillRect(askX0, y, askX1 - askX0, rowH-1);
-      }}
-    }}
 
-// Draw bids/asks
-    for (let i=0;i<levels;i++) {{
-      const y = yForIndex(i);
-      const bq = bids[i] || 0;
-      const aq = asks[i] || 0;
+    // Heatmap area: between axis labels and right pad
+    const heatX0 = padL;
+    const heatX1 = W - padR;
+    const cols = heatHist.length;
+    const colW = Math.max(1, Math.floor((heatX1 - heatX0) / Math.max(1, cols)));
+    const xRight = heatX1;
 
-      // bid bar
-      const bw = Math.min(bidW, (bq / maxQty) * bidW);
-      if (bw > 0.5) {{
-        ctx.fillStyle = 'rgba(46,125,50,0.35)';
-        ctx.fillRect(bidX1 - bw, y, bw, rowH-1);
-      }}
-
-      // ask bar
-      const aw = Math.min(askW, (aq / maxQty) * askW);
-      if (aw > 0.5) {{
-        ctx.fillStyle = 'rgba(198,40,40,0.35)';
-        ctx.fillRect(askX0, y, aw, rowH-1);
+    // Draw oldest -> newest, newest anchored at the right edge
+    for (let c = 0; c < cols; c++) {{
+      const col = heatHist[c];
+      const x = xRight - (cols - c) * colW;
+      if (x + colW < heatX0) continue;
+      const hbCol = col.hb;
+      const haCol = col.ha;
+      for (let i=0;i<levels;i++) {{
+        const y = yForIndex(i);
+        const hb = hbCol[i] || 0;
+        const ha = haCol[i] || 0;
+        // Combine side intensities (Bookmap heatmap is magnitude-centric)
+        let v = hb + ha;
+        if (v > 1.0) v = 1.0;
+        if (v < 0.002) continue;
+        const a = Math.min(heatMaxAlpha, 0.10 + v * heatMaxAlpha);
+        ctx.fillStyle = heatRGBA(v, a);
+        ctx.fillRect(x, y, colW, rowH-1);
       }}
     }}
 
