@@ -463,7 +463,16 @@ async def _connector_loop() -> None:
                     _route_message(obj)
 
         except Exception as e:
-            STATE.status = "ERROR"
+            # transient failures should not hard-flip UI to RED immediately
+            now = time.time()
+            if now - getattr(STATE, "last_err_ts", 0.0) > 60.0:
+              STATE.err_count = 0
+            STATE.err_count = getattr(STATE, "err_count", 0) + 1
+            STATE.last_err_ts = now
+            if STATE.err_count >= 3:
+              STATE.status = "ERROR"
+            else:
+              STATE.status = "DISCONNECTED"
             STATE.last_error = str(e)
             STATE.reconnects += 1
             bootlog(f"WS ERROR: {e} (reconnects={STATE.reconnects})")
@@ -1180,6 +1189,34 @@ def _ui_html() -> str:
 (() => {{
   const cv = document.getElementById('cv');
   const ctx = cv.getContext('2d', {{ alpha: false }});
+
+  // --- render coalescing (gesture-smooth) ---
+  let latestFrame = null;
+  let dirty = false;
+  let animating = false;
+  let lastRenderMs = 0;
+  const RENDER_MIN_DT_MS = 33; // ~30fps cap (mobile-friendly)
+
+  function scheduleRender() {{
+    if (animating) return;
+    animating = true;
+    requestAnimationFrame(renderLoop);
+  }}
+
+  function renderLoop(ts) {{
+    const now = performance.now();
+    if (dirty && latestFrame && (now - lastRenderMs) >= RENDER_MIN_DT_MS) {{
+      lastRenderMs = now;
+      dirty = false;
+      draw(latestFrame);
+    }}
+    if (dirty) {{
+      requestAnimationFrame(renderLoop);
+    }} else {{
+      animating = false;
+    }}
+  }}
+
   const healthEl = document.getElementById('health');
   const modeEl = document.getElementById('mode');
   const scaleEl = document.getElementById('scale');
@@ -1253,8 +1290,10 @@ def _ui_html() -> str:
     ws.onopen = () => {{ sendView(); }};
     ws.onmessage = (ev) => {{
       try {{
-        const frame = JSON.parse(ev.data);
-        draw(frame);
+        latestFrame = JSON.parse(ev.data);
+        dirty = true;
+        scheduleRender();
+        if (latestFrame && latestFrame.health) setHealth(latestFrame.health);
       }} catch(e) {{}}
     }};
     ws.onclose = () => {{
@@ -1275,122 +1314,109 @@ def _ui_html() -> str:
   }}
 
   function draw(frame) {{
-    const W = cv.width, H = cv.height;
-    ctx.fillStyle = '#0b0f14';
-    ctx.fillRect(0,0,W,H);
-
-    setHealth(frame.health);
+    if (!frame) return;
+    if (frame.health) setHealth(frame.health);
 
     const bm = frame.render && frame.render.bm ? frame.render.bm : null;
-    if (!bm || !bm.cols) {{
-      ctx.fillStyle = 'rgba(230,238,248,0.85)';
+    if (!bm || !bm.cols || bm.cols.length === 0) {{
+      ctx.fillStyle = '#0b0f14';
+      ctx.fillRect(0,0,cv.width,cv.height);
+      ctx.fillStyle = 'rgba(220,230,255,0.85)';
       ctx.font = '16px system-ui';
-      ctx.fillText('Warming up...', 16, 24);
+      ctx.fillText('Warming...', 20, 40);
       return;
     }}
 
-    // initialize centerIdx from server once
-    if (view.centerIdx === null && bm.center_idx !== null && bm.center_idx !== undefined) {{
-      view.centerIdx = bm.center_idx;
-      throttledSend();
+    // Screen background
+    ctx.fillStyle = '#0b0f14';
+    ctx.fillRect(0,0,cv.width,cv.height);
+
+    const padL = 90, padT = 8, padB = 30, padR = 8;
+    const plotX = padL, plotY = padT;
+    const plotW = Math.max(1, cv.width - padL - padR);
+    const plotH = Math.max(1, cv.height - padT - padB);
+
+    // Bins in view (price axis window)
+    const minIdx = bm.minIdx, maxIdx = bm.maxIdx;
+    const bins = Math.max(1, (maxIdx - minIdx + 1));
+    const pxPerBin = plotH / bins;
+
+    // LOD: when massively zoomed out (tiny pxPerBin), render at reduced res and scale up
+    let lod = 1.0;
+    if (pxPerBin < 0.60) lod = 0.5;
+    if ((plotW*plotH) > 1_400_000) lod = Math.min(lod, 0.5);
+
+    const bw = Math.max(1, Math.floor(plotW * lod));
+    const bh = Math.max(1, Math.floor(plotH * lod));
+
+    if (!window._qdOsc || window._qdBw !== bw || window._qdBh !== bh) {{
+      window._qdOsc = document.createElement('canvas');
+      window._qdOsc.width = bw;
+      window._qdOsc.height = bh;
+      window._qdOctx = window._qdOsc.getContext('2d', {{ alpha: true }});
+      window._qdImg = window._qdOctx.createImageData(bw, bh);
+      window._qdBuf = window._qdImg.data;
+      window._qdBw = bw; window._qdBh = bh;
     }}
 
-    const live = !!bm.live && (view.timeOffset === 0);
-    modeEl.textContent = live ? 'LIVE' : 'HISTORY';
-    modeEl.className = 'pill' + (live ? ' green' : '');
+    const octx = window._qdOctx;
+    const img = window._qdImg;
+    const buf = window._qdBuf;
+    const W = window._qdBw, H = window._qdBh;
 
-    scaleEl.textContent = 'TIME: ' + fmtTimeScale(bm.time_scale_s_per_col);
-    offsetEl.textContent = live ? 'OFFSET: 0s' : ('OFFSET: T-' + (bm.t_minus_s || 0).toFixed(1) + 's');
+    // Clear offscreen buffer (transparent)
+    buf.fill(0);
 
-    // Update auto-follow
-    if (live) view.autoFollow = true;
+    const colN = bm.cols.length;
+    const colW = Math.max(1, Math.floor(W / Math.max(1, colN)));
+    const pxPerBinL = (H / bins);
 
-    const cols = bm.cols;
-    const minIdx = bm.min_idx, maxIdx = bm.max_idx;
-    const tick = bm.tick || 0.1;
+    for (let i = 0; i < colN; i++) {{
+      const col = bm.cols[i];
+      if (!col || !col.pts) continue;
+      const x0 = Math.min(W-1, i*colW);
+      const x1 = Math.min(W, x0 + colW);
 
-    // Layout
-    const leftPad = Math.floor(W * 0.08); // price labels area
-    const rightPad = 8;
-    const topPad = 8;
-    const botPad = 8;
-    const plotW = W - leftPad - rightPad;
-    const plotH = H - topPad - botPad;
+      const pts = col.pts;
+      for (let k = 0; k < pts.length; k++) {{
+        const pt = pts[k];
+        const idx = pt[0];
+        const v = pt[1];
+        const y = Math.floor((maxIdx - idx) * pxPerBinL);
+        if (y < 0 || y >= H) continue;
 
-    // Determine vmax (robust): sample max across visible points
-    let vmax = 0;
-    for (let i=0;i<cols.length;i++) {{
-      const pts = cols[i].pts || [];
-      for (let j=0;j<pts.length;j++) {{
-        const v = pts[j][1];
-        if (v > vmax) vmax = v;
-      }}
-    }}
-    // soft cap for stability
-    vmax = Math.max(1e-9, vmax);
+        const rgb = valToRGB(v);
+        const r = rgb[0], g = rgb[1], b = rgb[2];
 
-    // Render columns
-    const colW = Math.max(1, Math.floor(plotW / Math.max(1, cols.length)));
-    const span = Math.max(1, (maxIdx - minIdx));
-    const pxPerBin = plotH / span;
-
-    for (let ci=0; ci<cols.length; ci++) {{
-      const x0 = leftPad + ci * colW;
-      const pts = cols[ci].pts || [];
-      for (let k=0; k<pts.length; k++) {{
-        const idx = pts[k][0];
-        const v = pts[k][1];
-        const y = topPad + (maxIdx - idx) * pxPerBin; // higher idx at top
-        const h = Math.max(1, Math.ceil(pxPerBin));
-        const rgb = valToRGB(v, vmax);
-        ctx.fillStyle = `rgb(${{rgb[0]}},${{rgb[1]}},${{rgb[2]}})`;
-        ctx.fillRect(x0, y, colW, h);
-      }}
-    }}
-
-    // Draw price labels (few ticks)
-    ctx.fillStyle = 'rgba(230,238,248,0.80)';
-    ctx.font = (Math.max(10, Math.floor(H/48))) + 'px system-ui';
-    ctx.textAlign = 'right';
-    ctx.textBaseline = 'middle';
-    const labelCount = 6;
-    for (let i=0;i<=labelCount;i++) {{
-      const t = i/labelCount;
-      const idx = Math.round(maxIdx - t*(maxIdx - minIdx));
-      const y = topPad + t*plotH;
-      const px = (idx * tick);
-      ctx.fillText(px.toFixed(1), leftPad - 8, y);
-      // grid line
-      ctx.strokeStyle = 'rgba(255,255,255,0.04)';
-      ctx.beginPath();
-      ctx.moveTo(leftPad, y);
-      ctx.lineTo(W-rightPad, y);
-      ctx.stroke();
-    }}
-
-    // Price line (best bid/ask mid) overlay
-    if (frame.book && frame.book.best_bid !== null && frame.book.best_ask !== null) {{
-      const mid = (frame.book.best_bid + frame.book.best_ask)/2.0;
-      const midIdx = Math.round(mid / tick);
-      const y = topPad + (maxIdx - midIdx) * pxPerBin;
-      ctx.strokeStyle = 'rgba(255,255,255,0.70)';
-      ctx.beginPath();
-      ctx.moveTo(leftPad, y);
-      ctx.lineTo(W-rightPad, y);
-      ctx.stroke();
-
-      // auto-follow: keep mid within viewport by nudging centerIdx on UI side
-      if (view.autoFollow && view.centerIdx !== null) {{
-        const margin = Math.floor(view.priceSpan * 0.12);
-        if (midIdx > (view.centerIdx + margin) || midIdx < (view.centerIdx - margin)) {{
-          view.centerIdx = midIdx;
-          throttledSend();
+        const rowOff = (y * W) * 4;
+        for (let x = x0; x < x1; x++) {{
+          const off = rowOff + x*4;
+          buf[off] = r;
+          buf[off+1] = g;
+          buf[off+2] = b;
+          buf[off+3] = 255;
         }}
       }}
     }}
+
+    octx.putImageData(img, 0, 0);
+
+    // Blit to screen
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(window._qdOsc, plotX, plotY, plotW, plotH);
+
+    // Price labels (lightweight)
+    ctx.fillStyle = 'rgba(220,230,255,0.85)';
+    ctx.font = '16px system-ui';
+    for (let j = 0; j <= 4; j++) {{
+      const y = plotY + (plotH*j/4);
+      const idx = (maxIdx - (bins-1)*(j/4));
+      const p = bm.basePrice + idx*bm.tick;
+      ctx.fillText(p.toFixed(1), 8, y+6);
+    }}
   }}
 
-  // Touch gesture handling
+// Touch gesture handling
   let active = false;
   let startTouches = [];
   let startMid = null;
