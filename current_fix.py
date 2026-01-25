@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =========================================================
-# QuantDesk Bookmap Service — FIX16_INTERACTIVE_SCROLL_ZOOM
+# QuantDesk Bookmap Service — FIX17_HEATMAP_DENSITY_LAYER
 #
 # Builds on FIX14 (parity-safe incremental book):
 # - Maintains canonical CLOB via incremental merge (no side wipeouts)
@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX16/P03"
+BUILD = "FIX17/P01"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -53,6 +53,13 @@ WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
 
 # Render controls (minimal)
 RENDER_FPS = float(os.environ.get("QD_RENDER_FPS", "8"))
+
+# Heatmap (resting liquidity) layer — FIX17
+# We maintain decayed intensity per price level (separately for bid/ask sides)
+# so liquidity "bands" persist briefly, similar to Bookmap's heat shading.
+HEAT_HALFLIFE_S = float(os.environ.get("QD_HEAT_HALFLIFE_S", "12.0"))  # decay half-life
+HEAT_MAX_KEYS = int(os.environ.get("QD_HEAT_MAX_KEYS", "4000"))         # safety cap for dict size
+HEAT_ALPHA = float(os.environ.get("QD_HEAT_ALPHA", "0.55"))             # max opacity for heat overlay (0..1)
 RENDER_LEVELS = int(os.environ.get("QD_LEVELS", "140"))   # visible rows
 RENDER_STEP = float(os.environ.get("QD_STEP", "0.1"))      # price tick for ladder rows
 ANCHOR_ALPHA = float(os.environ.get("QD_ANCHOR_ALPHA", "0.25"))  # smoothing factor
@@ -145,6 +152,11 @@ class State:
     # Render anchor + history (time window)
     anchor_px: Optional[float] = None
     anchor_hist: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=5000))
+
+    # Heatmap (FIX17): decayed resting liquidity intensity per price
+    heat_bid: Dict[float, float] = field(default_factory=dict)
+    heat_ask: Dict[float, float] = field(default_factory=dict)
+    heat_last_ts: Optional[float] = None
 
     # Debug
     last_raw: Optional[Dict[str, Any]] = None
@@ -418,6 +430,98 @@ async def _connector_loop() -> None:
 
 
 # ----------------------------
+
+# ----------------------------
+# Heatmap (FIX17): decayed liquidity intensity per price
+# ----------------------------
+
+def _heat_decay_factor(dt: float) -> float:
+    # exponential decay by half-life
+    if dt <= 0:
+        return 1.0
+    hl = max(0.5, float(HEAT_HALFLIFE_S))
+    return math.exp(-math.log(2.0) * dt / hl)
+
+def _heat_update_and_extract(prices: List[float], bid_qty: List[float], ask_qty: List[float]) -> Tuple[List[float], List[float]]:
+    """Update decayed heat maps and return normalized heat arrays aligned to `prices`."""
+    if not prices:
+        return [], []
+    ts = _now()
+    if STATE.heat_last_ts is None:
+        dt = 0.0
+    else:
+        dt = max(0.0, ts - float(STATE.heat_last_ts))
+    decay = _heat_decay_factor(dt)
+    STATE.heat_last_ts = ts
+
+    # Update intensities for current visible window
+    # Safety: limit dict growth
+    pmin = prices[0]
+    pmax = prices[-1]
+    # Because prices are ascending, this defines the visible range
+    for i, px in enumerate(prices):
+        bq = float(bid_qty[i] or 0.0)
+        aq = float(ask_qty[i] or 0.0)
+        if bq > 0.0:
+            prev = float(STATE.heat_bid.get(px, 0.0)) * decay
+            STATE.heat_bid[px] = max(prev, bq)
+        else:
+            # still decay existing
+            if px in STATE.heat_bid:
+                STATE.heat_bid[px] = float(STATE.heat_bid[px]) * decay
+
+        if aq > 0.0:
+            prev = float(STATE.heat_ask.get(px, 0.0)) * decay
+            STATE.heat_ask[px] = max(prev, aq)
+        else:
+            if px in STATE.heat_ask:
+                STATE.heat_ask[px] = float(STATE.heat_ask[px]) * decay
+
+    # Prune keys outside current view range and tiny values
+    def _prune_side(d: Dict[float, float]) -> None:
+        if not d:
+            return
+        # soft prune: remove out-of-range or near-zero
+        kill = []
+        for k, v in d.items():
+            if (k < pmin - 1e-9) or (k > pmax + 1e-9) or (v <= 0.0) or (v < 1e-9):
+                kill.append(k)
+        for k in kill:
+            try:
+                del d[k]
+            except Exception:
+                pass
+        # hard cap
+        if len(d) > HEAT_MAX_KEYS:
+            # drop smallest values
+            items = sorted(d.items(), key=lambda kv: kv[1])
+            for k, _ in items[: max(0, len(d) - HEAT_MAX_KEYS)]:
+                try:
+                    del d[k]
+                except Exception:
+                    pass
+
+    _prune_side(STATE.heat_bid)
+    _prune_side(STATE.heat_ask)
+
+    # Extract aligned arrays
+    hb = [float(STATE.heat_bid.get(px, 0.0)) for px in prices]
+    ha = [float(STATE.heat_ask.get(px, 0.0)) for px in prices]
+
+    # Normalize with log scaling to [0,1]
+    # Use max over window; avoid divide by 0
+    vmax = max(1e-9, max(hb + ha + [1e-9]))
+    denom = math.log1p(vmax)
+    if denom <= 0:
+        return [0.0 for _ in hb], [0.0 for _ in ha]
+
+    def _norm(v: float) -> float:
+        return min(1.0, max(0.0, math.log1p(max(0.0, v)) / denom))
+
+    hb_n = [_norm(v) for v in hb]
+    ha_n = [_norm(v) for v in ha]
+    return hb_n, ha_n
+
 # Render frame (bridge contract)
 # ----------------------------
 
@@ -451,7 +555,10 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0) -> Dict[str,
             bid_qty.append(float(STATE.book.bids.get(px, 0.0)))
             ask_qty.append(float(STATE.book.asks.get(px, 0.0)))
 
-    # Trades (last N)
+    
+    # Heatmap density (FIX17): update decayed liquidity intensity and extract normalized arrays
+    heat_bid, heat_ask = _heat_update_and_extract(prices, bid_qty, ask_qty)
+# Trades (last N)
     tape = [{"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side} for t in list(STATE.trades)[-60:]]
 
     # Anchor history for time window overlay
@@ -506,9 +613,12 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0) -> Dict[str,
             "anchor_px": view_anchor,
             "base_step": RENDER_STEP,
             "pan_ticks": pan_ticks,
+            "heat_alpha": HEAT_ALPHA,
             "prices": prices,
             "bid_qty": bid_qty,
             "ask_qty": ask_qty,
+            "heat_bid": heat_bid,
+            "heat_ask": heat_ask,
             "anchor_hist": hist,
         },
     }
@@ -699,7 +809,7 @@ def _ui_html() -> str:
 
   <div class="grid">
     <div class="card">
-      <div class="muted">This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a moving anchored ladder (price travel) with interactive pan/zoom (FIX16). It is not a full Bookmap renderer yet.</div>
+      <div class="muted">This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a moving anchored ladder (price travel) with interactive pan/zoom (FIX16) + heatmap density (FIX17). It is not a full Bookmap renderer yet.</div>
       <div style="height:10px"></div>
       <canvas id="cv" width="980" height="520"></canvas>
       <div class="muted small" style="margin-top:8px;">Ladder: green = bids, red = asks. Axis: higher prices at top. Mid line shows anchor. Wheel/pinch = zoom, drag = pan.</div>
@@ -778,6 +888,9 @@ def _ui_html() -> str:
     const prices = r.prices || [];
     const bids = r.bid_qty || [];
     const asks = r.ask_qty || [];
+    const heatB = r.heat_bid || [];
+    const heatA = r.heat_ask || [];
+
     const levels = prices.length;
 
     // Layout
@@ -829,7 +942,27 @@ def _ui_html() -> str:
       }}
     }}
 
-    // Draw bids/asks
+    
+    // Heatmap background (FIX17): draw decayed liquidity intensity per price level
+    // Values are normalized 0..1 server-side.
+    const heatMaxAlpha = clamp((frame.render && frame.render.heat_alpha) ? frame.render.heat_alpha : 0.55, 0.0, 1.0);
+    for (let i=0;i<levels;i++) {{
+      const y = yForIndex(i);
+      const hb = heatB[i] || 0;
+      const ha = heatA[i] || 0;
+      if (hb > 0.001) {{
+        const a = Math.min(heatMaxAlpha, hb * heatMaxAlpha);
+        ctx.fillStyle = 'rgba(46,125,50,' + (0.06 + 0.34*a).toFixed(3) + ')';
+        ctx.fillRect(bidX0, y, bidX1 - bidX0, rowH-1);
+      }}
+      if (ha > 0.001) {{
+        const a = Math.min(heatMaxAlpha, ha * heatMaxAlpha);
+        ctx.fillStyle = 'rgba(198,40,40,' + (0.06 + 0.34*a).toFixed(3) + ')';
+        ctx.fillRect(askX0, y, askX1 - askX0, rowH-1);
+      }}
+    }}
+
+// Draw bids/asks
     for (let i=0;i<levels;i++) {{
       const y = yForIndex(i);
       const bq = bids[i] || 0;
