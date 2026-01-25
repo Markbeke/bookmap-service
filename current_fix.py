@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX17/P02"
+BUILD = "FIX17/P03"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -994,7 +994,32 @@ def _ui_html() -> str:
     const colW = Math.max(1, Math.floor((heatX1 - heatX0) / Math.max(1, cols)));
     const xRight = heatX1;
 
-    // Draw oldest -> newest, newest anchored at the right edge
+    
+    // Normalization & contrast tuning (FIX17/P03):
+    // Use a high-percentile reference over recent history so a single liquidity wall
+    // does not wash out the entire heatmap.
+    let denom = 0.25;
+    if (cols > 0) {{
+      const samples = [];
+      const cStep = Math.max(1, Math.floor(cols / 60));   // sample up to ~60 columns
+      const iStep = Math.max(1, Math.floor(levels / 80)); // sample up to ~80 rows
+      for (let cc = 0; cc < cols; cc += cStep) {{
+        const hbS = heatHist[cc].hb;
+        const haS = heatHist[cc].ha;
+        for (let ii = 0; ii < levels; ii += iStep) {{
+          let vv = (hbS[ii] || 0) + (haS[ii] || 0);
+          if (vv > 1.0) vv = 1.0;
+          samples.push(vv);
+        }}
+      }}
+      samples.sort((a,b)=>a-b);
+      const p = 0.95;
+      const k = Math.max(0, Math.min(samples.length-1, Math.floor(p*(samples.length-1))));
+      denom = Math.max(0.05, samples[k] || denom);
+    }}
+    const HEAT_GAMMA = 0.65;  // <1 boosts low/mid contrast
+    const HEAT_CLIP  = 0.015; // suppress noise floor
+// Draw oldest -> newest, newest anchored at the right edge
     for (let c = 0; c < cols; c++) {{
       const col = heatHist[c];
       const x = xRight - (cols - c) * colW;
@@ -1006,10 +1031,15 @@ def _ui_html() -> str:
         const hb = hbCol[i] || 0;
         const ha = haCol[i] || 0;
         // Combine side intensities (Bookmap heatmap is magnitude-centric)
-        let v = hb + ha;
-        if (v > 1.0) v = 1.0;
-        if (v < 0.002) continue;
-        const a = Math.min(heatMaxAlpha, 0.10 + v * heatMaxAlpha);
+        let vRaw = hb + ha;
+        if (vRaw > 1.0) vRaw = 1.0;
+
+        // Robust normalization + contrast (FIX17/P03)
+        let v = clamp(vRaw / Math.max(1e-9, denom), 0.0, 1.0);
+        v = Math.pow(v, HEAT_GAMMA);
+        if (v < HEAT_CLIP) continue;
+
+        const a = heatMaxAlpha * (0.12 + 0.88 * v);
         ctx.fillStyle = heatRGBA(v, a);
         ctx.fillRect(x, y, colW, rowH-1);
       }}
