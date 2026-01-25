@@ -1,18 +1,23 @@
-# QuantDesk Bookmap Service - current_fix.py
-# Build: FIX12/P01
-# Purpose:
-# - Harden Replit startup so the process does not "start then stop" due to connector/import issues.
-# - Keep FastAPI up on 0.0.0.0:5000 even if WS/deps fail (health will show ERROR but server stays alive).
-# - Provide a Preview-safe HTML dashboard at "/" with clickable links and auto-refresh.
+# =========================================================
+# QuantDesk Bookmap Service — FIX13_RENDER_BRIDGE_CONTRACT
+# Replit runtime contract:
+# - Single entrypoint: current_fix.py
+# - FastAPI on 0.0.0.0:5000
+# - Always stays up (no hard exit) even if WS feed fails
+# - Provides:
+#     /            (UI dashboard + render bridge demo)
+#     /health.json (health summary)
+#     /telemetry.json
+#     /book.json   (best bid/ask + depth aggregates)
+#     /tape.json   (last trades)
+#     /render.json (render-bridge frame contract)
+#     /render.ws   (WebSocket stream of render frames)
+#     /raw.json    (raw ring buffer; debug)
+#     /bootlog.txt (startup + runtime log)
 #
-# Contract (Workflow v1.2):
-# - Single executable file: current_fix.py
-# - Endpoints: /, /health.json, /telemetry.json
-# - Additional endpoints: /book.json, /tape.json, /raw.json, /bootlog.txt
-#
-# Notes:
-# - ASCII-only file (avoid unicode like U+2014 that can break execution if pasted).
-# - No console spam; boot diagnostics are written to /tmp/qd_boot.log and served via /bootlog.txt.
+# NOTE: This build does not claim Bookmap parity; it formalizes the
+#       render-bridge contract required by the next rendering engine phase.
+# =========================================================
 
 from __future__ import annotations
 
@@ -21,168 +26,599 @@ import json
 import os
 import time
 import traceback
-from dataclasses import dataclass, field
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
-BOOT_LOG_PATH = "/tmp/qd_boot.log"
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+
+# websockets is optional in some Replit envs; we degrade safely.
+try:
+    import websockets  # type: ignore
+except Exception:  # pragma: no cover
+    websockets = None  # type: ignore
 
 
-def _bootlog(msg: str) -> None:
-    try:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-        with open(BOOT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}Z] {msg}\n")
-    except Exception:
-        pass
+# ----------------------------
+# Runtime configuration
+# ----------------------------
+BUILD = "FIX13/P01"
+SERVICE = "qd-bookmap"
+SYMBOL = os.getenv("QD_SYMBOL", "BTC_USDT")
+WS_URL = os.getenv("QD_WS_URL", "wss://contract.mexc.com/edge")  # contract WS
+
+HOST = "0.0.0.0"
+PORT = int(os.getenv("PORT", "5000"))
+
+RAW_RING_MAX = int(os.getenv("QD_RAW_RING", "200"))
+TAPE_MAX = int(os.getenv("QD_TAPE_MAX", "200"))
+DEPTH_MAX_LEVELS = int(os.getenv("QD_DEPTH_MAX", "200"))  # per side
+
+RENDER_DEFAULT_LEVELS = int(os.getenv("QD_RENDER_LEVELS", "120"))
+RENDER_DEFAULT_STEP = float(os.getenv("QD_RENDER_STEP", "0.1"))
+RENDER_FPS = float(os.getenv("QD_RENDER_FPS", "8"))  # ws push rate
+
+BOOTLOG_PATH = os.getenv("QD_BOOTLOG_PATH", "bootlog.txt")
 
 
 def _now() -> float:
     return time.time()
 
 
-# -----------------------------
-# Config
-# -----------------------------
-BUILD = "FIX12/P01"
-SERVICE = "qd-bookmap"
-
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", "5000"))  # Replit expects 5000
-SYMBOL = os.environ.get("QD_SYMBOL", "BTC_USDT")
-
-# MEXC contract WS base (as per earlier working state)
-WS_URL = os.environ.get("QD_WS_URL", "wss://contract.mexc.com/edge")
-
-# Optional stream hints
-TRADE_CHANNELS = [
-    os.environ.get("QD_TRADE_CH1", "push.deal"),
-    os.environ.get("QD_TRADE_CH2", "push.trade"),
-]
-
-RAW_RING_MAX = int(os.environ.get("QD_RAW_RING_MAX", "200"))
-TAPE_RING_MAX = int(os.environ.get("QD_TAPE_RING_MAX", "300"))
-
-RECONNECT_MIN_S = float(os.environ.get("QD_RECONNECT_MIN_S", "0.5"))
-RECONNECT_MAX_S = float(os.environ.get("QD_RECONNECT_MAX_S", "15.0"))
+def _fmt_ts(ts: float) -> str:
+    # lightweight iso-ish
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + f".{int((ts%1)*1000):03d}Z"
 
 
-# -----------------------------
-# State Models
-# -----------------------------
-@dataclass
-class BookState:
-    best_bid: Optional[Tuple[str, str]] = None  # (price, qty)
-    best_ask: Optional[Tuple[str, str]] = None
-    depth_counts: Dict[str, int] = field(default_factory=lambda: {"bids": 0, "asks": 0})
-    totals: Dict[str, str] = field(default_factory=lambda: {"bid_qty": "0", "ask_qty": "0"})
-    version: Optional[int] = None
-    last_update_ts: Optional[float] = None
-
-
-@dataclass
-class EngineState:
-    status: str = "WARMING"  # WARMING/ACTIVE/ERROR
-    frames: int = 0
-    reconnects: int = 0
-    last_error: str = ""
-    last_close_code: Optional[int] = None
-    last_close_reason: str = ""
-    last_connect_ts: Optional[float] = None
-    last_event_ts: Optional[float] = None
-
-    # Parsing stats
-    snapshots_applied: int = 0
-    parse_hits: int = 0
-    parse_misses: int = 0
-    invariants_ok: bool = True
-    last_invariant_violation: str = ""
-
-    # Tape stats
-    trades_seen: int = 0
-    last_trade_px: Optional[float] = None
-    last_trade_side: Optional[str] = None
-    last_trade_qty: Optional[float] = None
-    last_trade_ts: Optional[float] = None
-
-    # Book
-    book: BookState = field(default_factory=BookState)
-
-
-@dataclass
-class ServiceState:
-    started_ts: float = field(default_factory=_now)
-    subsystem: str = "FOUNDATION+STREAM+GLOBAL_LADDER_STATE_ENGINE+INCREMENTAL_MERGE+TRADE_TAPE"
-    health: str = "YELLOW"  # GREEN/YELLOW/RED
-    ws_url: str = WS_URL
-    symbol: str = SYMBOL
-    engine: EngineState = field(default_factory=EngineState)
-    raw_ring: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=RAW_RING_MAX))
-    tape_ring: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=TAPE_RING_MAX))
-    import_errors: List[str] = field(default_factory=list)
-
-
-STATE = ServiceState()
-STATE_LOCK = asyncio.Lock()
-
-
-# -----------------------------
-# Dependency-safe imports
-# -----------------------------
-try:
-    from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
-except Exception as e:
-    STATE.import_errors.append(f"fastapi_import_error: {repr(e)}")
-    _bootlog(f"FastAPI import failed: {repr(e)}")
-    FastAPI = None  # type: ignore
-
-try:
-    import websockets  # type: ignore
-except Exception as e:
-    STATE.import_errors.append(f"websockets_import_error: {repr(e)}")
-    _bootlog(f"websockets import failed: {repr(e)}")
-    websockets = None  # type: ignore
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def _compute_health() -> str:
-    eng = STATE.engine
-    if eng.status == "ERROR":
-        return "RED"
-    if eng.status == "ACTIVE" and eng.last_event_ts is not None:
-        if (_now() - eng.last_event_ts) <= 5.0:
-            return "GREEN"
-    return "YELLOW"
-
-
-def _json(obj: Any) -> str:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=True)
+def bootlog(msg: str) -> None:
+    try:
+        line = f"[{_fmt_ts(_now())}] {msg}\n"
+        with open(BOOTLOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        # never crash for logging
+        pass
 
 
 def _as_float(x: Any) -> Optional[float]:
     try:
         if x is None:
             return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            x = x.strip()
+            if not x:
+                return None
+            return float(x)
         return float(x)
     except Exception:
         return None
 
 
-def _norm_side(x: Any) -> Optional[str]:
-    if x is None:
+def _as_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, int):
+            return int(x)
+        if isinstance(x, float):
+            return int(x)
+        if isinstance(x, str):
+            x = x.strip()
+            if not x:
+                return None
+            return int(float(x))
+        return int(x)
+    except Exception:
         return None
-    s = str(x).lower()
-    if s in ("buy", "b", "1"):
-        return "buy"
-    if s in ("sell", "s", "2", "-1"):
-        return "sell"
-    return None
 
 
-def _html_index() -> str:
+@dataclass
+class Trade:
+    ts: float
+    px: float
+    qty: float
+    side: str  # "buy" or "sell"
+
+
+@dataclass
+class Book:
+    bids: Dict[float, float] = field(default_factory=dict)  # px -> qty
+    asks: Dict[float, float] = field(default_factory=dict)  # px -> qty
+    version: Optional[int] = None
+    last_update_ts: Optional[float] = None
+
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+
+    bid_qty_total: float = 0.0
+    ask_qty_total: float = 0.0
+
+    def recompute(self) -> None:
+        self.best_bid = max(self.bids.keys()) if self.bids else None
+        self.best_ask = min(self.asks.keys()) if self.asks else None
+        self.bid_qty_total = float(sum(self.bids.values())) if self.bids else 0.0
+        self.ask_qty_total = float(sum(self.asks.values())) if self.asks else 0.0
+
+
+@dataclass
+class State:
+    start_ts: float = field(default_factory=_now)
+
+    # connector
+    status: str = "INIT"  # INIT/CONNECTING/CONNECTED/ERROR
+    frames: int = 0
+    reconnects: int = 0
+    last_error: str = ""
+    last_connect_ts: Optional[float] = None
+    last_event_ts: Optional[float] = None
+    last_close_code: Optional[int] = None
+    last_close_reason: str = ""
+
+    # parsing stats
+    parse_hits: int = 0
+    parse_misses: int = 0
+
+    # rings
+    raw_ring: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=RAW_RING_MAX))
+    trades: Deque[Trade] = field(default_factory=lambda: deque(maxlen=TAPE_MAX))
+
+    # book
+    book: Book = field(default_factory=Book)
+    snapshots_applied: int = 0
+
+    def uptime_s(self) -> float:
+        return _now() - self.start_ts
+
+
+STATE = State()
+
+# ----------------------------
+# Depth parsing & merge
+# ----------------------------
+
+def _apply_depth_snapshot(obj: Dict[str, Any], ts: float) -> bool:
+    """
+    Accepts MEXC contract depth push. Seen variants include:
+      { "channel":"push.depth", "symbol":"BTC_USDT", "data": {"bids":[[px,qty],...], "asks":[[px,qty],...], "version": ... } }
+    and/or:
+      { "data": {"bids":..., "asks":...}, "symbol":..., "ts": ... }
+    """
+    data = obj.get("data")
+    if not isinstance(data, dict):
+        return False
+
+    bids = data.get("bids")
+    asks = data.get("asks")
+    if not isinstance(bids, list) and not isinstance(asks, list):
+        return False
+
+    # Build new maps (snapshot semantics)
+    new_bids: Dict[float, float] = {}
+    new_asks: Dict[float, float] = {}
+
+    def _ingest(side_list: Any, out: Dict[float, float]) -> None:
+        if not isinstance(side_list, list):
+            return
+        # Each entry may be [px, qty] or {"price":..., "quantity":...}
+        for lvl in side_list[:DEPTH_MAX_LEVELS]:
+            px = qty = None
+            if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                px = _as_float(lvl[0])
+                qty = _as_float(lvl[1])
+            elif isinstance(lvl, dict):
+                px = _as_float(lvl.get("price") or lvl.get("p"))
+                qty = _as_float(lvl.get("quantity") or lvl.get("q"))
+            if px is None or qty is None:
+                continue
+            if qty <= 0:
+                continue
+            out[px] = qty
+
+    _ingest(bids, new_bids)
+    _ingest(asks, new_asks)
+
+    # Apply
+    STATE.book.bids = new_bids
+    STATE.book.asks = new_asks
+    STATE.book.version = _as_int(data.get("version") or obj.get("version") or obj.get("v"))
+    STATE.book.last_update_ts = ts
+    STATE.book.recompute()
+    STATE.snapshots_applied += 1
+    return True
+
+
+def _extract_trade_events(obj: Dict[str, Any], ts: float) -> int:
+    """
+    Accepts MEXC contract deal push variants. Common patterns:
+      - data is dict with fields p/v/S (price/vol/side)
+      - data is list of dicts (batch)
+    Side field varies; we map to buy/sell if possible, else unknown.
+    """
+    data = obj.get("data")
+    if data is None:
+        return 0
+
+    events: List[Dict[str, Any]] = []
+    if isinstance(data, list):
+        events = [x for x in data if isinstance(x, dict)]
+    elif isinstance(data, dict):
+        # sometimes nested: {"deals":[...]}
+        if isinstance(data.get("deals"), list):
+            events = [x for x in data.get("deals") if isinstance(x, dict)]
+        else:
+            events = [data]
+    else:
+        return 0
+
+    pushed = 0
+    for ev in events:
+        px = _as_float(ev.get("p") or ev.get("price") or ev.get("px"))
+        qty = _as_float(ev.get("v") or ev.get("vol") or ev.get("qty") or ev.get("q"))
+        if px is None or qty is None:
+            continue
+
+        side_raw = ev.get("S") or ev.get("side") or ev.get("t") or ev.get("T")
+        side = "unknown"
+        if isinstance(side_raw, str):
+            s = side_raw.lower()
+            if "buy" in s or s in ("b", "bid"):
+                side = "buy"
+            elif "sell" in s or s in ("s", "ask"):
+                side = "sell"
+        elif isinstance(side_raw, (int, float)):
+            # Some feeds use 1/2, 1=buy 2=sell (cannot confirm for MEXC)
+            if int(side_raw) == 1:
+                side = "buy"
+            elif int(side_raw) == 2:
+                side = "sell"
+
+        STATE.trades.append(Trade(ts=ts, px=px, qty=qty, side=side))
+        pushed += 1
+
+    return pushed
+
+
+def _handle_ws_message(raw: str) -> None:
+    ts = _now()
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        STATE.parse_misses += 1
+        return
+
+    STATE.raw_ring.append({"ts": ts, "raw": obj})
+    STATE.frames += 1
+    STATE.last_event_ts = ts
+
+    if isinstance(obj, dict):
+        hit = False
+        ch = obj.get("channel") or obj.get("c") or ""
+        if isinstance(ch, str):
+            ch_l = ch.lower()
+        else:
+            ch_l = ""
+
+        # Depth: push.depth or any dict containing bids/asks
+        if "depth" in ch_l or ("data" in obj and isinstance(obj.get("data"), dict) and ("bids" in obj["data"] or "asks" in obj["data"])):
+            if _apply_depth_snapshot(obj, ts):
+                hit = True
+
+        # Deals/trades: push.deal, push.trade, deals, etc.
+        if ("deal" in ch_l) or ("trade" in ch_l) or ("deals" in ch_l):
+            pushed = _extract_trade_events(obj, ts)
+            if pushed > 0:
+                hit = True
+
+        if hit:
+            STATE.parse_hits += 1
+        else:
+            STATE.parse_misses += 1
+    else:
+        STATE.parse_misses += 1
+
+
+# ----------------------------
+# Connector loop (MEXC contract WS)
+# ----------------------------
+
+async def _connector_loop() -> None:
+    if websockets is None:
+        STATE.status = "ERROR"
+        STATE.last_error = "python package 'websockets' is not available in this environment"
+        bootlog("ERROR: websockets module missing; connector disabled")
+        return
+
+    sub_depth = {"method": "sub.depth", "param": {"symbol": SYMBOL, "depth": 200}, "id": 1}
+    sub_deals = {"method": "sub.deal", "param": {"symbol": SYMBOL}, "id": 2}
+
+    while True:
+        try:
+            STATE.status = "CONNECTING"
+            bootlog(f"Connecting WS: {WS_URL} symbol={SYMBOL}")
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, close_timeout=10) as ws:
+                STATE.status = "CONNECTED"
+                STATE.last_connect_ts = _now()
+                STATE.last_error = ""
+                STATE.last_close_code = None
+                STATE.last_close_reason = ""
+
+                try:
+                    await ws.send(json.dumps(sub_depth))
+                    await ws.send(json.dumps(sub_deals))
+                except Exception as e:
+                    STATE.last_error = f"subscribe_send_failed: {e}"
+                    bootlog(f"ERROR: subscribe send failed: {e}")
+
+                while True:
+                    raw = await ws.recv()
+                    if isinstance(raw, bytes):
+                        try:
+                            raw = raw.decode("utf-8", errors="replace")
+                        except Exception:
+                            raw = str(raw)
+                    _handle_ws_message(str(raw))
+        except Exception as e:
+            STATE.status = "ERROR"
+            STATE.reconnects += 1
+            STATE.last_error = f"{type(e).__name__}: {e}"
+            bootlog(f"WS ERROR: {STATE.last_error}\n{traceback.format_exc()}")
+            # bounded backoff
+            await asyncio.sleep(min(10.0, 0.5 * STATE.reconnects))
+
+
+# ----------------------------
+# Render Bridge Contract
+# ----------------------------
+
+def _mid_px() -> Optional[float]:
+    bb = STATE.book.best_bid
+    ba = STATE.book.best_ask
+    if bb is not None and ba is not None:
+        return (bb + ba) / 2.0
+    if STATE.trades:
+        return STATE.trades[-1].px
+    return bb or ba
+
+
+def _render_frame(levels: int, step: float) -> Dict[str, Any]:
+    ts = _now()
+    mid = _mid_px()
+    bb = STATE.book.best_bid
+    ba = STATE.book.best_ask
+
+    # Create a symmetric ladder around mid if possible
+    prices: List[float] = []
+    bid_qty: List[float] = []
+    ask_qty: List[float] = []
+
+    if mid is not None and step > 0 and levels > 0:
+        center = round(mid / step) * step
+        half = levels // 2
+        start = center - half * step
+        for i in range(levels):
+            px = round(start + i * step, 10)
+            prices.append(px)
+            bid_qty.append(float(STATE.book.bids.get(px, 0.0)))
+            ask_qty.append(float(STATE.book.asks.get(px, 0.0)))
+
+    # Tape (last N, newest last)
+    tape = [
+        {"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side}
+        for t in list(STATE.trades)[-50:]
+    ]
+
+    last_event_age = None
+    if STATE.last_event_ts is not None:
+        last_event_age = ts - STATE.last_event_ts
+
+    return {
+        "ts": ts,
+        "service": SERVICE,
+        "build": BUILD,
+        "symbol": SYMBOL,
+        "ws_url": WS_URL,
+        "health": "GREEN" if STATE.status == "CONNECTED" else ("YELLOW" if STATE.status in ("INIT", "CONNECTING") else "RED"),
+        "connector": {
+            "status": STATE.status,
+            "frames": STATE.frames,
+            "reconnects": STATE.reconnects,
+            "last_error": STATE.last_error,
+            "last_event_age_s": last_event_age,
+        },
+        "book": {
+            "best_bid": bb,
+            "best_ask": ba,
+            "version": STATE.book.version,
+            "depth_counts": {"bids": len(STATE.book.bids), "asks": len(STATE.book.asks)},
+            "totals": {"bid_qty": STATE.book.bid_qty_total, "ask_qty": STATE.book.ask_qty_total},
+            "last_update_ts": STATE.book.last_update_ts,
+        },
+        "tape": {
+            "trades_seen": len(STATE.trades),
+            "last_trade_px": STATE.trades[-1].px if STATE.trades else None,
+            "last_trade_qty": STATE.trades[-1].qty if STATE.trades else None,
+            "last_trade_side": STATE.trades[-1].side if STATE.trades else None,
+            "last_trade_ts": STATE.trades[-1].ts if STATE.trades else None,
+            "items": tape,
+        },
+        "render": {
+            "levels": levels,
+            "step": step,
+            "mid_px": mid,
+            "prices": prices,
+            "bid_qty": bid_qty,
+            "ask_qty": ask_qty,
+        },
+    }
+
+
+# ----------------------------
+# FastAPI App (with lifespan)
+# ----------------------------
+
+app = FastAPI(title="QuantDesk Bookmap", version=BUILD)
+
+@app.on_event("startup")  # OK for Replit; deprecation warning is acceptable for now
+async def _startup() -> None:
+    bootlog(f"Starting {SERVICE} {BUILD} on {HOST}:{PORT}")
+    bootlog(f"Lifespan startup entered")
+    # Start connector in background
+    asyncio.create_task(_connector_loop())
+
+
+@app.get("/bootlog.txt")
+async def bootlog_txt() -> PlainTextResponse:
+    try:
+        with open(BOOTLOG_PATH, "r", encoding="utf-8") as f:
+            return PlainTextResponse(f.read())
+    except Exception:
+        return PlainTextResponse("bootlog unavailable", status_code=404)
+
+
+@app.get("/health.json")
+async def health_json() -> JSONResponse:
+    # Health semantics (matching prior workflow):
+    # GREEN: server up + connector CONNECTED + fresh frames
+    # YELLOW: server up but connector not connected yet (warmup) OR no frames yet
+    # RED: server up but connector in ERROR
+    now = _now()
+    fresh = (STATE.last_event_ts is not None) and (now - STATE.last_event_ts < 5.0)
+    if STATE.status == "CONNECTED" and fresh and STATE.frames > 0:
+        h = "GREEN"
+    elif STATE.status == "ERROR":
+        h = "RED"
+    else:
+        h = "YELLOW"
+    return JSONResponse({
+        "ts": now,
+        "service": SERVICE,
+        "build": BUILD,
+        "symbol": SYMBOL,
+        "ws_url": WS_URL,
+        "health": h,
+        "uptime_s": round(STATE.uptime_s(), 3),
+        "connector": {
+            "status": STATE.status,
+            "frames": STATE.frames,
+            "reconnects": STATE.reconnects,
+            "last_error": STATE.last_error,
+            "last_event_ts": STATE.last_event_ts,
+            "last_connect_ts": STATE.last_connect_ts,
+        },
+        "book": {
+            "best_bid": STATE.book.best_bid,
+            "best_ask": STATE.book.best_ask,
+            "depth_counts": {"bids": len(STATE.book.bids), "asks": len(STATE.book.asks)},
+            "version": STATE.book.version,
+            "last_update_ts": STATE.book.last_update_ts,
+        },
+        "tape": {
+            "trades_seen": len(STATE.trades),
+            "last_trade_px": STATE.trades[-1].px if STATE.trades else None,
+            "last_trade_ts": STATE.trades[-1].ts if STATE.trades else None,
+        },
+    })
+
+
+@app.get("/telemetry.json")
+async def telemetry_json() -> JSONResponse:
+    return JSONResponse({
+        "ts": _now(),
+        "service": SERVICE,
+        "build": BUILD,
+        "symbol": SYMBOL,
+        "ws_url": WS_URL,
+        "uptime_s": round(STATE.uptime_s(), 3),
+        "connector": {
+            "status": STATE.status,
+            "frames": STATE.frames,
+            "reconnects": STATE.reconnects,
+            "last_error": STATE.last_error,
+            "last_close_code": STATE.last_close_code,
+            "last_close_reason": STATE.last_close_reason,
+            "last_connect_ts": STATE.last_connect_ts,
+            "last_event_ts": STATE.last_event_ts,
+        },
+        "parser": {
+            "parse_hits": STATE.parse_hits,
+            "parse_misses": STATE.parse_misses,
+            "snapshots_applied": STATE.snapshots_applied,
+        },
+        "rings": {
+            "raw_ring_size": len(STATE.raw_ring),
+            "tape_size": len(STATE.trades),
+        },
+        "host": HOST,
+        "port": PORT,
+    })
+
+
+@app.get("/raw.json")
+async def raw_json() -> JSONResponse:
+    return JSONResponse({
+        "ts": _now(),
+        "build": BUILD,
+        "raw_ring": list(STATE.raw_ring),
+    })
+
+
+@app.get("/book.json")
+async def book_json() -> JSONResponse:
+    return JSONResponse({
+        "ts": _now(),
+        "build": BUILD,
+        "symbol": SYMBOL,
+        "best_bid": STATE.book.best_bid,
+        "best_ask": STATE.book.best_ask,
+        "depth_counts": {"bids": len(STATE.book.bids), "asks": len(STATE.book.asks)},
+        "totals": {"bid_qty": STATE.book.bid_qty_total, "ask_qty": STATE.book.ask_qty_total},
+        "version": STATE.book.version,
+        "last_update_ts": STATE.book.last_update_ts,
+    })
+
+
+@app.get("/tape.json")
+async def tape_json() -> JSONResponse:
+    return JSONResponse({
+        "ts": _now(),
+        "build": BUILD,
+        "symbol": SYMBOL,
+        "trades_seen": len(STATE.trades),
+        "last_trade_px": STATE.trades[-1].px if STATE.trades else None,
+        "last_trade_qty": STATE.trades[-1].qty if STATE.trades else None,
+        "last_trade_side": STATE.trades[-1].side if STATE.trades else None,
+        "last_trade_ts": STATE.trades[-1].ts if STATE.trades else None,
+        "tape": [{"ts": t.ts, "px": t.px, "qty": t.qty, "side": t.side} for t in list(STATE.trades)],
+    })
+
+
+@app.get("/render.json")
+async def render_json(levels: int = RENDER_DEFAULT_LEVELS, step: float = RENDER_DEFAULT_STEP) -> JSONResponse:
+    # Contract: always returns a frame; empty arrays allowed during warmup.
+    levels = max(10, min(400, int(levels)))
+    step = float(step) if step and step > 0 else RENDER_DEFAULT_STEP
+    return JSONResponse(_render_frame(levels=levels, step=step))
+
+
+@app.websocket("/render.ws")
+async def render_ws(ws: WebSocket) -> None:
+    await ws.accept()
+    fps = max(1.0, min(30.0, RENDER_FPS))
+    period = 1.0 / fps
+    try:
+        while True:
+            frame = _render_frame(levels=RENDER_DEFAULT_LEVELS, step=RENDER_DEFAULT_STEP)
+            await ws.send_text(json.dumps(frame))
+            await asyncio.sleep(period)
+    except Exception:
+        # client disconnect or send failure
+        return
+
+
+def _ui_html() -> str:
     return f"""<!doctype html>
 <html>
 <head>
@@ -190,384 +626,208 @@ def _html_index() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>QuantDesk Bookmap</title>
   <style>
-    body {{ font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }}
-    .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 16px; max-width: 900px; }}
-    .row {{ display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }}
-    .pill {{ display: inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid #ccc; font-weight: 700; }}
-    pre {{ background: #0b0f14; color: #e6edf3; padding: 12px; border-radius: 10px; overflow: auto; }}
-    a {{ text-decoration: none; }}
-    code {{ background: #f6f8fa; padding: 1px 4px; border-radius: 6px; }}
-    .muted {{ color: #666; }}
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }}
+    .top {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
+    .pill {{ padding:6px 10px; border-radius:999px; border:1px solid #ddd; font-weight:600; }}
+    .pill.green {{ border-color:#2e7d32; color:#2e7d32; }}
+    .pill.yellow {{ border-color:#f9a825; color:#8a6d00; }}
+    .pill.red {{ border-color:#c62828; color:#c62828; }}
+    .muted {{ color:#666; }}
+    .grid {{ display:grid; grid-template-columns: 1fr; gap:14px; margin-top:16px; max-width: 1100px; }}
+    @media (min-width: 980px) {{
+      .grid {{ grid-template-columns: 1.2fr 0.8fr; }}
+    }}
+    pre {{ background:#0b0b0c; color:#e8e8e8; padding:14px; border-radius:12px; overflow:auto; font-size:12px; line-height:1.25; }}
+    canvas {{ width:100%; height:520px; background:#fff; border:1px solid #ddd; border-radius:12px; }}
+    .links a {{ display:block; margin:4px 0; }}
   </style>
 </head>
 <body>
-  <h2>QuantDesk Bookmap</h2>
-  <div class="card">
-    <div class="row">
-      <div><span class="pill" id="healthPill">HEALTH: ...</span></div>
-      <div class="muted">Build: <b>{BUILD}</b></div>
-      <div class="muted">Symbol: <b>{SYMBOL}</b></div>
-      <div class="muted">WS: <b id="wsUrl">...</b></div>
+  <h1>QuantDesk Bookmap</h1>
+  <div class="top">
+    <span id="healthPill" class="pill yellow">HEALTH: ...</span>
+    <span class="muted">Build: {BUILD}</span>
+    <span class="muted">Symbol: {SYMBOL}</span>
+    <span class="muted">WS: {WS_URL}</span>
+  </div>
+
+  <p class="muted">
+    This page is a <b>render bridge contract demo</b>. It streams <code>/render.ws</code> frames and draws a minimal ladder.
+    It is not a full Bookmap renderer yet.
+  </p>
+
+  <div class="grid">
+    <div>
+      <canvas id="cv" width="1100" height="520"></canvas>
+      <p class="muted" style="margin-top:8px;">
+        Ladder: green = bids, red = asks. Mid line shown when available.
+      </p>
     </div>
-
-    <p class="muted">
-      If you opened an editor URL like <code>replit.com/@user/...</code> it can 404.
-      Use the runtime host you are on now and these endpoints:
-    </p>
-
-    <ul>
-      <li><a id="l_health" href="/health.json" target="_blank">/health.json</a></li>
-      <li><a id="l_tele" href="/telemetry.json" target="_blank">/telemetry.json</a></li>
-      <li><a id="l_book" href="/book.json" target="_blank">/book.json</a></li>
-      <li><a id="l_tape" href="/tape.json" target="_blank">/tape.json</a></li>
-      <li><a id="l_raw" href="/raw.json" target="_blank">/raw.json</a></li>
-      <li><a id="l_boot" href="/bootlog.txt" target="_blank">/bootlog.txt</a></li>
-    </ul>
-
-    <h3>Status (auto-refresh)</h3>
-    <pre id="statusBox">loading...</pre>
+    <div>
+      <div class="links">
+        <b>Endpoints</b>
+        <a href="/health.json" target="_blank">/health.json</a>
+        <a href="/telemetry.json" target="_blank">/telemetry.json</a>
+        <a href="/book.json" target="_blank">/book.json</a>
+        <a href="/tape.json" target="_blank">/tape.json</a>
+        <a href="/render.json" target="_blank">/render.json</a>
+        <a href="/raw.json" target="_blank">/raw.json</a>
+        <a href="/bootlog.txt" target="_blank">/bootlog.txt</a>
+      </div>
+      <h3>Status (auto-refresh)</h3>
+      <pre id="statusPre">{{}}</pre>
+    </div>
   </div>
 
 <script>
 (function() {{
-  function setHealth(h) {{
-    const pill = document.getElementById("healthPill");
-    pill.textContent = "HEALTH: " + h;
-    pill.style.borderColor = (h === "GREEN") ? "#1a7f37" : (h === "RED" ? "#cf222e" : "#bf8700");
+  const statusPre = document.getElementById('statusPre');
+  const pill = document.getElementById('healthPill');
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+
+  function setPill(h) {{
+    pill.classList.remove('green','yellow','red');
+    if (h === 'GREEN') pill.classList.add('green');
+    else if (h === 'RED') pill.classList.add('red');
+    else pill.classList.add('yellow');
+    pill.textContent = 'HEALTH: ' + h;
   }}
-  function abs(u) {{
-    return window.location.origin + u;
-  }}
-  function fixLinks() {{
-    document.getElementById("l_health").href = abs("/health.json");
-    document.getElementById("l_tele").href = abs("/telemetry.json");
-    document.getElementById("l_book").href = abs("/book.json");
-    document.getElementById("l_tape").href = abs("/tape.json");
-    document.getElementById("l_raw").href = abs("/raw.json");
-    document.getElementById("l_boot").href = abs("/bootlog.txt");
-  }}
-  async function tick() {{
-    try {{
-      const r = await fetch("/health.json", {{ cache: "no-store" }});
-      const j = await r.json();
-      document.getElementById("wsUrl").textContent = j.ws_url || "";
-      setHealth(j.health || "YELLOW");
-      document.getElementById("statusBox").textContent = JSON.stringify(j, null, 2);
-    }} catch(e) {{
-      document.getElementById("statusBox").textContent = "fetch failed: " + (e && e.message ? e.message : String(e));
+
+  function draw(frame) {{
+    // Clear
+    ctx.clearRect(0,0,cv.width,cv.height);
+
+    const prices = frame?.render?.prices || [];
+    const bid = frame?.render?.bid_qty || [];
+    const ask = frame?.render?.ask_qty || [];
+
+    // Background
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0,0,cv.width,cv.height);
+
+    if (!prices.length) {{
+      ctx.fillStyle = '#666';
+      ctx.font = '16px system-ui';
+      ctx.fillText('Waiting for render frames...', 16, 28);
+      return;
+    }}
+
+    const n = prices.length;
+    const padL = 80, padR = 20, padT = 16, padB = 16;
+    const W = cv.width - padL - padR;
+    const H = cv.height - padT - padB;
+
+    // Scale qty to bars
+    let maxQ = 0;
+    for (let i=0;i<n;i++) {{
+      maxQ = Math.max(maxQ, bid[i]||0, ask[i]||0);
+    }}
+    maxQ = Math.max(1e-9, maxQ);
+
+    // Draw ladder rows
+    const rowH = H / n;
+    for (let i=0;i<n;i++) {{
+      const y = padT + i*rowH;
+      const b = (bid[i]||0) / maxQ;
+      const a = (ask[i]||0) / maxQ;
+
+      // price labels
+      if (i % Math.max(1, Math.floor(n/12)) === 0) {{
+        ctx.fillStyle = '#333';
+        ctx.font = '12px system-ui';
+        ctx.fillText(prices[i].toFixed(1), 10, y + rowH*0.8);
+        // light grid
+        ctx.strokeStyle = '#eee';
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(padL+W, y);
+        ctx.stroke();
+      }}
+
+      // bid bar (left-to-right)
+      if (b > 0) {{
+        ctx.fillStyle = 'rgba(46, 125, 50, 0.45)';
+        ctx.fillRect(padL, y, W * b, rowH);
+      }}
+      // ask bar (right-to-left)
+      if (a > 0) {{
+        ctx.fillStyle = 'rgba(198, 40, 40, 0.40)';
+        ctx.fillRect(padL + (W * (1 - a)), y, W * a, rowH);
+      }}
+    }}
+
+    // Mid line
+    const mid = frame?.render?.mid_px;
+    if (typeof mid === 'number') {{
+      // find nearest row
+      let bestI = 0, bestD = 1e18;
+      for (let i=0;i<n;i++) {{
+        const d = Math.abs(prices[i]-mid);
+        if (d < bestD) {{ bestD = d; bestI = i; }}
+      }}
+      const y = padT + bestI*rowH + rowH/2;
+      ctx.strokeStyle = '#111';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padL, y);
+      ctx.lineTo(padL+W, y);
+      ctx.stroke();
+      ctx.lineWidth = 1;
     }}
   }}
-  fixLinks();
-  tick();
-  setInterval(tick, 1000);
+
+  // Health poll
+  async function poll() {{
+    try {{
+      const r = await fetch('/health.json', {{cache:'no-store'}});
+      const j = await r.json();
+      setPill(j.health || 'YELLOW');
+    }} catch (e) {{
+      setPill('YELLOW');
+    }}
+  }}
+  setInterval(poll, 1000);
+  poll();
+
+  // Render WS
+  const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+  const wsUrl = proto + '://' + location.host + '/render.ws';
+  const ws = new WebSocket(wsUrl);
+  ws.onmessage = (ev) => {{
+    try {{
+      const frame = JSON.parse(ev.data);
+      statusPre.textContent = JSON.stringify(frame, null, 2);
+      draw(frame);
+    }} catch (e) {{
+      // ignore
+    }}
+  }};
+  ws.onopen = () => {{
+    // noop
+  }};
+  ws.onerror = () => {{
+    // noop
+  }};
 }})();
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 
-# -----------------------------
-# WS Connector (best-effort, never fatal)
-# -----------------------------
-async def _ws_loop() -> None:
-    if websockets is None:
-        async with STATE_LOCK:
-            STATE.engine.status = "WARMING"
-            STATE.engine.last_error = "websockets library missing; connector disabled"
-            STATE.engine.last_event_ts = None
-            STATE.health = _compute_health()
-        _bootlog("WS loop disabled: websockets missing")
-        return
-
-    backoff = RECONNECT_MIN_S
-    while True:
-        try:
-            async with STATE_LOCK:
-                STATE.engine.status = "WARMING"
-                STATE.engine.last_error = ""
-                STATE.ws_url = WS_URL
-                STATE.health = _compute_health()
-            _bootlog(f"Connecting WS: {WS_URL}")
-
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:  # type: ignore
-                async with STATE_LOCK:
-                    STATE.engine.last_connect_ts = _now()
-                    STATE.engine.last_close_code = None
-                    STATE.engine.last_close_reason = ""
-                    STATE.engine.status = "ACTIVE"
-                    STATE.health = _compute_health()
-                backoff = RECONNECT_MIN_S
-
-                # Conservative subscribe set (schema may vary; failures show in /raw.json and /bootlog.txt)
-                sub_msgs: List[Dict[str, Any]] = []
-                for ch in TRADE_CHANNELS:
-                    sub_msgs.append({"method": ch, "param": {"symbol": SYMBOL}})
-                sub_msgs.append({"method": "sub.depth", "param": {"symbol": SYMBOL, "level": 20}})
-
-                for m in sub_msgs:
-                    try:
-                        await ws.send(_json(m))
-                    except Exception as e:
-                        _bootlog(f"WS send failed: {repr(e)} msg={m}")
-
-                async for msg in ws:
-                    ts = _now()
-                    try:
-                        if isinstance(msg, (bytes, bytearray)):
-                            msg = msg.decode("utf-8", errors="replace")
-                        obj = json.loads(msg)
-                    except Exception:
-                        obj = {"_raw": str(msg)}
-
-                    async with STATE_LOCK:
-                        eng = STATE.engine
-                        eng.frames += 1
-                        eng.last_event_ts = ts
-                        STATE.raw_ring.append({"ts": ts, "raw": obj})
-
-                        # Extract trades best-effort
-                        trades: List[Dict[str, Any]] = []
-                        try:
-                            d = obj.get("data") if isinstance(obj, dict) else None
-                            if isinstance(d, list):
-                                trades = [it for it in d if isinstance(it, dict)]
-                            elif isinstance(d, dict) and isinstance(d.get("deals"), list):
-                                trades = [it for it in d["deals"] if isinstance(it, dict)]
-                            elif isinstance(d, dict) and isinstance(d.get("trades"), list):
-                                trades = [it for it in d["trades"] if isinstance(it, dict)]
-                        except Exception:
-                            trades = []
-
-                        for t in trades[:50]:
-                            px = _as_float(t.get("p") or t.get("price") or t.get("px"))
-                            qty = _as_float(t.get("v") or t.get("qty") or t.get("q") or t.get("size"))
-                            side = _norm_side(t.get("S") or t.get("side") or t.get("takerSide") or t.get("m"))
-                            eng.trades_seen += 1
-                            eng.last_trade_px = px
-                            eng.last_trade_qty = qty
-                            eng.last_trade_side = side
-                            eng.last_trade_ts = ts
-                            STATE.tape_ring.append({
-                                "ts": ts,
-                                "px": px,
-                                "qty": qty,
-                                "side": side,
-                                "raw_type": obj.get("method") or obj.get("channel") or obj.get("c"),
-                            })
-
-                        STATE.health = _compute_health()
-
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            _bootlog(f"WS loop error: {err}\n{traceback.format_exc()}")
-            async with STATE_LOCK:
-                STATE.engine.status = "ERROR"
-                STATE.engine.last_error = err
-                STATE.engine.reconnects += 1
-                STATE.health = _compute_health()
-            await asyncio.sleep(backoff)
-            backoff = min(RECONNECT_MAX_S, max(RECONNECT_MIN_S, backoff * 1.7))
+@app.get("/")
+async def index() -> HTMLResponse:
+    return HTMLResponse(_ui_html())
 
 
-# -----------------------------
-# FastAPI app
-# -----------------------------
-APP = None
-
-if FastAPI is not None:
-    from contextlib import asynccontextmanager
-
-    @asynccontextmanager
-    async def lifespan(app: "FastAPI"):
-        _bootlog("Lifespan startup entered")
-        try:
-            if os.environ.get("QD_CLEAR_BOOTLOG", "0") == "1" and os.path.exists(BOOT_LOG_PATH):
-                os.remove(BOOT_LOG_PATH)
-        except Exception:
-            pass
-
-        task = asyncio.create_task(_ws_loop())
-        try:
-            yield
-        finally:
-            _bootlog("Lifespan shutdown entered")
-            task.cancel()
-            try:
-                await task
-            except Exception:
-                pass
-
-    app = FastAPI(lifespan=lifespan)
-
-    @app.get("/", response_class=HTMLResponse)
-    async def index():
-        return HTMLResponse(_html_index())
-
-    @app.get("/bootlog.txt", response_class=PlainTextResponse)
-    async def bootlog():
-        try:
-            if not os.path.exists(BOOT_LOG_PATH):
-                return PlainTextResponse("boot log empty\n")
-            with open(BOOT_LOG_PATH, "r", encoding="utf-8") as f:
-                return PlainTextResponse(f.read())
-        except Exception as e:
-            return PlainTextResponse(f"bootlog read error: {repr(e)}\n")
-
-    @app.get("/health.json")
-    async def health():
-        async with STATE_LOCK:
-            STATE.health = _compute_health()
-            eng = STATE.engine
-            out = {
-                "ts": _now(),
-                "service": SERVICE,
-                "build": BUILD,
-                "subsystem": STATE.subsystem,
-                "health": STATE.health,
-                "uptime_s": round(_now() - STATE.started_ts, 3),
-                "ws_url": STATE.ws_url,
-                "symbol": STATE.symbol,
-                "connector": {
-                    "status": "CONNECTED" if eng.status == "ACTIVE" else ("ERROR" if eng.status == "ERROR" else "WARMING"),
-                    "frames": eng.frames,
-                    "reconnects": eng.reconnects,
-                    "last_error": eng.last_error,
-                    "last_event_ts": eng.last_event_ts,
-                    "last_connect_ts": eng.last_connect_ts,
-                    "last_close_code": eng.last_close_code,
-                    "last_close_reason": eng.last_close_reason,
-                },
-                "book": {
-                    "best_bid": eng.book.best_bid,
-                    "best_ask": eng.book.best_ask,
-                    "depth_counts": eng.book.depth_counts,
-                    "version": eng.book.version,
-                    "last_update_ts": eng.book.last_update_ts,
-                },
-                "tape": {
-                    "trades_seen": eng.trades_seen,
-                    "last_trade_px": eng.last_trade_px,
-                    "last_trade_qty": eng.last_trade_qty,
-                    "last_trade_side": eng.last_trade_side,
-                    "last_trade_ts": eng.last_trade_ts,
-                    "ring_size": len(STATE.tape_ring),
-                },
-                "import_errors": list(STATE.import_errors),
-                "host": HOST,
-                "port": PORT,
-            }
-            return JSONResponse(out)
-
-    @app.get("/telemetry.json")
-    async def telemetry():
-        async with STATE_LOCK:
-            eng = STATE.engine
-            return JSONResponse({
-                "ts": _now(),
-                "service": SERVICE,
-                "build": BUILD,
-                "health": STATE.health,
-                "uptime_s": _now() - STATE.started_ts,
-                "engine": {
-                    "status": eng.status,
-                    "frames": eng.frames,
-                    "reconnects": eng.reconnects,
-                    "last_error": eng.last_error,
-                    "last_event_age_s": (None if eng.last_event_ts is None else (_now() - eng.last_event_ts)),
-                },
-                "rings": {"raw": len(STATE.raw_ring), "tape": len(STATE.tape_ring)},
-            })
-
-    @app.get("/raw.json")
-    async def raw():
-        async with STATE_LOCK:
-            return JSONResponse({"ts": _now(), "build": BUILD, "raw_ring": list(STATE.raw_ring)})
-
-    @app.get("/book.json")
-    async def book():
-        async with STATE_LOCK:
-            b = STATE.engine.book
-            return JSONResponse({
-                "ts": _now(),
-                "build": BUILD,
-                "symbol": SYMBOL,
-                "best_bid": b.best_bid,
-                "best_ask": b.best_ask,
-                "depth_counts": b.depth_counts,
-                "totals": b.totals,
-                "version": b.version,
-                "last_update_ts": b.last_update_ts,
-            })
-
-    @app.get("/tape.json")
-    async def tape():
-        async with STATE_LOCK:
-            eng = STATE.engine
-            return JSONResponse({
-                "ts": _now(),
-                "build": BUILD,
-                "symbol": SYMBOL,
-                "trades_seen": eng.trades_seen,
-                "last_trade_px": eng.last_trade_px,
-                "last_trade_qty": eng.last_trade_qty,
-                "last_trade_side": eng.last_trade_side,
-                "last_trade_ts": eng.last_trade_ts,
-                "ring_size": len(STATE.tape_ring),
-                "tape": list(STATE.tape_ring),
-            })
-
-    APP = app
-
-
-# -----------------------------
-# Fallback minimal HTTP server (only if FastAPI missing)
-# -----------------------------
-def _run_fallback_http() -> None:
-    import http.server
-    import socketserver
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            body = {
-                "service": SERVICE,
-                "build": BUILD,
-                "health": "RED",
-                "error": "FastAPI not available",
-                "import_errors": STATE.import_errors,
-            }
-            raw = (json.dumps(body, indent=2) + "\n").encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def log_message(self, format, *args):  # noqa: A002
-            return
-
-    with socketserver.TCPServer((HOST, PORT), Handler) as httpd:
-        _bootlog(f"Fallback HTTP server listening on {HOST}:{PORT}")
-        httpd.serve_forever()
-
-
-# -----------------------------
+# ----------------------------
 # Entrypoint
-# -----------------------------
-def main() -> None:
-    _bootlog(f"Starting {SERVICE} {BUILD} on {HOST}:{PORT}")
-    try:
-        if APP is None:
-            _run_fallback_http()
-            return
-
-        import uvicorn
-        uvicorn.run(APP, host=HOST, port=PORT, log_level="warning")
-    except Exception as e:
-        _bootlog(f"Fatal main() exception: {repr(e)}\n{traceback.format_exc()}")
-        while True:
-            time.sleep(1.0)
-
-
+# ----------------------------
 if __name__ == "__main__":
-    main()
+    try:
+        import uvicorn  # type: ignore
+    except Exception as e:
+        bootlog(f"FATAL: uvicorn import failed: {e}")
+        raise
+
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
