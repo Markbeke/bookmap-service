@@ -907,12 +907,16 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0, *, bm_center
 
     if STATE.status == "ERROR":
         health = "RED"
-    elif STATE.status == "CONNECTED" and parity_ok and (age <= green_age or (STATE.last_health == "GREEN" and age <= green_grace)):
-        health = "GREEN"
-    elif STATE.status == "CONNECTED" and age <= yellow_age:
-        health = "YELLOW"
+    elif STATE.status == "CONNECTED":
+        if parity_ok and (age <= green_age or (STATE.last_health == "GREEN" and age <= green_grace)):
+            health = "GREEN"
+        elif age <= yellow_age:
+            health = "YELLOW"
+        else:
+            health = "RED"
     else:
-        health = "RED"
+        # CONNECTING / DISCONNECTED: avoid flicker to RED if we still have recent data
+        health = "YELLOW" if age <= yellow_age else "RED"
 
     if health != STATE.last_health:
         STATE.last_health = health
@@ -1197,6 +1201,35 @@ def _ui_html() -> str:
   const off = document.createElement("canvas");
   const offCtx = off.getContext("2d", { alpha: false });
 
+  // --- Client-side error surfacing (no console required) ---
+  const errBox = document.createElement("div");
+  errBox.style.position = "fixed";
+  errBox.style.left = "12px";
+  errBox.style.top = "72px";
+  errBox.style.maxWidth = "calc(100vw - 24px)";
+  errBox.style.zIndex = "9999";
+  errBox.style.padding = "10px 12px";
+  errBox.style.borderRadius = "10px";
+  errBox.style.background = "rgba(120, 20, 20, 0.85)";
+  errBox.style.color = "#fff";
+  errBox.style.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+  errBox.style.display = "none";
+  errBox.style.whiteSpace = "pre-wrap";
+  document.body.appendChild(errBox);
+
+  function showErr(msg){
+    errBox.textContent = msg;
+    errBox.style.display = "block";
+  }
+  window.addEventListener("error", (e) => {
+    const where = e.filename ? (e.filename.split("/").slice(-1)[0] + ":" + (e.lineno||0) + ":" + (e.colno||0)) : "";
+    showErr("JS ERROR\n" + (e.message||"") + (where ? ("\n" + where) : ""));
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = e.reason;
+    showErr("PROMISE REJECTION\n" + (r && r.message ? r.message : String(r)));
+  });
+
   const healthDot = document.getElementById("healthDot");
   const healthVal = document.getElementById("healthVal");
   const modeTxt = document.getElementById("modeTxt");
@@ -1239,11 +1272,11 @@ def _ui_html() -> str:
 
   // Debounced server update
   let pendingSend = null;
-  function scheduleSend(ms=160) {
+  function scheduleSend(ms=33) {
     if (pendingSend) clearTimeout(pendingSend);
     pendingSend = setTimeout(() => {
       pendingSend = null;
-      sendView();
+      sendView(true);
     }, ms);
   }
 
@@ -1335,12 +1368,13 @@ def _ui_html() -> str:
 
   function sendView(force=false) {
     if (view.bm_center_idx == null) return;
-    // When not force, avoid hammering the server during pointer moves; scheduleSend() handles this.
-    if (!force && interacting) return;
+    // Interaction LOD: during active gestures we reduce resolution for responsiveness.
+    const ds = interacting ? Math.max(BASE_TIME_DOWNSAMPLE, 4) : BASE_TIME_DOWNSAMPLE;
+    const spanBins = interacting ? Math.min(view.bm_price_span_bins, 120) : view.bm_price_span_bins;
     send({
       cmd: "set_view",
       bm_center_idx: view.bm_center_idx,
-      bm_price_span_bins: view.bm_price_span_bins,
+      bm_price_span_bins: spanBins,
       bm_time_offset_cols: view.bm_time_offset_cols,
       bm_time_downsample: view.bm_time_downsample
     });
@@ -1516,6 +1550,10 @@ def _ui_html() -> str:
     ev.preventDefault();
     cv.setPointerCapture(ev.pointerId);
     pointers.set(ev.pointerId, {x: ev.clientX, y: ev.clientY});
+    interacting = true;
+    sendView(true);
+    // drop to interaction LOD immediately
+    sendView(true);
     if (pointers.size === 1) {
       start = { one: {...pointers.values().next().value}, view: {...view} };
     } else if (pointers.size === 2) {
@@ -1532,6 +1570,9 @@ def _ui_html() -> str:
     pointers.set(ev.pointerId, {x: ev.clientX, y: ev.clientY});
 
     interacting = true;
+    sendView(true);
+    // drop to interaction LOD immediately
+    sendView(true);
     lastInteractTs = performance.now();
 
     const rect = cv.getBoundingClientRect();
@@ -1545,7 +1586,7 @@ def _ui_html() -> str:
       view.bm_center_idx = start.view.bm_center_idx - deltaBins;
       view.bm_time_offset_cols = start.view.bm_time_offset_cols; // keep
       updateHUD();
-      scheduleSend(240);
+      scheduleSend(33);
       return;
     }
 
@@ -1572,7 +1613,7 @@ def _ui_html() -> str:
         view.bm_time_downsample = clampDownsample(start.view.bm_time_downsample * (1 + dy * dsPerPx));
       }
       updateHUD();
-      scheduleSend(260);
+      scheduleSend(33);
     }
   }
 
@@ -1580,9 +1621,10 @@ def _ui_html() -> str:
     if (pointers.has(ev.pointerId)) pointers.delete(ev.pointerId);
     if (pointers.size === 0) {
       start = null;
-      interacting = true;
+      interacting = false;
       lastInteractTs = performance.now();
-      scheduleSend(80);
+      // restore full LOD after interaction ends
+      sendView(true);
     }
   }
 
