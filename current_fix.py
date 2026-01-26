@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import websockets  # type: ignore
 
 SERVICE = "quantdesk-bookmap-ui"
-BUILD = "FIX20/P09"
+BUILD = "FIX20/P15"
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5000"))
@@ -901,7 +901,7 @@ def _render_frame(levels: int, step: float, pan_ticks: float = 0.0, *, bm_center
     # Health hysteresis:
     # - GREEN requires a connected feed and *recent* events.
     # - We keep GREEN for a short grace period to avoid flicker on brief gaps.
-    green_age = 3.0
+    green_age = 6.0
     green_grace = 8.0
     yellow_age = 20.0
 
@@ -1132,401 +1132,484 @@ async def render_ws(ws: WebSocket) -> None:
 
 
 
+
 def _ui_html() -> str:
-    # Bookmap parity demo (FIX20):
-    # - Absolute price axis (bins) + horizontal time columns
-    # - Camera viewport (price pan/zoom, time scrub/zoom)
-    # - iPad-first gestures:
-    #     1-finger vertical drag: price pan
-    #     pinch: price zoom
-    #     2-finger horizontal drag: time scrub
-    #     2-finger vertical drag: time zoom (downsample)
-    return f"""<!doctype html>
-<html>
+    # NOTE: This function must NOT be an f-string.
+    # JS template literals contain ${...} which would be interpreted by Python f-strings.
+    html = """<!doctype html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
-  <title>QuantDesk Bookmap</title>
-  <style>
-    html, body {{ height: 100%; margin: 0; background: #0b0f14; color: #e6eef8; }}
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; overflow:hidden; }}
-    #topbar {{
-      position: fixed; left: 0; right: 0; top: 0;
-      display: flex; gap: 10px; align-items: center; padding: 10px 12px;
-      background: rgba(11,15,20,0.88); backdrop-filter: blur(8px);
-      border-bottom: 1px solid rgba(255,255,255,0.06);
-      z-index: 20;
-    }}
-    .pill {{ padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.14); font-weight: 650; font-size: 13px; }}
-    .pill.green {{ border-color: rgba(46,125,50,0.8); color: #76ff7a; }}
-    .pill.yellow {{ border-color: rgba(249,168,37,0.8); color: #ffd36b; }}
-    .pill.red {{ border-color: rgba(198,40,40,0.8); color: #ff8a80; }}
-    .spacer {{ flex: 1; }}
-    .muted {{ opacity: 0.8; font-size: 13px; }}
-    #cvwrap {{ position: fixed; left: 0; right: 0; top: 52px; bottom: 0; }}
-    canvas {{ display:block; width: 100%; height: 100%; touch-action: none; }}
-    #hint {{
-      position: fixed; left: 12px; bottom: 12px;
-      font-size: 12px; opacity: 0.75; background: rgba(0,0,0,0.25);
-      padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.08);
-      max-width: 70ch;
-    }}
-    a {{ color: inherit; }}
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>QuantDesk Bookmap</title>
+<style>
+  :root{
+    --bg:#070a10;
+    --panel:#0b1220;
+    --panel2:#0e1628;
+    --text:#cfd7e6;
+    --muted:#93a4bf;
+    --green:#2dd36f;
+    --yellow:#ffcc00;
+    --red:#ff3b30;
+    --blue:#3b82f6;
+    --heat1:#1e40af;
+    --heat2:#facc15;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
+  #topbar{position:fixed;left:0;right:0;top:0;height:64px;display:flex;align-items:center;gap:10px;padding:10px 12px;background:linear-gradient(180deg, rgba(7,10,16,0.98), rgba(7,10,16,0.60));backdrop-filter: blur(6px);z-index:5}
+  .pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;background:rgba(11,18,32,0.92);border:1px solid rgba(255,255,255,0.08);font-size:13px;line-height:1}
+  .pill b{font-weight:700}
+  .pill .dot{width:9px;height:9px;border-radius:999px;background:#666}
+  #spacer{flex:1}
+  #build{opacity:0.9}
+  #canvasWrap{position:fixed;left:0;right:0;top:64px;bottom:0}
+  canvas{width:100%;height:100%;display:block;touch-action:none}
+  #hint{position:fixed;left:12px;bottom:12px;max-width:620px;background:rgba(11,18,32,0.92);border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:10px 12px;color:var(--muted);font-size:12px;z-index:6}
+  #hint code{color:var(--text)}
+</style>
 </head>
 <body>
   <div id="topbar">
-    <div id="health" class="pill yellow">HEALTH: YELLOW</div>
-    <div id="mode" class="pill">LIVE</div>
-    <div id="scale" class="pill">TIME: --</div>
-    <div id="offset" class="pill">OFFSET: --</div>
-    <div class="spacer"></div>
-    <div class="muted">{SERVICE} {BUILD} · {SYMBOL}</div>
+    <div class="pill" id="jumpBtn" style="cursor:pointer;user-select:none;">JUMP</div>
+    <div class="pill" id="healthPill"><span class="dot" id="healthDot"></span><b id="healthTxt">HEALTH:</b><span id="healthVal">—</span></div>
+    <div class="pill"><b id="modeTxt">LIVE</b></div>
+    <div class="pill"><b>TIME:</b> <span id="timeTxt">—</span></div>
+    <div class="pill"><b>OFFSET:</b> <span id="offTxt">—</span></div>
+    <div id="spacer"></div>
+    <div class="pill" id="build">__BUILD__ · __SYMBOL__</div>
   </div>
 
-  <div id="cvwrap"><canvas id="cv"></canvas></div>
+  <div id="canvasWrap">
+    <canvas id="cv"></canvas>
+  </div>
+
   <div id="hint">
-    Gestures: 1-finger vertical pan (price), pinch (price zoom), 2-finger horizontal scrub (time), 2-finger vertical drag (time zoom).
-    Auto-follow ON by default; it turns OFF when you scrub away from LIVE.
+    Gestures: <code>1‑finger vertical</code> pan (price), <code>pinch</code> (price zoom), <code>2‑finger horizontal</code> scrub (time), <code>2‑finger vertical</code> zoom (time). Auto‑follow ON by default; turns OFF when you scrub/pan away from LIVE.
   </div>
 
 <script>
-(() => {{
-  const cv = document.getElementById('cv');
-  const ctx = cv.getContext('2d', {{ alpha: false }});
-  const healthEl = document.getElementById('health');
-  const modeEl = document.getElementById('mode');
-  const scaleEl = document.getElementById('scale');
-  const offsetEl = document.getElementById('offset');
+(() => {
+  const BUILD = "__BUILD__";
+  const SYMBOL = "__SYMBOL__";
+  const cv = document.getElementById("cv");
+  const ctx = cv.getContext("2d", { alpha: false, desynchronized: true });
+  const off = document.createElement("canvas");
+  const offCtx = off.getContext("2d", { alpha: false });
 
-  function resize() {{
-    const dpr = window.devicePixelRatio || 1;
-    const rect = cv.getBoundingClientRect();
-    cv.width = Math.max(1, Math.floor(rect.width * dpr));
-    cv.height = Math.max(1, Math.floor(rect.height * dpr));
-  }}
-  window.addEventListener('resize', resize, {{ passive: true }});
+  const healthDot = document.getElementById("healthDot");
+  const healthVal = document.getElementById("healthVal");
+  const modeTxt = document.getElementById("modeTxt");
+  const timeTxt = document.getElementById("timeTxt");
+  const offTxt  = document.getElementById("offTxt");
+  const jumpBtn = document.getElementById("jumpBtn");
+
+  let dpr = 1;
+  function resize() {
+    dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    const r = cv.getBoundingClientRect();
+    cv.width = Math.max(1, Math.floor(r.width * dpr));
+    cv.height = Math.max(1, Math.floor(r.height * dpr));
+  }
+  window.addEventListener("resize", resize, { passive: true });
   resize();
 
-  // View (camera) state owned by UI
-  const view = {{
-    centerIdx: null,        // price bin index
-    priceSpan: {BM_DEFAULT_PRICE_SPAN_BINS}, // bins
-    timeOffset: 0,          // columns from newest
-    timeDownsample: 1,      // 1=base scale; >1 zoom-out in time
-    autoFollow: true,
-  }};
+  // ---------------------------
+  // View state (Bookmap)
+  // ---------------------------
+  const view = {
+    bm_center_idx: null,
+    bm_price_span_bins: 6000,
+    bm_time_offset_cols: 0,
+    bm_time_downsample: 1,
+    live: true,
+    tick: 1.0,
+    min_idx: null,
+    max_idx: null,
+    lastBm: null,
+    lastFrameTs: 0,
+  };
 
-  // WS render bridge
+  // Interaction + LOD: while interacting, we render by transforming the last fully-rendered bitmap.
+  let interacting = false;
+  let lastInteractTs = 0;
+  let baseBitmapValid = false;
+  let baseMinIdx = null;
+  let baseMaxIdx = null;
+
+  // Debounced server update
+  let pendingSend = null;
+  function scheduleSend(ms=160) {
+    if (pendingSend) clearTimeout(pendingSend);
+    pendingSend = setTimeout(() => {
+      pendingSend = null;
+      sendView();
+    }, ms);
+  }
+
+  function setHealth(h) {
+    healthVal.textContent = h || "—";
+    let c = "#666";
+    if (h === "GREEN") c = getComputedStyle(document.documentElement).getPropertyValue("--green");
+    else if (h === "YELLOW") c = getComputedStyle(document.documentElement).getPropertyValue("--yellow");
+    else if (h === "RED") c = getComputedStyle(document.documentElement).getPropertyValue("--red");
+    healthDot.style.background = c;
+  }
+
+  function fmtTimeScale() {
+    const s = 0.25 * Math.max(1, view.bm_time_downsample); // BM_BASE_COL_DT is 0.25s in server code
+    return s.toFixed(2) + "s/col";
+  }
+
+  function fmtOffset() {
+    if (view.bm_time_offset_cols <= 0) return "0s";
+    const s = view.bm_time_offset_cols * 0.25 * Math.max(1, view.bm_time_downsample);
+    return "T-" + s.toFixed(1) + "s";
+  }
+
+  function updateHUD() {
+    modeTxt.textContent = view.bm_time_offset_cols === 0 ? "LIVE" : "HISTORY";
+    timeTxt.textContent = fmtTimeScale();
+    offTxt.textContent = fmtOffset();
+  }
+
+  // ---------------------------
+  // WebSocket (render stream)
+  // ---------------------------
   let ws = null;
-  function wsUrl() {{
-    const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-    return proto + '//' + location.host + '/render.ws';
-  }}
+  let wsOpen = false;
+  let lastPayload = null;
 
-  function setHealth(h) {{
-    healthEl.classList.remove('green','yellow','red');
-    if (h === 'GREEN') healthEl.classList.add('green');
-    else if (h === 'RED') healthEl.classList.add('red');
-    else healthEl.classList.add('yellow');
-    healthEl.textContent = 'HEALTH: ' + (h || 'YELLOW');
-  }}
+  function wsUrl() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host + "/render.ws";
+  }
 
-  function fmtTimeScale(sPerCol) {{
-    if (!isFinite(sPerCol) || sPerCol <= 0) return '--';
-    if (sPerCol < 1) return sPerCol.toFixed(2) + 's/col';
-    if (sPerCol < 10) return sPerCol.toFixed(1) + 's/col';
-    return Math.round(sPerCol) + 's/col';
-  }}
-
-  function sendView() {{
-    if (!ws || ws.readyState !== 1) return;
-    const payload = {{
-      cmd: "set_view",
-      // legacy params left intact; server will ignore for Bookmap draw
-      levels: {RENDER_LEVELS},
-      step: {RENDER_STEP},
-      pan_ticks: 0.0,
-
-      bm_center_idx: view.centerIdx,
-      bm_price_span_bins: Math.round(view.priceSpan),
-      bm_time_offset_cols: Math.round(view.timeOffset),
-      bm_time_downsample: Math.round(view.timeDownsample),
-    }};
-    try {{ ws.send(JSON.stringify(payload)); }} catch(e) {{}}
-  }}
-
-  let lastSend = 0;
-  function throttledSend() {{
-    const now = performance.now();
-    if (now - lastSend > 50) {{ lastSend = now; sendView(); }}
-  }}
-
-  function connect() {{
+  function wsConnect() {
+    try { if (ws) ws.close(); } catch(e) {}
     ws = new WebSocket(wsUrl());
-    ws.onopen = () => {{ sendView(); }};
-    ws.onmessage = (ev) => {{
-      try {{
-        const frame = JSON.parse(ev.data);
-        draw(frame);
-      }} catch(e) {{}}
-    }};
-    ws.onclose = () => {{
-      setTimeout(connect, 750);
-    }};
-  }}
-  connect();
+    wsOpen = false;
 
-  // Color mapping: value -> intensity -> RGB. (Simple, stable; not tuned yet.)
-  function valToRGB(v, vmax) {{
-    if (v <= 0 || vmax <= 0) return [11,15,20];
-    const x = Math.max(0, Math.min(1, v / vmax));
-    // blue -> cyan -> yellow -> red (simple gradient)
-    const r = Math.floor(30 + 225 * Math.pow(x, 0.85));
-    const g = Math.floor(50 + 205 * Math.pow(x, 0.60));
-    const b = Math.floor(80 + 160 * Math.pow(1 - x, 0.55));
-    return [r,g,b];
-  }}
+    ws.onopen = () => {
+      wsOpen = true;
+      sendView(true);
+    };
 
-  function draw(frame) {{
-    const W = cv.width, H = cv.height;
-    ctx.fillStyle = '#0b0f14';
-    ctx.fillRect(0,0,W,H);
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (!msg || !msg.kind) return;
+        if (msg.kind === "hello") {
+          setHealth(msg.health || "—");
+          if (msg.bm && msg.bm.center_idx != null) {
+            view.bm_center_idx = msg.bm.center_idx;
+            view.bm_price_span_bins = msg.bm.price_span_bins || view.bm_price_span_bins;
+            view.bm_time_offset_cols = msg.bm.time_offset_cols || 0;
+            view.bm_time_downsample = msg.bm.time_downsample || 1;
+            view.tick = msg.bm.tick || view.tick;
+            updateHUD();
+          }
+        } else if (msg.kind === "frame") {
+          // Keep latest only (drop older frames) to preserve interactivity.
+          lastPayload = msg;
+        }
+      } catch(e) {
+        // ignore malformed frames
+      }
+    };
 
-    setHealth(frame.health);
+    ws.onclose = () => {
+      wsOpen = false;
+      setTimeout(wsConnect, 600);
+    };
+    ws.onerror = () => {
+      wsOpen = false;
+      try { ws.close(); } catch(e) {}
+    };
+  }
 
-    const bm = frame.render && frame.render.bm ? frame.render.bm : null;
-    if (!bm || !bm.cols) {{
-      ctx.fillStyle = 'rgba(230,238,248,0.85)';
-      ctx.font = '16px system-ui';
-      ctx.fillText('Warming up...', 16, 24);
-      return;
-    }}
+  function send(obj) {
+    if (!wsOpen) return;
+    try { ws.send(JSON.stringify(obj)); } catch(e) {}
+  }
 
-    // initialize centerIdx from server once
-    if (view.centerIdx === null && bm.center_idx !== null && bm.center_idx !== undefined) {{
-      view.centerIdx = bm.center_idx;
-      throttledSend();
-    }}
+  function sendView(force=false) {
+    if (view.bm_center_idx == null) return;
+    // When not force, avoid hammering the server during pointer moves; scheduleSend() handles this.
+    if (!force && interacting) return;
+    send({
+      cmd: "set_view",
+      bm_center_idx: view.bm_center_idx,
+      bm_price_span_bins: view.bm_price_span_bins,
+      bm_time_offset_cols: view.bm_time_offset_cols,
+      bm_time_downsample: view.bm_time_downsample
+    });
+  }
 
-    const live = !!bm.live && (view.timeOffset === 0);
-    modeEl.textContent = live ? 'LIVE' : 'HISTORY';
-    modeEl.className = 'pill' + (live ? ' green' : '');
+  wsConnect();
 
-    scaleEl.textContent = 'TIME: ' + fmtTimeScale(bm.time_scale_s_per_col);
-    offsetEl.textContent = live ? 'OFFSET: 0s' : ('OFFSET: T-' + (bm.t_minus_s || 0).toFixed(1) + 's');
+  // ---------------------------
+  // Rendering
+  // ---------------------------
+  function clearCanvas() {
+    ctx.fillStyle = "#070a10";
+    ctx.fillRect(0,0,cv.width,cv.height);
+  }
 
-    // Update auto-follow
-    if (live) view.autoFollow = true;
+  function drawBmToOffscreen(bm) {
+    if (!bm || !bm.cols) return false;
+    const w = cv.width;
+    const h = cv.height;
+    off.width = w;
+    off.height = h;
 
+    // Background
+    offCtx.fillStyle = "#070a10";
+    offCtx.fillRect(0,0,w,h);
+
+    // Determine y mapping from indices
+    const minIdx = bm.min_idx;
+    const maxIdx = bm.max_idx;
+    if (minIdx == null || maxIdx == null || maxIdx === minIdx) return false;
+
+    // Precompute y for each idx to avoid repeated division.
+    const span = (maxIdx - minIdx);
+    function yFromIdx(idx) {
+      // higher idx => higher price => top of screen
+      const t = (idx - minIdx) / span;
+      return Math.round((1.0 - t) * h);
+    }
+
+    // Draw heatmap: lines across each column segment.
+    // Cols are left->right; we map to x.
     const cols = bm.cols;
-    const minIdx = bm.min_idx, maxIdx = bm.max_idx;
-    const tick = bm.tick || 0.1;
-
-    // Layout
-    const leftPad = Math.floor(W * 0.08); // price labels area
-    const rightPad = 8;
-    const topPad = 8;
-    const botPad = 8;
-    const plotW = W - leftPad - rightPad;
-    const plotH = H - topPad - botPad;
-
-    // Determine vmax (robust): sample max across visible points
-    let vmax = 0;
-    for (let i=0;i<cols.length;i++) {{
+    const n = cols.length;
+    const xStep = (n <= 1) ? w : (w / (n - 1));
+    for (let i=0;i<n;i++) {
+      const x = Math.round(i * xStep);
       const pts = cols[i].pts || [];
-      for (let j=0;j<pts.length;j++) {{
+      for (let j=0;j<pts.length;j++) {
+        const idx = pts[j][0];
         const v = pts[j][1];
-        if (v > vmax) vmax = v;
-      }}
-    }}
-    // soft cap for stability
-    vmax = Math.max(1e-9, vmax);
+        if (v <= 0) continue;
+        const y = yFromIdx(idx);
+        // map v -> intensity
+        const t = Math.max(0, Math.min(1, Math.log10(1 + v) / 4.0));
+        // lerp between blue and yellow
+        const r = Math.round(30 + (250-30)*t);
+        const g = Math.round(64 + (204-64)*t);
+        const b = Math.round(175 + (21-175)*t);
+        offCtx.fillStyle = "rgba(" + r + "," + g + "," + b + "," + (0.12 + 0.55*t) + ")";
+        offCtx.fillRect(x, y, Math.max(1, Math.ceil(xStep)), 1);
+      }
+    }
 
-    // Render columns
-    const colW = Math.max(1, Math.floor(plotW / Math.max(1, cols.length)));
-    const span = Math.max(1, (maxIdx - minIdx));
-    const pxPerBin = plotH / span;
+    baseBitmapValid = true;
+    baseMinIdx = minIdx;
+    baseMaxIdx = maxIdx;
+    return true;
+  }
 
-    for (let ci=0; ci<cols.length; ci++) {{
-      const x0 = leftPad + ci * colW;
-      const pts = cols[ci].pts || [];
-      for (let k=0; k<pts.length; k++) {{
-        const idx = pts[k][0];
-        const v = pts[k][1];
-        const y = topPad + (maxIdx - idx) * pxPerBin; // higher idx at top
-        const h = Math.max(1, Math.ceil(pxPerBin));
-        const rgb = valToRGB(v, vmax);
-        ctx.fillStyle = `rgb(${{rgb[0]}},${{rgb[1]}},${{rgb[2]}})`;
-        ctx.fillRect(x0, y, colW, h);
-      }}
-    }}
+  function drawTransformedBitmap() {
+    if (!baseBitmapValid || baseMinIdx == null || baseMaxIdx == null) return false;
+    const w = cv.width, h = cv.height;
 
-    // Draw price labels (few ticks)
-    ctx.fillStyle = 'rgba(230,238,248,0.80)';
-    ctx.font = (Math.max(10, Math.floor(H/48))) + 'px system-ui';
-    ctx.textAlign = 'right';
-    ctx.textBaseline = 'middle';
-    const labelCount = 6;
-    for (let i=0;i<=labelCount;i++) {{
-      const t = i/labelCount;
-      const idx = Math.round(maxIdx - t*(maxIdx - minIdx));
-      const y = topPad + t*plotH;
-      const px = (idx * tick);
-      ctx.fillText(px.toFixed(1), leftPad - 8, y);
-      // grid line
-      ctx.strokeStyle = 'rgba(255,255,255,0.04)';
-      ctx.beginPath();
-      ctx.moveTo(leftPad, y);
-      ctx.lineTo(W-rightPad, y);
-      ctx.stroke();
-    }}
+    const spanBase = (baseMaxIdx - baseMinIdx);
+    const spanNow  = (view.bm_price_span_bins);
+    if (!spanBase || !spanNow) return false;
 
-    // Price line (best bid/ask mid) overlay
-    if (frame.book && frame.book.best_bid !== null && frame.book.best_ask !== null) {{
-      const mid = (frame.book.best_bid + frame.book.best_ask)/2.0;
-      const midIdx = Math.round(mid / tick);
-      const y = topPad + (maxIdx - midIdx) * pxPerBin;
-      ctx.strokeStyle = 'rgba(255,255,255,0.70)';
-      ctx.beginPath();
-      ctx.moveTo(leftPad, y);
-      ctx.lineTo(W-rightPad, y);
-      ctx.stroke();
+    // Compute current min/max based on center/span (server clamps; client preview approximates).
+    const minNow = view.bm_center_idx - Math.floor(spanNow/2);
+    const maxNow = view.bm_center_idx + Math.floor(spanNow/2);
 
-      // auto-follow: keep mid within viewport by nudging centerIdx on UI side
-      if (view.autoFollow && view.centerIdx !== null) {{
-        const margin = Math.floor(view.priceSpan * 0.12);
-        if (midIdx > (view.centerIdx + margin) || midIdx < (view.centerIdx - margin)) {{
-          view.centerIdx = midIdx;
-          throttledSend();
-        }}
-      }}
-    }}
-  }}
+    // Affine in y: map base idx range to current idx range
+    const scaleY = spanBase / (maxNow - minNow);
+    const y0Base = 0;
+    // translation to align minNow with baseMinIdx in idx-space
+    // We want idx=minNow to map to baseMinIdx: in y-space, that means shifting.
+    const dyIdx = (minNow - baseMinIdx);
+    const dyPx = (dyIdx / spanBase) * h;
 
-  // Touch gesture handling
-  let active = false;
-  let startTouches = [];
-  let startMid = null;
-  let startDist = 0;
-  let startCenter = null;
-  let startSpan = null;
-  let startOffset = null;
-  let startDownsample = null;
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle = "#070a10";
+    ctx.fillRect(0,0,w,h);
 
-  function getTouches(e) {{
-    const t = [];
-    for (let i=0;i<e.touches.length;i++) {{
-      const touch = e.touches[i];
-      t.push({{ id: touch.identifier, x: touch.clientX, y: touch.clientY }});
-    }}
-    return t;
-  }}
+    // Apply vertical scale about top; then translate
+    ctx.save();
+    ctx.translate(0, dyPx);
+    ctx.scale(1, scaleY);
+    ctx.drawImage(off, 0, 0);
+    ctx.restore();
 
-  function dist(a,b) {{
-    const dx = a.x-b.x, dy = a.y-b.y;
-    return Math.sqrt(dx*dx + dy*dy);
-  }}
+    // Reset
+    ctx.setTransform(1,0,0,1,0,0);
+    return true;
+  }
 
-  function midpoint(a,b) {{
-    return {{ x: (a.x+b.x)/2, y: (a.y+b.y)/2 }};
-  }}
+  function renderLoop() {
+    // consume latest frame
+    if (lastPayload && lastPayload.kind === "frame") {
+      setHealth(lastPayload.health || "—");
+      const bm = (lastPayload.render && lastPayload.render.bm) ? lastPayload.render.bm : null;
+      if (bm && bm.center_idx != null) {
+        view.bm_center_idx = bm.center_idx;
+        view.bm_price_span_bins = bm.price_span_bins || view.bm_price_span_bins;
+        view.bm_time_offset_cols = bm.time_offset_cols || 0;
+        view.bm_time_downsample = bm.time_downsample || 1;
+        view.tick = bm.tick || view.tick;
+        view.min_idx = bm.min_idx;
+        view.max_idx = bm.max_idx;
+        view.lastBm = bm;
+        view.lastFrameTs = lastPayload.ts || 0;
+        updateHUD();
 
-  function clamp(v, lo, hi) {{
-    return Math.max(lo, Math.min(hi, v));
-  }}
+        // Update base bitmap only when not interacting (or if base is invalid)
+        if (!interacting || !baseBitmapValid) {
+          drawBmToOffscreen(bm);
+          // draw 1:1
+          ctx.setTransform(1,0,0,1,0,0);
+          ctx.drawImage(off, 0, 0);
+        }
+      }
+      lastPayload = null;
+    }
 
-  cv.addEventListener('touchstart', (e) => {{
-    if (!view) return;
-    active = true;
-    startTouches = getTouches(e);
-    if (startTouches.length === 1) {{
-      startCenter = view.centerIdx;
-    }} else if (startTouches.length >= 2) {{
-      const a = startTouches[0], b = startTouches[1];
-      startMid = midpoint(a,b);
-      startDist = dist(a,b);
-      startSpan = view.priceSpan;
-      startOffset = view.timeOffset;
-      startDownsample = view.timeDownsample;
-    }}
-  }}, {{ passive: false }});
+    if (interacting) {
+      // During interaction: fast transform preview
+      drawTransformedBitmap();
+      if (performance.now() - lastInteractTs > 220) {
+        // Consider interaction ended
+        interacting = false;
+        scheduleSend(10);
+      }
+    } else if (!baseBitmapValid) {
+      clearCanvas();
+    }
 
-  cv.addEventListener('touchmove', (e) => {{
-    if (!active) return;
-    e.preventDefault();
-    const t = getTouches(e);
-    if (t.length === 1) {{
-      // 1-finger vertical pan (price)
-      const dy = t[0].y - startTouches[0].y;
-      if (view.centerIdx === null) return;
-      const binsPerPx = (view.priceSpan / Math.max(50, cv.getBoundingClientRect().height));
-      const deltaBins = Math.round(dy * binsPerPx);
-      view.centerIdx = (startCenter === null ? view.centerIdx : startCenter) + deltaBins;
-      view.autoFollow = false;
-      throttledSend();
+    requestAnimationFrame(renderLoop);
+  }
+  requestAnimationFrame(renderLoop);
+
+  // ---------------------------
+  // Pointer gestures (iPad-first contract)
+  // ---------------------------
+  const pointers = new Map();
+  let start = null;
+
+  function clampSpanBins(x) {
+    x = Math.round(x);
+    x = Math.max(800, Math.min(24000, x));
+    return x;
+  }
+  function clampDownsample(x) {
+    x = Math.round(x);
+    x = Math.max(1, Math.min(64, x));
+    return x;
+  }
+  function clampOffsetCols(x) {
+    x = Math.round(x);
+    x = Math.max(0, Math.min(60000, x));
+    return x;
+  }
+
+  function onDown(ev) {
+    ev.preventDefault();
+    cv.setPointerCapture(ev.pointerId);
+    pointers.set(ev.pointerId, {x: ev.clientX, y: ev.clientY});
+    if (pointers.size === 1) {
+      start = { one: {...pointers.values().next().value}, view: {...view} };
+    } else if (pointers.size === 2) {
+      const pts = Array.from(pointers.values());
+      const mid = {x:(pts[0].x+pts[1].x)/2, y:(pts[0].y+pts[1].y)/2};
+      const dist = Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y);
+      start = { two: {pts, mid, dist}, view: {...view} };
+    }
+  }
+
+  function onMove(ev) {
+    if (!pointers.has(ev.pointerId) || view.bm_center_idx == null) return;
+    ev.preventDefault();
+    pointers.set(ev.pointerId, {x: ev.clientX, y: ev.clientY});
+
+    interacting = true;
+    lastInteractTs = performance.now();
+
+    const rect = cv.getBoundingClientRect();
+    const w = rect.width, h = rect.height;
+
+    if (pointers.size === 1 && start && start.view) {
+      const p = pointers.values().next().value;
+      const dy = (p.y - start.one.y);
+      // positive dy => drag down => move price window down => center_idx decreases
+      const deltaBins = Math.round((dy / h) * start.view.bm_price_span_bins);
+      view.bm_center_idx = start.view.bm_center_idx - deltaBins;
+      view.bm_time_offset_cols = start.view.bm_time_offset_cols; // keep
+      updateHUD();
+      scheduleSend(240);
       return;
-    }}
-    if (t.length >= 2) {{
-      const a = t[0], b = t[1];
-      const mid = midpoint(a,b);
-      const d = dist(a,b);
-      const dx = mid.x - startMid.x;
-      const dy = mid.y - startMid.y;
+    }
 
-      const pinchRatio = (startDist > 0) ? (d / startDist) : 1.0;
-      const pinchDelta = pinchRatio - 1.0;
+    if (pointers.size === 2 && start && start.two && start.view) {
+      const pts = Array.from(pointers.values());
+      const mid = {x:(pts[0].x+pts[1].x)/2, y:(pts[0].y+pts[1].y)/2};
+      const dist = Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y);
 
-      // Rule:
-      // - If pinch changes distance noticeably -> price zoom
-      // - Else: horizontal move -> time scrub, vertical move -> time zoom
-      if (Math.abs(pinchDelta) > 0.03) {{
-        // pinch: price zoom (inverse ratio)
-        const newSpan = (startSpan || view.priceSpan) / pinchRatio;
-        view.priceSpan = clamp(newSpan, {BM_MIN_PRICE_SPAN_BINS}, {BM_MAX_PRICE_SPAN_BINS});
-        view.autoFollow = false;
-        throttledSend();
-        return;
-      }}
+      const dx = (mid.x - start.two.mid.x);
+      const dy = (mid.y - start.two.mid.y);
+      const scale = dist / Math.max(1e-6, start.two.dist);
 
-      if (Math.abs(dx) >= Math.abs(dy)) {{
-        // two-finger horizontal scrub
-        const rect = cv.getBoundingClientRect();
-        const colsPerPx = 900 / Math.max(200, rect.width); // heuristic; server clamps anyway
-        const deltaCols = Math.round(-dx * colsPerPx);
-        view.timeOffset = Math.max(0, (startOffset || view.timeOffset) + deltaCols);
-        view.autoFollow = (view.timeOffset === 0);
-        throttledSend();
-        return;
-      }} else {{
-        // two-finger vertical drag: time zoom (downsample)
-        // drag down => zoom out => increase downsample
-        const rect = cv.getBoundingClientRect();
-        const units = dy / Math.max(120, rect.height);
-        const factor = Math.pow(2, units * 6); // ~64x over full height
-        const base = (startDownsample || view.timeDownsample);
-        const newDs = clamp(Math.round(base * factor), 1, {BM_MAX_DOWNSAMPLE});
-        view.timeDownsample = newDs;
-        view.autoFollow = false;
-        throttledSend();
-        return;
-      }}
-    }}
-  }}, {{ passive: false }});
+      // Pinch => price zoom
+      const span = clampSpanBins(start.view.bm_price_span_bins / scale);
+      view.bm_price_span_bins = span;
 
-  cv.addEventListener('touchend', (e) => {{
-    active = false;
-  }}, {{ passive: true }});
-  cv.addEventListener('touchcancel', (e) => {{
-    active = false;
-  }}, {{ passive: true }});
+      // Two-finger horizontal drag => time scrub
+      if (Math.abs(dx) > Math.abs(dy)) {
+        const colsPerPx = 0.6; // sensitivity
+        view.bm_time_offset_cols = clampOffsetCols(start.view.bm_time_offset_cols + dx * colsPerPx);
+      } else {
+        // Two-finger vertical drag => time zoom (downsample)
+        const dsPerPx = 0.03;
+        view.bm_time_downsample = clampDownsample(start.view.bm_time_downsample * (1 + dy * dsPerPx));
+      }
+      updateHUD();
+      scheduleSend(260);
+    }
+  }
 
-}})();
+  function onUp(ev) {
+    if (pointers.has(ev.pointerId)) pointers.delete(ev.pointerId);
+    if (pointers.size === 0) {
+      start = null;
+      interacting = true;
+      lastInteractTs = performance.now();
+      scheduleSend(80);
+    }
+  }
+
+  cv.addEventListener("pointerdown", onDown, { passive: false });
+  cv.addEventListener("pointermove", onMove, { passive: false });
+  cv.addEventListener("pointerup", onUp, { passive: false });
+  cv.addEventListener("pointercancel", onUp, { passive: false });
+
+  // Jump back to LIVE + recent center from last bm
+  jumpBtn.addEventListener("click", () => {
+    if (view.lastBm && view.lastBm.center_idx != null) {
+      view.bm_center_idx = view.lastBm.center_idx;
+    }
+    view.bm_time_offset_cols = 0;
+    updateHUD();
+    interacting = false;
+    baseBitmapValid = false;
+    sendView(true);
+  });
+
+})();
 </script>
 </body>
-</html>"""
-
-
+</html>
+"""
+    html = html.replace("__BUILD__", BUILD).replace("__SYMBOL__", SYMBOL)
+    return html
 @app.get("/")
 async def index() -> HTMLResponse:
     return HTMLResponse(_ui_html())
